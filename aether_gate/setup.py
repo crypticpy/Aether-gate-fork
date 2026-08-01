@@ -227,9 +227,11 @@ def _known_checks():
         add("Dependencies", "SoapySDR", "installed", "ok")
         try:
             devs = SoapySDR.Device.enumerate()
-            add("SDR devices", "dongles", f"{len(devs)} found",
-                "ok" if devs else "warn",
-                ", ".join(str(d.get("driver", "?")) for d in devs) if devs
+            # entries are SoapySDRKwargs (a swig map, no .get) — copy to dicts first
+            devd = [dict(d) for d in devs]
+            add("SDR devices", "dongles", f"{len(devd)} found",
+                "ok" if devd else "warn",
+                ", ".join(str(d.get("driver", "?")) for d in devd) if devd
                 else "none plugged in - needed for dongle / Kenwood-Yaesu IF-tap spectrum")
         except Exception as e:
             add("SDR devices", "dongles", "enumerate failed", "warn", str(e)[:80])
