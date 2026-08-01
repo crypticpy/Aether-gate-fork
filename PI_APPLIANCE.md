@@ -16,7 +16,8 @@ service), [`ONBOARDING.md`](ONBOARDING.md) (the day-one design).
 |---|---|---|
 | **Pi 5** | ✅ best | Proven appliance. Best USB power/bandwidth (drove the V4 dongle + an FTDI CAT cable together, no brownout). |
 | **Pi 4** (2GB+) | ✅ fine | Runs the gate comfortably. Source build is a bit slower (~15–20 min vs ~10–15). USB power is more marginal — use a **powered hub** if a dongle misbehaves. |
-| **Pi 3 / Zero 2** | ⚠️ maybe | Not tested. Icom-LAN-only (`--no-sdr`) would likely be OK; the source build will be slow. |
+| **Pi 3 / Zero 2** | ⚠️ maybe | The **prebuilt image boots** on a Pi 3 (verified: first boot → Setup UI, 2026-07-31). Gate workloads untested there — Icom-LAN-only is the realistic use; a source build will be slow. |
+| **Pi 1 / 2 / Zero** | ❌ no | ARMv6/v7 — cannot run a 64-bit image at all. Symptom: ACT LED flickers (firmware reads the card) but it never boots or joins the network. |
 
 **The one thing that matters more than the model: the OS.** Flash **current
 64-bit Raspberry Pi OS (Debian 13 / trixie, Python 3.13)** — the exact stack the
@@ -27,7 +28,39 @@ fights the source builds.
 
 ---
 
-## Install
+## The easy way: flash the prebuilt image
+
+Skip the install entirely — flash a ready-made appliance image:
+
+1. Download the latest `aether-gate-pi-<ver>.img.xz` (+ `.sha256`) from the
+   [releases page](https://github.com/nigelfenton/Aether-gate/releases).
+2. Flash it with **Raspberry Pi Imager** → *Use custom image*. Imager's OS
+   customisation (⚙ — your username, WiFi, SSH) **works on this image exactly
+   as on stock Pi OS** — set your WiFi there if the Pi won't be on Ethernet.
+3. Boot, give it a minute or two (first boot expands the filesystem), then
+   browse **`http://aethergate.local:8730`** — pick your radio, hit **Start**.
+
+The image is official 64-bit Pi OS Lite with the full install below already
+baked in (SDR stack included). The gate runs as its own `aethergate` system
+user, so it works whatever username you pick in Imager — and works even if you
+skip Imager customisation entirely. Provenance is stamped in
+`/etc/aether-gate-image-release`.
+
+### Building the image yourself
+
+`deploy/build-image.sh` reproduces it from any 64-bit Pi (4/5) or other
+aarch64 Debian host — it customises the official image in a chroot and never
+boots it, so all of Pi OS's first-boot machinery stays stock:
+
+```sh
+git clone https://github.com/nigelfenton/Aether-gate.git
+cd Aether-gate
+sudo ./deploy/build-image.sh          # -> out/aether-gate-pi-<ver>.img.xz
+```
+
+---
+
+## Install by hand (the original way)
 
 On a fresh Pi OS Lite (SSH enabled, on your LAN):
 
