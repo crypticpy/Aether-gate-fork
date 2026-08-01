@@ -80,6 +80,7 @@ class SoapyAdapter(RadioAdapter):
         self._audio_gain = 60.0             # post-demod fixed gain (SSB baseband is small)
         self._agc_level = 0.05              # AGC running estimate of audio level
         self._agc_target = 0.25             # desired RMS-ish output level
+        self._agc_gain = None               # last applied gain (per-sample ramp continuity)
 
     # --- lifecycle -------------------------------------------------------
     def open(self):
@@ -302,6 +303,15 @@ class SoapyAdapter(RadioAdapter):
     def set_mode(self, mode):
         self._mode = (mode or "USB").upper()
 
+    def set_span(self, span_hz):
+        """The pan window IS the device sample rate. get_iq hands the core
+        full-rate blocks, so the engine must label the bins with the width the
+        data actually covers. Before this, AE's default 250 kHz label sat on
+        2.04 MHz of spectrum: every signal painted ~8x too narrow and a click
+        on the pan tuned ~8x short of the signal — off-tuned SSB = robotic
+        'Dalek' audio (found with a sig gen on 2 m, 2026-08-01)."""
+        return float(self.samp_rate)
+
     # --- the IQ source (core FFTs this) ---------------------------------
     def get_iq(self, n, center_hz, span_hz):
         # If AE's centre moved, schedule the hardware to follow.
@@ -343,11 +353,17 @@ class SoapyAdapter(RadioAdapter):
         self._rs_phase = nxt - k
 
         audio = audio * self._audio_gain
-        # simple AGC: track signal level, scale toward target (fast attack, slow release)
+        # simple AGC: track signal level, scale toward target (fast attack, slow release).
+        # Apply the gain as a per-sample RAMP from the previous chunk's gain — a
+        # stepped per-chunk gain modulates a steady carrier at the chunk rate
+        # (20 ms chunks = 50 Hz flutter, heard on a sig gen 2026-08-01).
         rms = float(np.sqrt(np.mean(audio * audio)) + 1e-9)
         a = 0.3 if rms > self._agc_level else 0.02
         self._agc_level = (1 - a) * self._agc_level + a * rms
-        audio = audio * (self._agc_target / max(self._agc_level, 1e-4))
+        g_new = self._agc_target / max(self._agc_level, 1e-4)
+        g_old = self._agc_gain if self._agc_gain is not None else g_new
+        audio = audio * np.linspace(g_old, g_new, len(audio))
+        self._agc_gain = g_new
         np.clip(audio, -1.0, 1.0, out=audio)
         return audio.tolist()
 
