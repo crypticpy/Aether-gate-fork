@@ -73,6 +73,29 @@ def test_audio_survives_realtime_supply_at_non_multiple_rate():
         f"tone landed at {peak_hz:.1f} Hz, expected {TONE_HZ:.0f} — resampler warps time")
 
 
+def test_ssb_sideband_selection_actually_selects():
+    # real(conj(z)) == real(z): the old 'LSB' path was a mathematical no-op, so
+    # USB and LSB were byte-identical and both sidebands folded together —
+    # found by ear ("strangely in usb and lsb ... no difference", 2026-08-01).
+    # A +1 kHz tone is UPPER sideband: USB must pass it, LSB must reject it.
+    t = np.arange(int(SAMP * 0.5)) / SAMP
+    tone = (0.1 * np.exp(2j * np.pi * 1000.0 * t)).astype(np.complex64)
+    blocks = np.array_split(tone, 20)
+
+    a_usb = _bench_adapter()
+    a_usb._mode = "USB"
+    usb = np.concatenate([a_usb._demod_block(b) for b in blocks])
+    a_lsb = _bench_adapter()
+    a_lsb._mode = "LSB"
+    lsb = np.concatenate([a_lsb._demod_block(b) for b in blocks])
+
+    u = np.sqrt(np.mean(usb[2000:] ** 2))
+    l = np.sqrt(np.mean(lsb[2000:] ** 2))
+    assert u > 10 * l, (
+        f"USB rms {u:.4f} vs LSB rms {l:.4f} — sideband selection not selecting "
+        f"(ratio {u / max(l, 1e-12):.1f}x, need >10x)")
+
+
 def test_sweet_spot_ratio_is_passthrough():
     a = SoapyAdapter(samp_rate=2_040_000)                    # 85 * 24 kHz exactly
     a._np = np

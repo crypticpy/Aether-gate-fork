@@ -185,6 +185,20 @@ class SoapyAdapter(RadioAdapter):
         self._rs_ratio = self._pd_rate / AUDIO_RATE        # input samples per output sample (>= 1)
         self._rs_phase = 0.0                               # fractional read position carry-over
         self._ar_buf = np.zeros(0, dtype=np.float64)       # demodulated audio at _pd_rate
+        # SSB sideband selection: a complex one-sided bandpass (lowpass taps
+        # shifted to +1500 Hz -> passband ~0..3 kHz above the carrier for USB;
+        # conjugate taps mirror it below for LSB). The previous 'demod' took
+        # real(z) — and real(conj(z)) == real(z), so USB and LSB were byte-
+        # identical and both sidebands folded together. Found by ear against a
+        # sig gen (2026-08-01): "strangely in usb and lsb ... no difference".
+        ssb_ntaps = 63
+        k = np.arange(ssb_ntaps) - (ssb_ntaps - 1) / 2.0
+        f_half = 1500.0 / self._pd_rate                    # half-width, normalised
+        lp = np.sinc(2 * f_half * k) * np.hamming(ssb_ntaps)
+        lp = lp / lp.sum()
+        self._ssb_usb = (lp * np.exp(2j * np.pi * (1500.0 / self._pd_rate) * k)).astype(np.complex128)
+        self._ssb_lsb = np.conj(self._ssb_usb)
+        self._ssb_state = np.zeros(ssb_ntaps - 1, dtype=np.complex128)
 
     def _demod_block(self, block):
         """One raw IQ block -> demodulated audio at _pd_rate (NCO + stages + SSB).
@@ -205,9 +219,11 @@ class SoapyAdapter(RadioAdapter):
             fir[1] = x[len(x) - (len(taps) - 1):]          # overlap-save (block-size safe)
             fir[3] = (offs - len(y)) % M                   # comb phase into the next block
             sig = y[offs::M]
-        if self._mode.startswith("LSB"):
-            return np.real(np.conj(sig))
-        return np.real(sig)
+        taps = self._ssb_lsb if self._mode.startswith("LSB") else self._ssb_usb
+        x = np.concatenate([self._ssb_state, sig])
+        y = np.convolve(x, taps, mode="valid")
+        self._ssb_state = x[len(x) - (len(taps) - 1):]
+        return 2.0 * np.real(y)                            # x2: real() halves the one-sided energy
 
     def close(self):
         self._run = False
