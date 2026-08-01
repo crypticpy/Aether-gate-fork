@@ -39,7 +39,8 @@ SOAPY_COMMIT="1551ea0"                     # "Fix SWIG parallel Device::make() o
 SOAPYRTL_REPO="https://github.com/pothosware/SoapyRTLSDR.git"
 SOAPYRTL_COMMIT="b1f568d"                  # "Update Github Action"
 
-GATE_USER="${SUDO_USER:-pi}"
+# AG_USER lets an image build (chroot, no sudo lineage) name the service user.
+GATE_USER="${AG_USER:-${SUDO_USER:-pi}}"
 GATE_HOME="$(getent passwd "$GATE_USER" | cut -d: -f6)"
 GATE_DIR="$GATE_HOME/gate"
 SRC_DIR="$GATE_HOME/gate-build"            # where the SDR sources are cloned/built
@@ -209,8 +210,14 @@ else
   sed -e "s#User=pi#User=$GATE_USER#" \
       -e "s#/home/pi/gate#$GATE_DIR#g" \
       "$UNIT_SRC" > /etc/systemd/system/aether-gate-setup.service
-  systemctl daemon-reload
-  systemctl enable --now aether-gate-setup.service
+  if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload
+    systemctl enable --now aether-gate-setup.service
+  else
+    # image-build chroot: systemd isn't running — enable is just a symlink,
+    # the service starts on the appliance's first real boot.
+    systemctl enable aether-gate-setup.service
+  fi
 fi
 
 # ------------------------------------------------------------------------------
