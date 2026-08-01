@@ -97,6 +97,17 @@ class SoapyAdapter(RadioAdapter):
                     k, v = kv.split("=", 1); args[k] = v
         self._sdr = SoapySDR.Device(args)
         self._sdr.setSampleRate(SOAPY_SDR_RX, 0, self.samp_rate)
+        # Never trust the requested rate: drivers snap to their own rate table
+        # (SDRplay honours only its discrete rates; a mismatch here plays audio
+        # pitch-shifted by actual/assumed and mis-scales every spectrum bin).
+        try:
+            actual = float(self._sdr.getSampleRate(SOAPY_SDR_RX, 0))
+        except Exception:
+            actual = 0.0
+        if actual > 0 and abs(actual - self.samp_rate) > 1.0:
+            print(f"[soapy] device runs {actual:.0f} S/s (requested {self.samp_rate:.0f}) — using actual",
+                  flush=True)
+            self.samp_rate = actual
         self._sdr.setFrequency(SOAPY_SDR_RX, 0, self.center_hz)
         try:
             self._sdr.setGainMode(SOAPY_SDR_RX, 0, bool(self.agc))   # AGC on/off
