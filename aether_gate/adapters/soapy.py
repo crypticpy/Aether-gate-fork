@@ -75,7 +75,7 @@ class SoapyAdapter(RadioAdapter):
         self._nco_phase = 0.0               # persistent mixer phase (continuity across blocks)
         self._decim = None                  # samp_rate / AUDIO_RATE (integer-ish); set in open()
         self._stages = []                   # decimation factors per stage
-        self._stage_firs = []               # [taps, overlap_state, M] per stage
+        self._stage_firs = []               # [taps, overlap_state, M, stride_offs] per stage
         self._iq_resid = None               # leftover IQ samples between audio calls
         self._audio_gain = 60.0             # post-demod fixed gain (SSB baseband is small)
         self._agc_level = 0.05              # AGC running estimate of audio level
@@ -146,29 +146,67 @@ class SoapyAdapter(RadioAdapter):
         self._stream = self._sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, [], stream_args)
         self._sdr.activateStream(self._stream)
 
-        # --- demod setup: STAGED decimation (samp_rate -> AUDIO_RATE) ---
-        # A single huge FIR at 2.048 MS/s is ~13x too slow on a Pi5 (70ms/call vs 5.3ms
-        # budget -> audio starves -> popping). Decimate in cheap stages instead: each
-        # stage is a short half/quarter-band FIR then [::M], so the expensive taps only
-        # ever run at progressively lower rates. 85 = 5 * 17; do 5 then 17.
-        self._decim = max(1, int(round(self.samp_rate / AUDIO_RATE)))   # 85 for 2.048M/24k
-        self._stages = self._factor_decim(self._decim)                  # e.g. [5, 17]
-        rate = self.samp_rate
-        self._stage_firs = []                                            # (taps, state) per stage
-        for M in self._stages:
-            # short anti-alias FIR for this stage: cutoff at the post-decimation Nyquist
-            ntaps = 4 * M + 1
-            cutoff = 0.45 / M                                            # normalised to this stage's input rate
-            idx = np.arange(ntaps) - (ntaps - 1) / 2.0
-            h = (np.sinc(2 * cutoff * idx) * np.hamming(ntaps))
-            h = (h / h.sum()).astype(np.float64)
-            self._stage_firs.append([h, np.zeros(ntaps - 1, dtype=np.complex128), M])
-            rate /= M
-        self._iq_resid = np.zeros(0, dtype=np.complex64)
+        self._init_demod()
 
         self._run = True
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
+
+    def _init_demod(self):
+        """Build the staged-decimation + fractional-resampler audio chain.
+
+        STAGED decimation (samp_rate -> ~AUDIO_RATE): a single huge FIR at
+        2.048 MS/s is ~13x too slow on a Pi5 (audio starves -> popping), so
+        decimate in cheap stages — each a short FIR then [::M], the expensive
+        taps running at ever-lower rates.
+
+        FLOOR (never round) the decimation so the post-decimation rate R is
+        >= AUDIO_RATE, then a phase-continuous linear resampler maps R exactly
+        onto the 24 kHz grid. round() bred a starvation clock: at 500 kS/s it
+        picked 21, consuming 504 k/s from a 500 k/s tap — a 0.8% deficit that
+        clicked every ~1.3 s regardless of band, mode or signal (found live
+        with a sig gen on 2 m, 2026-08-01). At the 2.040 MS/s sweet spot
+        (85 * 24 kHz exactly) the resampler ratio is 1.0 = a pass-through.
+        """
+        np = self._np
+        self._decim = max(1, int(self.samp_rate // AUDIO_RATE))
+        self._stages = self._factor_decim(self._decim)                  # e.g. 85 -> [5, 17]
+        self._stage_firs = []          # per stage: [taps, overlap state, M, stride offset]
+        for M in self._stages:
+            # short anti-alias FIR for this stage: cutoff at the post-decimation Nyquist
+            ntaps = 4 * M + 1
+            cutoff = 0.45 / M                              # normalised to this stage's input rate
+            idx = np.arange(ntaps) - (ntaps - 1) / 2.0
+            h = (np.sinc(2 * cutoff * idx) * np.hamming(ntaps))
+            h = (h / h.sum()).astype(np.float64)
+            self._stage_firs.append([h, np.zeros(ntaps - 1, dtype=np.complex128), M, 0])
+        self._pd_rate = self.samp_rate / self._decim       # post-decimation rate, >= AUDIO_RATE
+        self._rs_ratio = self._pd_rate / AUDIO_RATE        # input samples per output sample (>= 1)
+        self._rs_phase = 0.0                               # fractional read position carry-over
+        self._ar_buf = np.zeros(0, dtype=np.float64)       # demodulated audio at _pd_rate
+
+    def _demod_block(self, block):
+        """One raw IQ block -> demodulated audio at _pd_rate (NCO + stages + SSB).
+        Stride offsets carried per stage keep the [::M] comb aligned across
+        arbitrary block boundaries."""
+        np = self._np
+        iq = block.astype(np.complex128)
+        f_off = self._slice_hz - self.center_hz
+        step = 2.0 * np.pi * (-f_off) / self.samp_rate
+        ph = self._nco_phase + step * np.arange(len(iq))
+        iq = iq * np.exp(1j * ph)
+        self._nco_phase = (ph[-1] + step) % (2.0 * np.pi)
+        sig = iq
+        for fir in self._stage_firs:
+            taps, state, M, offs = fir
+            x = np.concatenate([state, sig])
+            y = np.convolve(x, taps, mode="valid")         # len == len(sig)
+            fir[1] = x[len(x) - (len(taps) - 1):]          # overlap-save (block-size safe)
+            fir[3] = (offs - len(y)) % M                   # comb phase into the next block
+            sig = y[offs::M]
+        if self._mode.startswith("LSB"):
+            return np.real(np.conj(sig))
+        return np.real(sig)
 
     def close(self):
         self._run = False
@@ -287,42 +325,22 @@ class SoapyAdapter(RadioAdapter):
         if mode is not None:
             self._mode = mode.upper()
 
-        # how many input samples we need for n_samples output after decimation
-        need_in = n_samples * self._decim
-        # drain queued IQ blocks into the residual buffer until we have enough
-        while len(self._iq_resid) < need_in and self._audio_q:
-            self._iq_resid = np.concatenate([self._iq_resid, self._audio_q.popleft()])
-        if len(self._iq_resid) < need_in:
+        # rate-R audio needed in the buffer to interpolate n_samples on the 24 k grid
+        need_r = int(np.ceil(self._rs_phase + n_samples * self._rs_ratio)) + 2
+        while len(self._ar_buf) < need_r and self._audio_q:
+            self._ar_buf = np.concatenate(
+                [self._ar_buf, self._demod_block(self._audio_q.popleft())])
+        if len(self._ar_buf) < need_r:
             return None                      # not enough IQ yet (stream still filling)
 
-        iq = self._iq_resid[:need_in].astype(np.complex128)
-        self._iq_resid = self._iq_resid[need_in:]
-
-        # 1) mix the slice down to baseband: shift by (slice - hardware centre)
-        f_off = self._slice_hz - self.center_hz
-        k = np.arange(len(iq))
-        ph = self._nco_phase + 2.0 * np.pi * (-f_off) / self.samp_rate * k
-        iq = iq * np.exp(1j * ph)
-        self._nco_phase = (ph[-1] + 2.0 * np.pi * (-f_off) / self.samp_rate) % (2.0 * np.pi)
-
-        # 2) STAGED anti-alias + decimate (cheap: taps run at ever-lower rates)
-        sig = iq
-        for fir in self._stage_firs:
-            taps, state, M = fir
-            x = np.concatenate([state, sig])
-            y = np.convolve(x, taps, mode="valid")       # len == len(sig)
-            fir[1] = sig[-(len(taps) - 1):]              # save overlap state
-            sig = y[::M]
-        base = sig[:n_samples]
-        if len(base) < n_samples:                        # pad a short tail block
-            base = np.concatenate([base, np.zeros(n_samples - len(base), dtype=base.dtype)])
-
-        # 3) SSB demod: USB = real part of the (already lowpassed) baseband; for LSB
-        #    conjugate first (mirrors the sideband). Real part recovers the audio.
-        if self._mode.startswith("LSB"):
-            audio = np.real(np.conj(base))
-        else:                                # USB / DIGU / default
-            audio = np.real(base)
+        # fractional resample _pd_rate -> AUDIO_RATE, phase-continuous across calls.
+        # At the 2.040 MS/s sweet spot the ratio is exactly 1.0 -> pure pass-through.
+        idx = self._rs_phase + np.arange(n_samples) * self._rs_ratio
+        audio = np.interp(idx, np.arange(len(self._ar_buf)), self._ar_buf)
+        nxt = self._rs_phase + n_samples * self._rs_ratio
+        k = int(np.floor(nxt))
+        self._ar_buf = self._ar_buf[k:]
+        self._rs_phase = nxt - k
 
         audio = audio * self._audio_gain
         # simple AGC: track signal level, scale toward target (fast attack, slow release)
