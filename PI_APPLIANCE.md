@@ -100,7 +100,8 @@ The installer is **idempotent** — safe to re-run (it skips builds already done
 |---|---|
 | **IC-9700 / Icom LAN** | **numpy only** — no native libs. The easy path. |
 | Kenwood / Yaesu (CAT) | hamlib (apt) + the SoapySDR stack (IF-tap spectrum) |
-| RTL / Airspy / SDRplay dongle | the SoapySDR stack |
+| RTL dongle | the SoapySDR stack |
+| **SDRplay (RSP1a etc.)** | the SoapySDR stack + the **SDRplay API daemon** (proprietary, fetched from sdrplay.com during install — installing implies accepting their licence) + SoapySDRPlay3. In the Setup UI, set the SoapySDR driver to `sdrplay`. |
 
 If you only run an Icom-LAN rig, `--no-sdr` skips the ~15-minute source build
 entirely.

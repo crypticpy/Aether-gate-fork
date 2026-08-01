@@ -38,6 +38,13 @@ SOAPY_REPO="https://github.com/pothosware/SoapySDR.git"
 SOAPY_COMMIT="1551ea0"                     # "Fix SWIG parallel Device::make() overloads (#474)"
 SOAPYRTL_REPO="https://github.com/pothosware/SoapyRTLSDR.git"
 SOAPYRTL_COMMIT="b1f568d"                  # "Update Github Action"
+# SDRplay (RSP1a etc.): proprietary API daemon + the Soapy module built against it.
+# The .run is fetched from SDRplay's own site; installing it implies accepting
+# their licence (a copy lands in /opt/sdrplay_api/sdrplay_license.txt).
+SDRPLAY_API_URL="https://www.sdrplay.com/software/SDRplay_RSP_API-Linux-3.15.2.run"
+SDRPLAY_API_SHA256="3a97ca764263bbe76fb0f2220e6408942357e8864c19e1408a6d6987af382fe3"
+SOAPYSDRPLAY_REPO="https://github.com/pothosware/SoapySDRPlay3.git"
+SOAPYSDRPLAY_COMMIT="6cc3131"              # merge PR #104 (2026-06-12)
 
 # AG_USER lets an image build (chroot, no sudo lineage) name the service user.
 GATE_USER="${AG_USER:-${SUDO_USER:-pi}}"
@@ -96,6 +103,8 @@ report() {
   chk sh -c 'command -v SoapySDRUtil'
   chk python3 -c 'import SoapySDR'
   chk sh -c 'SoapySDRUtil --info 2>/dev/null | grep -q rtlsdr'
+  chk test -x /opt/sdrplay_api/sdrplay_apiService
+  chk sh -c 'SoapySDRUtil --info 2>/dev/null | grep -qi sdrplay'
   chk sh -c 'command -v avahi-daemon || test -x /usr/sbin/avahi-daemon'
   say "Aether-gate"
   chk test -d "$GATE_DIR/aether_gate"
@@ -119,7 +128,7 @@ say "Aether-gate Pi installer  (user=$GATE_USER  gate=$GATE_DIR  with-sdr=$WITH_
 say "apt: base + build prerequisites"
 APT_PKGS=(python3 python3-numpy python3-dev libhamlib-utils avahi-daemon)
 if [ "$WITH_SDR" = 1 ]; then
-  APT_PKGS+=(build-essential cmake git pkg-config libusb-1.0-0-dev swig)
+  APT_PKGS+=(build-essential cmake git pkg-config libusb-1.0-0-dev swig curl)
 fi
 run "apt-get update -y"
 run "apt-get install -y ${APT_PKGS[*]}"
@@ -148,18 +157,91 @@ if [ "$WITH_SDR" = 1 ]; then
   if command -v SoapySDRUtil >/dev/null 2>&1 && SoapySDRUtil --info 2>/dev/null | grep -q rtlsdr; then
     info "SoapySDR + rtlsdr module already present — skipping SDR build (re-run with a wiped $SRC_DIR to force)."
   else
-    say "SDR build 1/3: rtl-sdr-blog (V4 fork) -> /usr/local"
+    say "SDR build 1/5: rtl-sdr-blog (V4 fork) -> /usr/local"
     clone_pin "$RTLSDR_REPO" "$RTLSDR_COMMIT" "$SRC_DIR/rtl-sdr-blog"
     build_cmake "$SRC_DIR/rtl-sdr-blog" "-DINSTALL_UDEV_RULES=ON -DDETACH_KERNEL_DRIVER=OFF"
 
-    say "SDR build 2/3: SoapySDR core (+ python3 bindings) -> /usr/local"
+    say "SDR build 2/5: SoapySDR core (+ python3 bindings) -> /usr/local"
     clone_pin "$SOAPY_REPO" "$SOAPY_COMMIT" "$SRC_DIR/SoapySDR"
     build_cmake "$SRC_DIR/SoapySDR" "-DENABLE_PYTHON3=ON"
 
-    say "SDR build 3/3: SoapyRTLSDR module -> /usr/local"
+    say "SDR build 3/5: SoapyRTLSDR module -> /usr/local"
     clone_pin "$SOAPYRTL_REPO" "$SOAPYRTL_COMMIT" "$SRC_DIR/SoapyRTLSDR"
     build_cmake "$SRC_DIR/SoapyRTLSDR"
 
+    run "/sbin/ldconfig"
+  fi
+
+  # ---- SDRplay (RSP1a/RSP2/RSPdx...): proprietary API + SoapySDRPlay3 ----------
+  if [ -e /usr/local/lib/libsdrplay_api.so ] && SoapySDRUtil --info 2>/dev/null | grep -q sdrplay; then
+    info "SDRplay API + Soapy module already present — skipping."
+  else
+    say "SDR build 4/5: SDRplay API 3.15 (proprietary) -> /usr/local + /opt/sdrplay_api"
+    info "fetching from sdrplay.com — installing implies accepting their licence"
+    if [ "$DRY_RUN" = 1 ]; then
+      info "[dry-run] download+verify+extract $SDRPLAY_API_URL; install lib/headers/daemon/udev/service"
+    else
+      RUNFILE="$SRC_DIR/sdrplay-api.run"
+      if ! echo "$SDRPLAY_API_SHA256  $RUNFILE" | sha256sum -c - >/dev/null 2>&1; then
+        curl -fSL -o "$RUNFILE" "$SDRPLAY_API_URL"
+        echo "$SDRPLAY_API_SHA256  $RUNFILE" | sha256sum -c - \
+          || { echo "SDRplay API download failed its pinned sha256"; exit 1; }
+      fi
+      rm -rf "$SRC_DIR/sdrplay-extract"
+      sh "$RUNFILE" --noexec --target "$SRC_DIR/sdrplay-extract" >/dev/null
+      cd "$SRC_DIR/sdrplay-extract"
+      # mirror install_lib.sh's actions for arm64, minus the interactive licence pager
+      rm -f /usr/local/lib/libsdrplay_api.so*
+      cp -f arm64/libsdrplay_api.so.3.15 /usr/local/lib/
+      ln -s /usr/local/lib/libsdrplay_api.so.3.15 /usr/local/lib/libsdrplay_api.so.3
+      ln -s /usr/local/lib/libsdrplay_api.so.3 /usr/local/lib/libsdrplay_api.so
+      cp -f inc/sdrplay_api*.h /usr/local/include/
+      chmod 644 /usr/local/include/sdrplay_api*.h
+      install -d -m 755 /opt/sdrplay_api
+      cp -f arm64/sdrplay_apiService /opt/sdrplay_api/
+      chmod 755 /opt/sdrplay_api/sdrplay_apiService
+      cp -f sdrplay_license.txt /opt/sdrplay_api/
+      cat > /etc/udev/rules.d/66-sdrplay.rules <<'RULES'
+SUBSYSTEM=="usb",ENV{DEVTYPE}=="usb_device",ATTRS{idVendor}=="1df7",ATTRS{idProduct}=="2500",MODE:="0666"
+SUBSYSTEM=="usb",ENV{DEVTYPE}=="usb_device",ATTRS{idVendor}=="1df7",ATTRS{idProduct}=="3000",MODE:="0666"
+SUBSYSTEM=="usb",ENV{DEVTYPE}=="usb_device",ATTRS{idVendor}=="1df7",ATTRS{idProduct}=="3010",MODE:="0666"
+SUBSYSTEM=="usb",ENV{DEVTYPE}=="usb_device",ATTRS{idVendor}=="1df7",ATTRS{idProduct}=="3020",MODE:="0666"
+SUBSYSTEM=="usb",ENV{DEVTYPE}=="usb_device",ATTRS{idVendor}=="1df7",ATTRS{idProduct}=="3030",MODE:="0666"
+SUBSYSTEM=="usb",ENV{DEVTYPE}=="usb_device",ATTRS{idVendor}=="1df7",ATTRS{idProduct}=="3050",MODE:="0666"
+SUBSYSTEM=="usb",ENV{DEVTYPE}=="usb_device",ATTRS{idVendor}=="1df7",ATTRS{idProduct}=="3060",MODE:="0666"
+RULES
+      chmod 644 /etc/udev/rules.d/66-sdrplay.rules
+      cat > /etc/systemd/system/sdrplay.service <<'UNIT'
+[Unit]
+Description=SDRplay API Service
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=1
+User=root
+ExecStart=/opt/sdrplay_api/sdrplay_apiService
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+      chmod 644 /etc/systemd/system/sdrplay.service
+      if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        systemctl enable --now sdrplay
+        udevadm control --reload-rules 2>/dev/null || true
+      else
+        systemctl enable sdrplay   # image-build chroot: starts on first real boot
+      fi
+      /sbin/ldconfig
+      cd - >/dev/null
+    fi
+
+    say "SDR build 5/5: SoapySDRPlay3 module -> /usr/local"
+    clone_pin "$SOAPYSDRPLAY_REPO" "$SOAPYSDRPLAY_COMMIT" "$SRC_DIR/SoapySDRPlay3"
+    build_cmake "$SRC_DIR/SoapySDRPlay3"
     run "/sbin/ldconfig"
   fi
 
