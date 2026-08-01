@@ -126,7 +126,8 @@ say "Aether-gate Pi installer  (user=$GATE_USER  gate=$GATE_DIR  with-sdr=$WITH_
 # 1) apt packages
 # ------------------------------------------------------------------------------
 say "apt: base + build prerequisites"
-APT_PKGS=(python3 python3-numpy python3-dev libhamlib-utils avahi-daemon)
+# tcpdump: an appliance you can't wiretap is one you can't diagnose (2026-08-01)
+APT_PKGS=(python3 python3-numpy python3-dev libhamlib-utils avahi-daemon tcpdump)
 if [ "$WITH_SDR" = 1 ]; then
   APT_PKGS+=(build-essential cmake git pkg-config libusb-1.0-0-dev swig curl)
 fi
