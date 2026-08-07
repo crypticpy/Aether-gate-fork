@@ -1456,7 +1456,26 @@ class Radio:
                 return
             sl = self.slices.setdefault(idx, {"freq": self.slice_freq, "mode": self.slice_mode,
                                               "active": False, "pan": self._primary_pan()})
-            if "mode" in kvs: sl["mode"] = kvs["mode"]
+            # A MODE CHANGE MUST REACH THE ADAPTER ON ITS OWN. set_mode() is
+            # otherwise only called from _sync_active_slice()'s retune block, so
+            # it fires when the FREQUENCY changes and not when only the mode
+            # does. Tune to 145.070 first, switch to FM three minutes later, and
+            # the adapter stayed on the mode it was last told — demodulating SSB
+            # while AE showed FM. That is invisible from the AE end (the display
+            # is correct, the audio is plausible) and it is why 2 m packet still
+            # would not decode after the FM demodulator existed and was deployed
+            # (found live 2026-08-07: tune at 17:56:20, mode=DFM at 17:59:19,
+            # no set_mode in between).
+            if "mode" in kvs:
+                mode_changed = kvs["mode"] != sl.get("mode")
+                sl["mode"] = kvs["mode"]
+                if mode_changed and idx == self.active_slice \
+                        and self.adapter is not None and hasattr(self.adapter, "set_mode"):
+                    try:
+                        self.adapter.set_mode(sl["mode"])
+                        log(f"[adapter] mode -> {sl['mode']} (slice {idx})")
+                    except Exception as e:
+                        log("[adapter] set_mode error:", e)
             if "audio_mute" in kvs:
                 sl["muted"] = (kvs["audio_mute"] == "1")
                 log(f"[slice] {idx} audio_mute={kvs['audio_mute']}")
