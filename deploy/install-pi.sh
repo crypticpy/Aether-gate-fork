@@ -312,7 +312,17 @@ fi
 # surprises, matches how the Pi5 runs). Excludes dev/junk. If the script is being
 # run FROM $GATE_DIR already, this is a no-op.
 say "Deploy aether_gate -> $GATE_DIR"
-if [ "$REPO_ROOT" != "$GATE_DIR" ]; then
+# NO SOURCE TO DEPLOY IS NOT AN ERROR. REPO_ROOT is derived from this script's
+# own location, so running a COPY of it (from /tmp, or via add-sdrplay.sh on an
+# appliance where only deploy/ was staged) resolves REPO_ROOT to a directory
+# with no aether_gate/ in it — and the copy died on `cp //aether_gate` under
+# set -e, taking the verification block with it. The SDR work had already
+# succeeded at that point, so the run looked like a failure when it was not.
+# An appliance already HAS the package; adding SDRplay must not require the
+# whole source tree.
+if [ ! -d "$REPO_ROOT/aether_gate" ]; then
+  info "no aether_gate/ next to this script — skipping deploy (already installed?)"
+elif [ "$REPO_ROOT" != "$GATE_DIR" ]; then
   run "install -d -o '$GATE_USER' -g '$GATE_USER' '$GATE_DIR'"
   run "cp -r '$REPO_ROOT/aether_gate' '$GATE_DIR/'"
   run "cp -r '$REPO_ROOT/deploy' '$GATE_DIR/'"
