@@ -248,6 +248,52 @@ def test_capture_effect_a_carrier_dominates_added_noise():
         "— the carrier is not capturing the discriminator")
 
 
+def test_get_audio_output_does_not_clip_on_noise():
+    """THE OUTPUT AE ACTUALLY RECEIVES must not be saturated.
+
+    test_noise_does_not_clip_the_discriminator checks _demod_fm's internal
+    output, which is not what leaves the adapter: get_audio() applies its own
+    trim afterwards. A x3 trim added in the same commit as the scaling fix put
+    noise back at 1.73 RMS and clipped 40% of samples on a quiet channel — the
+    internal test still passed. This one measures the real thing.
+    """
+    fs = 240_000.0
+    a = _adapter(fs)
+    a._mode = "FM"
+    rng = np.random.default_rng(99)
+    n = int(fs * 0.5)
+    a._audio_q.append((rng.normal(size=n) + 1j * rng.normal(size=n)).astype(np.complex128))
+    out = np.array(a.get_audio(4096))
+    assert len(out) == 4096
+    rms = float(np.sqrt(np.mean(out ** 2)))
+    clipped = float(np.mean(np.abs(out) > 0.98))
+    assert rms < 0.8, f"get_audio noise RMS {rms:.3f} — output is saturated"
+    assert clipped < 0.02, f"{clipped*100:.1f}% of output samples are clipped"
+
+
+def test_get_audio_preserves_signal_to_noise_ratio():
+    """A signal must stay proportionally above the noise through get_audio().
+
+    Guards the property the AFSK slicer depends on: whatever gain is applied,
+    it must not compress signal and noise together (an AGC) or clip either.
+    """
+    fs = 240_000.0
+    rng = np.random.default_rng(3)
+    n = int(fs * 0.5)
+
+    quiet = _adapter(fs); quiet._mode = "FM"
+    quiet._audio_q.append((0.05 * (rng.normal(size=n) + 1j * rng.normal(size=n))).astype(np.complex128))
+    q = float(np.sqrt(np.mean(np.array(quiet.get_audio(4096)) ** 2)))
+
+    loud = _adapter(fs); loud._mode = "FM"
+    loud._audio_q.append(_fm_iq(n, fs, 1200.0, 3000.0, amp=1.0))
+    s_out = np.array(loud.get_audio(4096))
+    tone = _tone_amp(s_out, AUDIO_RATE, 1200.0)
+
+    assert tone > 0.05, f"recovered tone {tone:.4f} is too small to slice"
+    assert float(np.max(np.abs(s_out))) <= 1.0001, "signal path clips"
+
+
 def test_fm_does_not_use_the_ssb_taps():
     """Direct regression on the original defect: the FM path must not be the
     SSB path. Demodulating the same FM signal as FM and as USB must differ."""

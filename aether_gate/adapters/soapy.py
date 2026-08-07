@@ -491,14 +491,19 @@ class SoapyAdapter(RadioAdapter):
             # envelope across a packet moves that decision threshold mid-frame.
             # A fixed trim only.
             #
-            # _demod_fm now normalises against the discriminator's full +/-pi
-            # range, so a typical NBFM signal (3 kHz deviation on a 24 kHz grid
-            # = 0.79 rad/sample = 0.25 after scaling) needs lifting to a usable
-            # level. x3 puts that near 0.75 with headroom, and leaves broadband
-            # noise — which sits around 0.58 after the same scaling — below full
-            # scale instead of hard-clipped. The point is that signal and noise
-            # keep their RELATIVE levels, which is what the AFSK slicer needs.
-            audio = audio * 3.0
+            # NO TRIM. _demod_fm normalises against the discriminator's full
+            # +/-pi range, which already puts the output in the right place:
+            # broadband noise lands at 1/sqrt(3) = 0.58 RMS and a 3 kHz-deviation
+            # signal at 0.18. Those numbers look "quiet", and the temptation is
+            # to multiply them up — a x3 trim did exactly that and put noise at
+            # 1.73, i.e. 40% of samples clipped, undoing the scaling fix in the
+            # same commit that made it.
+            #
+            # A narrowband signal being quieter than full-band noise is CORRECT
+            # for FM: noise power grows with bandwidth, and the signal only wins
+            # once it captures the discriminator. Preserving that ratio is the
+            # whole point — the AFSK slicer needs the relative levels, not a
+            # loud output.
             np.clip(audio, -1.0, 1.0, out=audio)
             return audio.tolist()
 
