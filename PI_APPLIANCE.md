@@ -46,6 +46,76 @@ user, so it works whatever username you pick in Imager — and works even if you
 skip Imager customisation entirely. Provenance is stamped in
 `/etc/aether-gate-image-release`.
 
+**Which Pi?** One image covers **Pi 3, 3B+, 4, 5 and Zero 2 W** — it is stock
+64-bit Pi OS, so any board Pi OS calls 64-bit-capable will boot it. A **Pi 4 or
+5 is the recommendation**: the Pi 3 shares one USB 2 bus between Ethernet and
+USB, which shows up as audio stutter at high sample rates. ❌ **Pi 1, Pi 2 and
+the original Pi Zero cannot run it** — they are 32-bit (ARMv6/v7) and there is
+no 64-bit kernel for them. The failure looks alive but is not: solid red LED,
+green activity flickering, and the Pi never appears on the network. If that is
+what you see, check the board — the Ethernet MAC prefix `b8:27:eb` is shared by
+Pi 1 through Pi 3 and cannot tell them apart, so read the silkscreen.
+
+### SDRplay (RSP1a, RSP2, RSPdx…) — one extra command
+
+The published image does **not** include SDRplay support. Their API is
+proprietary and its licence does not permit us to redistribute it inside an
+image. It installs fine on your own Pi, where you accept their licence
+yourself:
+
+On the appliance itself (the script is already on the card):
+
+```sh
+sudo /home/aethergate/gate/deploy/add-sdrplay.sh
+```
+
+It is safe to re-run, refreshes the package lists the image ships without, and
+verifies the daemon and the SoapySDR driver rather than just assuming they came
+up. Then pick `sdrplay` as the driver in the Setup UI.
+
+**All RSP models are covered by one driver.** SDRplay's API claims the whole
+family — RSP1 (`2500`), RSP1a (`3000`), RSP1B (`3010`), RSP2/2pro (`3020`),
+RSPduo (`3030`), RSPdx (`3050`) and RSPdx-R2 (`3060`) — so the same install
+serves any of them. Only the RSP1a has been tested here; the RSPduo's dual-tuner
+modes in particular need extra Soapy device arguments that the Setup UI does not
+expose yet.
+
+Everything else — RTL-SDR, HPSDR/Hermes-Lite 2/Radioberry, and network Icoms —
+works straight off the flashed card with nothing extra to install.
+
+### ⚠ If 2 m and 70 cm never appear in AetherSDR
+
+Pass **`--model FLEX-6700`**. AE decides which bands to offer from the radio
+model the gate advertises, and a **FLEX-6600 is HF + 6 m only** — so 2 m simply
+never shows up, no matter what your SDR can actually tune. The 6700 has native
+2 m, and advertising it also raises the slice cap from 4 to 8.
+
+This bites because the command-line default is `FLEX-6600`, and it *overrides*
+the SDR adapter's own `FLEX-6700` default. It has to be stated explicitly.
+
+### Making it start at boot
+
+The Setup UI runs the gate as a child process, so it stops when the launcher
+does and does not come back after a power cut. For an always-on appliance,
+install the service instead:
+
+```sh
+sudo cp /home/aethergate/gate/deploy/systemd/aether-gate-sdr.service /etc/systemd/system/
+sudoedit /etc/systemd/system/aether-gate-sdr.service   # set --soapy-driver, --ae, --model
+sudo systemctl daemon-reload
+sudo systemctl enable --now aether-gate-sdr
+journalctl -u aether-gate-sdr -f
+```
+
+Verified on a Pi 3B+ with an RSP1a: after a reboot the Pi is back in about 40
+seconds with the gate already running and AetherSDR reconnecting on its own.
+
+> **RSP tuning note:** sample rates below 2 MHz carry an uncompensated Low-IF
+> offset (≈13 kHz low at 500 k, ≈16 kHz at 1 M). Use **2 MHz or higher** and
+> the tuning is true. Measured on an RSP1a — it is a property of the Low-IF
+> plan, so expect it family-wide, but the exact figures are not characterised
+> for other models.
+
 ### Building the image yourself
 
 `deploy/build-image.sh` reproduces it from any 64-bit Pi (4/5) or other
@@ -57,6 +127,11 @@ git clone https://github.com/nigelfenton/Aether-gate.git
 cd Aether-gate
 sudo ./deploy/build-image.sh          # -> out/aether-gate-pi-<ver>.img.xz
 ```
+
+Add `--with-sdrplay` to bake SDRplay support into your own image. That output
+is named `…-sdrplay-DO-NOT-REDISTRIBUTE.img.xz`, because it is fine for your
+own hardware but must not be published or passed on — see the SDRplay note
+above.
 
 ---
 
