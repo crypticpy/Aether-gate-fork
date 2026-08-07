@@ -200,6 +200,37 @@ class SoapyAdapter(RadioAdapter):
         self._ssb_lsb = np.conj(self._ssb_usb)
         self._ssb_state = np.zeros(ssb_ntaps - 1, dtype=np.complex128)
 
+        # --- NBFM: a REAL discriminator, not the SSB path ------------------
+        # Everything that was not LSB used to fall through to the USB taps, so
+        # asking for FM got an SSB product detector. That sounds plausible to
+        # the ear — which is exactly why it survived — but it destroys the
+        # 1200/2200 Hz Bell 202 tone pair AX.25 rides on, because those tones
+        # live in the FM DEVIATION and slope-detecting them mangles their
+        # relative amplitude and phase. Packet never decoded on 2 m for that
+        # reason (found live 2026-08-07: clean-sounding audio, zero decodes).
+        #
+        # Channel filter BEFORE the discriminator. FM is not linear, so any
+        # adjacent-channel energy reaching it intermodulates with the wanted
+        # signal and cannot be filtered out afterwards. ~+/-8 kHz passband
+        # covers Carson for 2.5-5 kHz deviation NBFM without clipping the
+        # sidebands that carry the tones.
+        fm_ntaps = 63
+        kf = np.arange(fm_ntaps) - (fm_ntaps - 1) / 2.0
+        fm_half = min(8000.0 / self._pd_rate, 0.45)        # normalised half-width
+        fh = np.sinc(2 * fm_half * kf) * np.hamming(fm_ntaps)
+        self._fm_taps = (fh / fh.sum()).astype(np.float64)
+        self._fm_state = np.zeros(fm_ntaps - 1, dtype=np.complex128)
+        # Discriminator continuity: the last sample of the previous block, so
+        # angle(x[n] * conj(x[n-1])) is unbroken across block boundaries. A
+        # reset here would inject a phase glitch every block — an audible tick
+        # at the block rate, and a bit error in the middle of a packet.
+        self._fm_prev = np.complex128(0)
+        # De-emphasis is DELIBERATELY OFF for data. Broadcast/voice FM applies
+        # 75 us (or 50 us) de-emphasis to undo transmit pre-emphasis, but AFSK
+        # packet is not pre-emphasised: rolling off 2200 Hz relative to 1200 Hz
+        # would skew the very tone ratio the demodulator downstream measures.
+        self._fm_deemph = None
+
     def _demod_block(self, block):
         """One raw IQ block -> demodulated audio at _pd_rate (NCO + stages + SSB).
         Stride offsets carried per stage keep the [::M] comb aligned across
@@ -219,11 +250,65 @@ class SoapyAdapter(RadioAdapter):
             fir[1] = x[len(x) - (len(taps) - 1):]          # overlap-save (block-size safe)
             fir[3] = (offs - len(y)) % M                   # comb phase into the next block
             sig = y[offs::M]
+        if self._is_fm_mode(self._mode):
+            return self._demod_fm(sig)
         taps = self._ssb_lsb if self._mode.startswith("LSB") else self._ssb_usb
         x = np.concatenate([self._ssb_state, sig])
         y = np.convolve(x, taps, mode="valid")
         self._ssb_state = x[len(x) - (len(taps) - 1):]
         return 2.0 * np.real(y)                            # x2: real() halves the one-sided energy
+
+    @staticmethod
+    def _is_fm_mode(mode):
+        """True for every mode AE may send that means 'frequency modulation'.
+
+        AE sends the Flex data-mode variants too: DFM is FM-with-data-filters,
+        NFM is narrow FM. All three want the discriminator. Anything else
+        (LSB/USB/DIGU/DIGL/CW/AM/...) stays on the SSB path, which is also the
+        safe fallback for a mode we do not model.
+        """
+        return (mode or "").upper() in ("FM", "FM-N", "NFM", "DFM")
+
+    def _demod_fm(self, sig):
+        """NBFM quadrature discriminator: angle(x[n] * conj(x[n-1])).
+
+        The instantaneous frequency IS the phase advance between consecutive
+        samples, so the product with the previous sample's conjugate gives the
+        deviation directly. Carrying _fm_prev across blocks keeps that
+        difference unbroken — see _init_demod for why that matters.
+        """
+        np = self._np
+        # channel filter first (see _init_demod: FM is non-linear)
+        x = np.concatenate([self._fm_state, sig])
+        z = np.convolve(x, self._fm_taps, mode="valid")
+        self._fm_state = x[len(x) - (len(self._fm_taps) - 1):]
+        if len(z) == 0:
+            return np.zeros(0, dtype=np.float64)
+        prev = np.concatenate([[self._fm_prev], z[:-1]])
+        self._fm_prev = z[-1]
+        disc = np.angle(z * np.conj(prev))                 # radians/sample = deviation
+        # radians/sample -> a normalised audio swing. Full scale is +/-pi, but
+        # NBFM at 5 kHz deviation on a ~24 kHz grid only reaches ~pi*5/12, so
+        # scale by pd_rate/(2*pi*peak_dev) to land near +/-1 rather than leaving
+        # packet audio 4x too quiet for the AGC to sort out.
+        peak_dev = 5000.0
+        disc = disc * (self._pd_rate / (2.0 * np.pi * peak_dev))
+        # DC block: any residual tuning offset shows up as a constant frequency
+        # error, i.e. a DC term after the discriminator. Left in, it walks the
+        # AFSK slicer's decision threshold off centre and costs bits. One-pole
+        # highpass, ~10 Hz, well below the 1200 Hz mark tone.
+        # VECTORISED, not a per-sample loop. A Python loop here would run at the
+        # post-decimation rate on every block — the same shape of mistake that
+        # starved the audio clock before (see _init_demod). Subtracting a
+        # block-mean that is itself smoothed across blocks gives the same ~10 Hz
+        # highpass behaviour with one numpy op.
+        blk_mean = float(np.mean(disc))
+        if getattr(self, "_fm_dc", None) is None:
+            self._fm_dc = blk_mean
+        # per-block one-pole toward the block mean: a = 1-exp(-2*pi*fc*N/fs)
+        a = 1.0 - np.exp(-2.0 * np.pi * 10.0 * len(disc) / self._pd_rate)
+        self._fm_dc += a * (blk_mean - self._fm_dc)
+        return disc - self._fm_dc
 
     def close(self):
         self._run = False
@@ -367,6 +452,20 @@ class SoapyAdapter(RadioAdapter):
         k = int(np.floor(nxt))
         self._ar_buf = self._ar_buf[k:]
         self._rs_phase = nxt - k
+
+        if self._is_fm_mode(self._mode):
+            # FM IS ALREADY LEVEL. The discriminator output depends on deviation,
+            # not on received amplitude — that is the whole point of FM — so it
+            # arrives near full scale and needs neither the x60 SSB baseband
+            # gain (which would just clip it) nor an AGC.
+            #
+            # The AGC is actively HARMFUL here: AFSK slices on the relative
+            # amplitude of the 1200/2200 Hz tones, and a gain that chases the
+            # envelope across a packet moves that decision threshold mid-frame.
+            # A fixed trim only.
+            audio = audio * 0.8
+            np.clip(audio, -1.0, 1.0, out=audio)
+            return audio.tolist()
 
         audio = audio * self._audio_gain
         # simple AGC: track signal level, scale toward target (fast attack, slow release).
