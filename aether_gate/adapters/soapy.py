@@ -291,8 +291,18 @@ class SoapyAdapter(RadioAdapter):
         # NBFM at 5 kHz deviation on a ~24 kHz grid only reaches ~pi*5/12, so
         # scale by pd_rate/(2*pi*peak_dev) to land near +/-1 rather than leaving
         # packet audio 4x too quiet for the AGC to sort out.
-        peak_dev = 5000.0
-        disc = disc * (self._pd_rate / (2.0 * np.pi * peak_dev))
+        # SCALE AGAINST THE FULL DISCRIMINATOR RANGE, NOT AGAINST PEAK DEVIATION.
+        # angle() returns +/-pi, so dividing by pi maps the whole possible output
+        # onto +/-1 and NOTHING can clip. The previous scaling (pd_rate /
+        # (2*pi*peak_dev) = 0.76) was calibrated so a 5 kHz-deviation tone hit
+        # full scale — but noise, whose phase steps are uniform over +/-pi, has
+        # an RMS of pi/sqrt(3) = 1.81 rad/sample and therefore came out at 1.39,
+        # i.e. HARD CLIPPED, while a real 3 kHz-deviation signal only reached
+        # 0.79. The clipper ate the signal and passed the noise: measured RMS
+        # 0.65 with 24% clipping on a quiet channel, identical at 6, 20 and
+        # 40 dB of RF gain (found 2026-08-07 — RF gain having no effect at all
+        # was the clue that the saturation was ours, not the front end's).
+        disc = disc * (1.0 / np.pi)
         # DC block: any residual tuning offset shows up as a constant frequency
         # error, i.e. a DC term after the discriminator. Left in, it walks the
         # AFSK slicer's decision threshold off centre and costs bits. One-pole
@@ -480,7 +490,15 @@ class SoapyAdapter(RadioAdapter):
             # amplitude of the 1200/2200 Hz tones, and a gain that chases the
             # envelope across a packet moves that decision threshold mid-frame.
             # A fixed trim only.
-            audio = audio * 0.8
+            #
+            # _demod_fm now normalises against the discriminator's full +/-pi
+            # range, so a typical NBFM signal (3 kHz deviation on a 24 kHz grid
+            # = 0.79 rad/sample = 0.25 after scaling) needs lifting to a usable
+            # level. x3 puts that near 0.75 with headroom, and leaves broadband
+            # noise — which sits around 0.58 after the same scaling — below full
+            # scale instead of hard-clipped. The point is that signal and noise
+            # keep their RELATIVE levels, which is what the AFSK slicer needs.
+            audio = audio * 3.0
             np.clip(audio, -1.0, 1.0, out=audio)
             return audio.tolist()
 

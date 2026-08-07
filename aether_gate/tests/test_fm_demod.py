@@ -188,6 +188,66 @@ def test_block_boundaries_do_not_glitch():
     assert float(np.max(np.abs(np.diff(got[:n])))) < 5.0 * float(np.std(got[:n])) + 1.0
 
 
+def test_noise_does_not_clip_the_discriminator():
+    """NOISE MUST NOT SATURATE THE OUTPUT.
+
+    angle() spans +/-pi, and broadband noise has phase steps uniform over that
+    range: RMS pi/sqrt(3) = 1.81 rad/sample. Scaling calibrated so a 5 kHz-
+    deviation TONE hits full scale therefore put noise at 1.39 — hard clipped —
+    while a real 3 kHz-deviation signal only reached 0.79. The clipper ate the
+    signal and passed the noise, and no amount of RF gain changed it (measured
+    identical at 6, 20 and 40 dB on 2026-08-07).
+
+    The other tests here all measure ratios or frequencies, so every one of them
+    passed while this was broken. This one asserts the absolute level.
+    """
+    a = _adapter()
+    a._mode = "FM"
+    fs = a.samp_rate
+    rng = np.random.default_rng(12345)
+    n = int(fs * 0.2)
+    noise = (rng.normal(size=n) + 1j * rng.normal(size=n)).astype(np.complex128)
+    out = a._demod_fm(noise)
+    assert len(out) > 0
+    rms = float(np.sqrt(np.mean(out ** 2)))
+    peak = float(np.max(np.abs(out)))
+    assert rms < 0.8, f"noise RMS {rms:.3f} — the discriminator output saturates on noise"
+    assert peak <= 1.05, f"noise peak {peak:.3f} exceeds the +/-1 audio range"
+
+
+def test_capture_effect_a_carrier_dominates_added_noise():
+    """A carrier plus noise must demodulate to the TONE, not to the noise.
+
+    NB comparing a bare signal against BARE noise is not the right test and it
+    misled me once: with no carrier at all the discriminator sees uniformly
+    random phase and legitimately outputs more than a narrowband signal does
+    (FM noise power grows with bandwidth). What matters on a real channel is
+    the capture effect — once a carrier is present it dominates the phase, and
+    the recovered tone must stand clear of what is left.
+    """
+    fs = 240_000.0
+    rng = np.random.default_rng(7)
+    n = int(fs * 0.25)
+    sig = _fm_iq(n, fs, 1200.0, 3000.0, amp=1.0)
+    noise = 0.1 * (rng.normal(size=n) + 1j * rng.normal(size=n))
+
+    a = _adapter(fs)
+    a._mode = "FM"
+    # through the FULL block path, not _demod_fm alone: _demod_fm expects data
+    # already decimated to pd_rate, so feeding it raw samp_rate IQ measures
+    # nothing real. (Doing exactly that in a scratch script made a correct
+    # demodulator look like it had a 10x frequency error — I had computed the
+    # frequency axis at the wrong rate and nearly "fixed" working code.)
+    out = a._demod_block((sig + noise).astype(np.complex128))
+
+    assert abs(_dominant_hz(out, a._pd_rate) - 1200.0) < 40.0
+    tone = _tone_amp(out, a._pd_rate, 1200.0)
+    total = float(np.sqrt(np.mean(out ** 2)))
+    assert tone > 0.3 * total, (
+        f"recovered 1200 Hz tone {tone:.4f} is small against total {total:.4f} "
+        "— the carrier is not capturing the discriminator")
+
+
 def test_fm_does_not_use_the_ssb_taps():
     """Direct regression on the original defect: the FM path must not be the
     SSB path. Demodulating the same FM signal as FM and as USB must differ."""
