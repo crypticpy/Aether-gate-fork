@@ -338,11 +338,28 @@ class SoapyAdapter(RadioAdapter):
         while self._run:
             # apply any pending retune on this thread (avoid racing readStream)
             if self._retune_to is not None:
+                want = float(self._retune_to)
                 try:
-                    self._sdr.setFrequency(self._SOAPY_SDR_RX, 0, float(self._retune_to))
-                    self.center_hz = float(self._retune_to)
-                except Exception:
-                    pass
+                    self._sdr.setFrequency(self._SOAPY_SDR_RX, 0, want)
+                    # READ IT BACK. A silent 'except: pass' here left the tuner
+                    # wherever it was while every layer above believed the retune
+                    # had happened — the panadapter, the slice and AE all showed
+                    # the new frequency and the receiver was still on the old one.
+                    # Same lesson as setSampleRate: never trust a setter on this
+                    # driver, and never swallow its failure.
+                    try:
+                        got = float(self._sdr.getFrequency(self._SOAPY_SDR_RX, 0))
+                    except Exception:
+                        got = want
+                    self.center_hz = got
+                    if abs(got - want) > 1000.0:
+                        print(f"[soapy] RETUNE MISMATCH: asked {want/1e6:.6f} MHz, "
+                              f"tuner reports {got/1e6:.6f} MHz", flush=True)
+                    else:
+                        print(f"[soapy] tuned to {got/1e6:.6f} MHz", flush=True)
+                except Exception as e:
+                    print(f"[soapy] RETUNE FAILED to {want/1e6:.6f} MHz: {e!r} "
+                          f"(still on {self.center_hz/1e6:.6f} MHz)", flush=True)
                 self._retune_to = None
             _t0 = _time.perf_counter() if _prof else 0.0
             sr = self._sdr.readStream(self._stream, [buf], CHUNK, timeoutUs=200000)
