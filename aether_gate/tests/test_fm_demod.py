@@ -395,3 +395,36 @@ def test_offset_tune_keeps_the_slice_in_the_window():
     a.set_slice(target)
     new_center = a._retune_to
     assert abs(target - new_center) < 0.40 * fs, "slice fell outside the usable window"
+
+
+def test_every_retune_path_respects_the_dc_offset():
+    """ALL THREE routes that move the hardware must keep DC off the slice.
+
+    Fixing only set_slice() was not enough: the log showed a correct offset
+    tune to 145.510 immediately undone by a retune() to 145.070. get_iq() is
+    the third path and the one AE drives every frame, since the pan centre and
+    the slice are the same frequency until the operator scrolls the panadapter.
+    """
+    fs = 2_040_000.0
+    slice_hz = 145_070_000.0
+
+    # 1. set_slice, slice outside the window
+    a = SoapyAdapter(driver="none", samp_rate=fs, center_hz=140_000_000.0)
+    a._np = np
+    a.set_slice(slice_hz)
+    assert abs(a._retune_to - slice_hz) > 0.05 * fs, "set_slice parks on DC"
+
+    # 2. retune() asked for the slice frequency itself
+    b = SoapyAdapter(driver="none", samp_rate=fs, center_hz=140_000_000.0)
+    b._np = np
+    b._slice_hz = slice_hz
+    b.retune(slice_hz)
+    assert abs(b._retune_to - slice_hz) > 0.05 * fs, "retune() parks on DC"
+
+    # 3. get_iq() following AE's pan centre onto the slice
+    c = SoapyAdapter(driver="none", samp_rate=fs, center_hz=140_000_000.0)
+    c._np = np
+    c._slice_hz = slice_hz
+    c.get_iq(1024, slice_hz, fs)
+    assert c._retune_to is not None
+    assert abs(c._retune_to - slice_hz) > 0.05 * fs, "get_iq parks on DC"

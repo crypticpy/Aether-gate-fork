@@ -447,7 +447,16 @@ class SoapyAdapter(RadioAdapter):
 
     def retune(self, center_hz):
         # Legacy/explicit hardware recentre (e.g. a band-change pan set).
-        self._retune_to = float(center_hz)
+        #
+        # OFFSET HERE TOO. Fixing only set_slice() left this path putting the
+        # centre back exactly on the slice: the log showed a correct offset tune
+        # to 145.510 immediately undone by a retune to 145.070, and the
+        # demodulator was on the DC spike again. Any route that moves the
+        # hardware has to respect the offset.
+        center_hz = float(center_hz)
+        if abs(center_hz - self._slice_hz) < 0.05 * self.samp_rate:
+            center_hz = self._slice_hz + self._dc_offset_hz()
+        self._retune_to = center_hz
 
     def set_mode(self, mode):
         self._mode = (mode or "USB").upper()
@@ -463,9 +472,13 @@ class SoapyAdapter(RadioAdapter):
 
     # --- the IQ source (core FFTs this) ---------------------------------
     def get_iq(self, n, center_hz, span_hz):
-        # If AE's centre moved, schedule the hardware to follow.
+        # If AE's centre moved, schedule the hardware to follow — through
+        # retune(), which applies the DC offset. Assigning _retune_to directly
+        # here was the third way the centre could land back on the slice, and
+        # the one AE drives on every frame: the pan centre and the slice are the
+        # same frequency whenever the operator has not scrolled the panadapter.
         if abs(center_hz - self.center_hz) > 1.0 and self._retune_to is None:
-            self._retune_to = float(center_hz)
+            self.retune(center_hz)
         with self._lock:
             blk = self._latest
         if blk is None:
