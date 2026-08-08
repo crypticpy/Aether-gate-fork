@@ -358,3 +358,40 @@ def test_s_meter_is_linear_in_db():
 # it feeds identical IQ at both gain settings, so the compensation has nothing
 # to cancel and correctly appears as a 20 dB shift. Asserting otherwise would
 # mean weakening working code to satisfy an unrealistic fixture.
+
+
+def test_slice_is_never_left_sitting_on_dc():
+    """OFFSET TUNING. The demodulator must never sit on the hardware centre.
+
+    A direct-conversion SDR has a DC spike at the centre of its IQ (LO leakage
+    + ADC offset) that is an artifact, not a signal. set_slice() used to
+    recentre the hardware exactly ON the slice when the slice left the window,
+    parking the demodulator on that spike: S-meter S9+20, a bright line at the
+    cursor in the waterfall, and audio containing only the artifact. Six real
+    S9+20 transmissions produced no measurable change in the audio.
+    """
+    fs = 2_040_000.0
+    a = SoapyAdapter(driver="none", samp_rate=fs, center_hz=145_000_000.0)
+    a._np = np
+
+    # a slice far outside the current window forces a hardware retune
+    a.set_slice(146_500_000.0)
+    assert a._retune_to is not None, "slice outside the window should force a retune"
+    offset = abs(a._retune_to - 146_500_000.0)
+    assert offset > 0.05 * fs, (
+        f"hardware would centre only {offset:.0f} Hz from the slice — "
+        "the demodulator lands on the DC spike")
+    # ...but still inside the usable passband
+    assert offset < 0.40 * fs, (
+        f"offset {offset:.0f} Hz pushes the slice outside the usable window")
+
+
+def test_offset_tune_keeps_the_slice_in_the_window():
+    """After the offset retune the slice must still be demodulable."""
+    fs = 2_040_000.0
+    a = SoapyAdapter(driver="none", samp_rate=fs, center_hz=145_000_000.0)
+    a._np = np
+    target = 146_500_000.0
+    a.set_slice(target)
+    new_center = a._retune_to
+    assert abs(target - new_center) < 0.40 * fs, "slice fell outside the usable window"

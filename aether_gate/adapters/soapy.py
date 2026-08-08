@@ -421,8 +421,29 @@ class SoapyAdapter(RadioAdapter):
         # usable window = ~80% of the sample rate (avoid the filtered band edges)
         edge = 0.40 * self.samp_rate
         if abs(slice_hz - self.center_hz) > edge:
-            # slice left the window -> recentre the hardware ON the slice
-            self._retune_to = slice_hz
+            # OFFSET-TUNE: recentre NEAR the slice, never ON it.
+            #
+            # Every direct-conversion SDR has a DC spike at the centre of its
+            # IQ — LO leakage and ADC offset, an artifact of the receiver and
+            # not a signal. Retuning the hardware exactly onto the slice put
+            # the demodulator on top of that spike: the S-meter read S9+20 (it
+            # measures the artifact), the waterfall showed a bright line at the
+            # cursor, and the audio contained nothing but the artifact. A real
+            # S9+20 transmission six times over produced no measurable change
+            # in the demodulated audio (found live 2026-08-07 on an RSP1a).
+            #
+            # Placing the centre a quarter-window away keeps the slice well
+            # inside the usable passband while moving DC off it entirely.
+            self._retune_to = slice_hz + self._dc_offset_hz()
+
+    def _dc_offset_hz(self):
+        """How far to put the hardware centre from the slice.
+
+        A quarter of the sample rate: far enough that the DC spike is nowhere
+        near the demodulated channel, close enough that the slice stays inside
+        the 80% usable window even after the tuner rounds our request.
+        """
+        return 0.25 * self.samp_rate
 
     def retune(self, center_hz):
         # Legacy/explicit hardware recentre (e.g. a band-change pan set).
