@@ -312,3 +312,49 @@ def test_fm_does_not_use_the_ssb_taps():
         return x / s
     corr = float(np.corrcoef(_n(out_fm[:n]), _n(out_ssb[:n]))[0, 1])
     assert abs(corr) < 0.9, f"FM and USB outputs correlate {corr:.3f} — FM is still on the SSB path"
+
+
+def _meter_for(iq, fs=240_000.0, gain=20.0):
+    a = SoapyAdapter(driver="none", samp_rate=fs, center_hz=145_000_000.0, gain_db=gain)
+    a._np = np
+    a._init_demod()
+    a._mode = "FM"
+    a._latest = iq.astype(np.complex128)
+    return a.read_meters().s_meter_dbm
+
+
+def test_s_meter_ranks_signals_above_noise():
+    """The S-meter must read a real carrier STRONGER than a quiet channel.
+
+    Measuring the demodulated audio gets this backwards: full-band noise makes
+    more discriminator output than a narrowband signal, so a quiet channel
+    metered -47 dBm against -55 dBm for a clean FM carrier. The meter has to
+    measure RF power in the slice instead.
+    """
+    fs = 240_000.0
+    n = int(fs * 0.05)
+    rng = np.random.default_rng(1)
+    noise = 0.02 * (rng.normal(size=n) + 1j * rng.normal(size=n))
+    weak = 0.1 * _fm_iq(n, fs, 1200.0, 3000.0)
+    strong = 1.0 * _fm_iq(n, fs, 1200.0, 3000.0)
+
+    q, w, s = _meter_for(noise), _meter_for(weak), _meter_for(strong)
+    assert q < w < s, f"meter not monotonic: noise={q:.1f} weak={w:.1f} strong={s:.1f}"
+
+
+def test_s_meter_is_linear_in_db():
+    """A 10x amplitude change must move the meter ~20 dB."""
+    fs = 240_000.0
+    n = int(fs * 0.05)
+    a1 = _meter_for(0.1 * _fm_iq(n, fs, 1200.0, 3000.0))
+    a2 = _meter_for(1.0 * _fm_iq(n, fs, 1200.0, 3000.0))
+    assert 15.0 < (a2 - a1) < 25.0, f"10x amplitude moved the meter {a2-a1:.1f} dB, expected ~20"
+
+
+# NB there is deliberately NO test that the meter ignores our own RF gain.
+# read_meters() subtracts the configured gain_db so that turning the front end
+# up does not read as more signal — which is right on hardware, where raising
+# the gain really does make the IQ louder. A unit test cannot reproduce that:
+# it feeds identical IQ at both gain settings, so the compensation has nothing
+# to cancel and correctly appears as a 20 dB shift. Asserting otherwise would
+# mean weakening working code to satisfy an unrealistic fixture.

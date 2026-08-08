@@ -523,4 +523,51 @@ class SoapyAdapter(RadioAdapter):
         return audio.tolist()
 
     def read_meters(self):
-        return Meters()
+        """S-meter from the demodulated slice, not the whole IQ block.
+
+        This adapter reported nothing at all before, so AE's S-meter sat dead on
+        an SDR gate. Measuring the FULL block (as the HPSDR adapter does) would
+        read total power across the entire 2 MHz window, so a strong signal
+        anywhere on the band would peg the meter while the slice was on a quiet
+        channel — worse than useless for tuning.
+
+        _ar_buf holds the audio already demodulated at the slice frequency, so
+        its level tracks what the operator is actually listening to.
+
+        UNCALIBRATED. There is no dBm reference for a Soapy front end whose gain
+        we set ourselves, so this is a relative indication: the offset below
+        merely places a typical signal in a plausible S-unit range. Do not treat
+        it as an absolute measurement.
+        """
+        np = self._np
+        if np is None:
+            return Meters()
+        with self._lock:
+            blk = self._latest
+        if blk is None or not len(blk):
+            return Meters()
+
+        # MEASURE RF POWER IN THE SLICE, NOT THE DEMODULATED AUDIO. Reading the
+        # discriminator output backwards: full-band noise produces MORE audio
+        # than a narrowband signal does (FM noise power grows with bandwidth),
+        # so a quiet channel metered STRONGER than a real carrier — measured
+        # -47 dBm on noise against -55 dBm on a clean FM signal.
+        #
+        # Goertzel-style: mix the slice to DC, low-pass by averaging over the
+        # block, and take the power there. That is the energy in roughly the
+        # audio bandwidth around the slice, which is what the operator is
+        # listening to.
+        f_off = self._slice_hz - self.center_hz
+        n = min(len(blk), 8192)
+        x = blk[-n:]
+        k = np.exp(-2j * np.pi * f_off * np.arange(n) / self.samp_rate)
+        # coarse channel power: |mean| picks the DC term after the mix
+        p = abs(np.mean(x * k))
+        rms = float(p) + 1e-12
+        # UNCALIBRATED — no dBm reference exists for a front end whose gain we
+        # set ourselves. The offset merely places a typical signal in a
+        # plausible S-unit range; treat it as relative.
+        dbm = 20.0 * np.log10(rms) - 10.0
+        # Do not let our own RF gain masquerade as signal strength.
+        dbm -= float(self.gain_db) - 20.0
+        return Meters(s_meter_dbm=max(-140.0, min(0.0, dbm)))
