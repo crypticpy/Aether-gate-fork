@@ -428,3 +428,38 @@ def test_every_retune_path_respects_the_dc_offset():
     c.get_iq(1024, slice_hz, fs)
     assert c._retune_to is not None
     assert abs(c._retune_to - slice_hz) > 0.05 * fs, "get_iq parks on DC"
+
+
+def test_panadapter_bins_line_up_with_ae_pan_centre():
+    """The pan must paint the signal where AE thinks it is.
+
+    get_iq() hands the core a raw block which it FFTs and labels with AE's pan
+    centre — so the samples must actually BE centred there. Offset tuning moved
+    the hardware a quarter sample rate away, so the raw block painted the
+    waterfall 510 kHz off: a signal appeared far from the slice cursor while the
+    demodulator (which does its own NCO shift) heard it correctly. Reported as
+    "the waterfall and signal are not in the same place" (2026-08-07).
+    """
+    fs = 2_040_000.0
+    hw_center = 145_580_000.0        # where the tuner really is (offset-tuned)
+    ae_center = 145_070_000.0        # where AE thinks the pan is centred
+    tone_hz = 145_100_000.0          # a signal 30 kHz above AE's centre
+
+    a = SoapyAdapter(driver="none", samp_rate=fs, center_hz=hw_center)
+    a._np = np
+    a._slice_hz = ae_center
+
+    n = 32768
+    t = np.arange(n) / fs
+    # a carrier at tone_hz, expressed in the HARDWARE's baseband
+    blk = np.exp(2j * np.pi * (tone_hz - hw_center) * t).astype(np.complex128)
+    a._latest = blk
+
+    out = a.get_iq(n, ae_center, fs)
+    assert out is not None
+    sp = np.abs(np.fft.fftshift(np.fft.fft(np.asarray(out) * np.hanning(len(out)))))
+    fr = np.fft.fftshift(np.fft.fftfreq(len(out), 1.0 / fs))
+    peak_hz = ae_center + fr[int(np.argmax(sp))]
+    assert abs(peak_hz - tone_hz) < 5_000.0, (
+        f"pan places the signal at {peak_hz/1e6:.4f} MHz, expected {tone_hz/1e6:.4f} MHz "
+        f"(off by {(peak_hz-tone_hz)/1e3:.1f} kHz)")

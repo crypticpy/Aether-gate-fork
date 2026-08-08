@@ -67,6 +67,7 @@ class SoapyAdapter(RadioAdapter):
         self._run = False
         self._reader = None
         self._retune_to = None              # pending centre change (applied in the reader thread)
+        self._pan_shift_phase = 0.0         # NCO phase for the panadapter's offset-undo mix
         self._np = None
         # --- demod / audio state (SSB first) ---
         self._slice_hz = center_hz          # where to demodulate (the slice freq; core updates it)
@@ -483,7 +484,30 @@ class SoapyAdapter(RadioAdapter):
             blk = self._latest
         if blk is None:
             return None
-        return blk                          # core/fft.iq_to_dbm resamples to n bins
+
+        # UNDO THE DC OFFSET FOR THE PANADAPTER. The core FFTs this block and
+        # labels the bins with AE's pan centre, so the samples must actually BE
+        # centred there. Since offset tuning moved the hardware a quarter rate
+        # away from the slice, handing the raw block over painted the waterfall
+        # 510 kHz off: the signal appeared well away from the slice cursor while
+        # the demodulator — which does its own NCO shift — heard it correctly.
+        # Nigel spotted it as "the waterfall and signal are not in the same
+        # place" (2026-08-07).
+        #
+        # Mixing by (center_hz - hardware centre) puts AE's requested centre at
+        # DC, which is what the FFT assumes. The DC spike moves off-centre in
+        # the display, which is correct and honest: that is where it really is.
+        np = self._np
+        if np is None:
+            return blk
+        delta = float(center_hz) - float(self.center_hz)
+        if abs(delta) < 1.0:
+            return blk
+        n = len(blk)
+        ph = self._pan_shift_phase + 2.0 * np.pi * (-delta) / self.samp_rate * np.arange(n)
+        self._pan_shift_phase = float((ph[-1] if n else self._pan_shift_phase)
+                                      % (2.0 * np.pi))
+        return blk * np.exp(1j * ph)
 
     # --- the AUDIO source (SSB demod; numpy only) -----------------------
     def get_audio(self, n_samples, slice_hz=None, mode=None):
