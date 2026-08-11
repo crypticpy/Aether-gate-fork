@@ -189,6 +189,46 @@ def test_status_is_honest_when_github_is_unreachable():
     assert "could not reach" in st["message"].lower(), st["message"]
 
 
+def test_running_gate_is_detected_even_when_started_by_systemd():
+    """The refuse-while-running guard must see a SERVICE, not just our own child.
+
+    ⚠ REGRESSION TEST FOR A REAL ESCAPE. The first version checked only `_proc`,
+    the process this web UI started. On the appliance the gate normally runs as
+    a systemd unit, so `_proc` is None — and on a Pi 4 the update installed
+    underneath a live, streaming gate. The unit tests passed throughout, because
+    they only ever exercised the `_proc` path.
+    """
+    from aether_gate import setup as gsetup
+
+    real_run = gsetup.subprocess.run
+
+    class _R:
+        def __init__(self, out):
+            self.stdout = out
+
+    # no gate anywhere -> not running
+    gsetup.subprocess.run = lambda *a, **k: _R(b"")
+    try:
+        running, how = gsetup._gate_running()
+        assert not running, "reported a gate running when none was"
+
+        # only this web UI -> still not running
+        gsetup.subprocess.run = lambda *a, **k: _R(
+            b"982 /usr/bin/python3 -u -m aether_gate.setup --no-browser\n")
+        running, how = gsetup._gate_running()
+        assert not running, "mistook the setup UI itself for a running gate"
+
+        # a systemd-launched gate -> MUST be detected
+        gsetup.subprocess.run = lambda *a, **k: _R(
+            b"982 /usr/bin/python3 -u -m aether_gate.setup --no-browser\n"
+            b"112030 /usr/bin/python3 -u -m aether_gate --adapter soapy --rx-only\n")
+        running, how = gsetup._gate_running()
+        assert running, "a systemd-started gate was NOT detected - update would run under a live radio"
+        assert how == "service", f"expected 'service', got {how!r}"
+    finally:
+        gsetup.subprocess.run = real_run
+
+
 def _main():
     fails = 0
     for name, fn in sorted(globals().items()):

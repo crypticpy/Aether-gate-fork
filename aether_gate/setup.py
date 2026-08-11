@@ -181,8 +181,40 @@ def _update_status():
     return st
 
 
+def _gate_running():
+    """Is ANY gate running — ours, or one started by systemd?
+
+    ⚠ Checking only `_proc` (the child this UI started) is not enough, and that
+    mistake shipped once: on the appliance the gate normally runs as a SYSTEMD
+    UNIT (aether-gate-9700.service and friends), so `_proc` is None and the
+    guard never fires. Caught on a Pi 4 — the update installed underneath a
+    live, streaming gate.
+
+    Returns (running, how) so the message can tell the operator WHICH thing to
+    stop; "press Stop" is useless advice when the gate is a service they never
+    started from this page.
+    """
+    with _lock:
+        if _proc is not None and _proc.poll() is None:
+            return True, "ui"
+    # Any `python -m aether_gate` that is not this setup UI. pgrep is on every
+    # Debian/Pi OS image; if it is missing we fail OPEN rather than block
+    # updates forever, since the swap itself is still safe and reversible.
+    try:
+        out = subprocess.run(["pgrep", "-af", "aether_gate"],
+                             capture_output=True, timeout=5).stdout.decode(errors="replace")
+    except Exception:
+        return False, None
+    for line in out.splitlines():
+        if "aether_gate.setup" in line or "-m aether_gate.setup" in line:
+            continue                      # that's this web UI
+        if "aether_gate" in line and str(os.getpid()) not in line.split()[:1]:
+            return True, "service"
+    return False, None
+
+
 def _update_install(body):
-    """Install the newest release. REFUSES while the gate is running.
+    """Install the newest release. REFUSES while a gate is running.
 
     Stopping first is the operator's decision, not ours: the gate may be mid-QSO
     or feeding a decoder, and swapping the code under a live radio session is
@@ -192,11 +224,13 @@ def _update_install(body):
     from . import __version__
     from . import updater
 
-    with _lock:
-        running = _proc is not None and _proc.poll() is None
+    running, how = _gate_running()
     if running:
         return 409, {"ok": False,
-                     "message": "The gate is running. Press Stop first, then update."}
+                     "message": ("The gate is running. Press Stop first, then update."
+                                 if how == "ui" else
+                                 "A gate is running as a system service. Stop it before "
+                                 "updating (sudo systemctl stop aether-gate-*), then try again.")}
 
     with _update_lock:
         if _update_busy:
