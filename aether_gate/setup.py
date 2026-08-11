@@ -169,9 +169,34 @@ _update_lock = threading.Lock()
 _update_busy = False
 
 
-def _update_status():
+def _installed_version():
+    """The version ON DISK, not the one this process imported at startup.
+
+    ⚠ After an update the swapped-in tree has a NEW __init__.py, but this
+    long-running web UI still holds the OLD __version__ in memory. Reporting
+    that made the banner keep offering an update the operator had just
+    installed — harmless (installing twice is idempotent) but baffling for
+    exactly the person this feature exists for. Observed on the Pi 4: disk said
+    0.4.0, the page said 0.3.0.
+
+    Falls back to the imported value if the file cannot be read, so a permissions
+    problem degrades to "slightly stale" rather than "no version at all".
+    """
     from . import __version__
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "__init__.py")
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("__version__"):
+                    return line.split("=", 1)[1].split("#")[0].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return __version__
+
+
+def _update_status():
     from . import updater
+    __version__ = _installed_version()
     try:
         st = updater.status(__version__)
     except Exception as e:                    # never let a check break the page
@@ -221,7 +246,6 @@ def _update_install(body):
     exactly the surprise this whole feature exists to avoid.
     """
     global _update_busy
-    from . import __version__
     from . import updater
 
     running, how = _gate_running()

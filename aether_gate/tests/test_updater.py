@@ -229,6 +229,39 @@ def test_running_gate_is_detected_even_when_started_by_systemd():
         gsetup.subprocess.run = real_run
 
 
+def test_reported_version_comes_from_disk_not_from_memory():
+    """After an update the page must report the NEW version, not the imported one.
+
+    ⚠ REGRESSION TEST. The setup UI is long-running: it imports __version__ once
+    at startup, and an update swaps in a tree with a different __init__.py
+    underneath it. Reporting the in-memory value made the banner keep offering
+    an update that had just been installed — observed on the Pi 4, where the
+    disk said 0.4.0 and the page still said 0.3.0.
+    """
+    from aether_gate import setup as gsetup
+    import aether_gate
+
+    on_disk = gsetup._installed_version()
+    assert on_disk, "no version could be read from disk"
+    # it must PARSE the file, not echo the module attribute
+    assert on_disk == aether_gate.__version__, (
+        "disk and memory disagree in a clean tree - the reader is wrong")
+
+    # and it must survive a __init__.py it cannot read, rather than returning nothing
+    import builtins
+    real_open = builtins.open
+
+    def _boom(*a, **k):
+        raise OSError("denied")
+
+    builtins.open = _boom
+    try:
+        assert gsetup._installed_version() == aether_gate.__version__, (
+            "an unreadable __init__.py must fall back to the imported version")
+    finally:
+        builtins.open = real_open
+
+
 def _main():
     fails = 0
     for name, fn in sorted(globals().items()):
