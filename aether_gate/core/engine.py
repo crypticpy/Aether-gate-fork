@@ -1054,6 +1054,24 @@ class Radio:
         log(f"[tcp] listening on :{self.port}  (radio ip {self.ip}, pattern={self.pattern})")
         while self.run:
             conn, addr = srv.accept()
+            # REFUSE CONNECTIONS WHEN THE RADIO IS GONE.
+            #
+            # ⚠ Stopping discovery is NOT enough, and assuming it was cost two
+            # attempts: AE already knows our address, so it reconnects straight
+            # to this port without ever consulting discovery again. Accepting
+            # produced a FLAP LOOP — connect, notice the device is missing, drop,
+            # repeat (measured 9-11 cycles in a couple of minutes on a Pi 4).
+            #
+            # Closing immediately makes the gate look DOWN to AE, which is the
+            # truth: there is no radio behind it. It comes back when the gate is
+            # restarted with the hardware plugged in.
+            if getattr(self.adapter, "device_lost", False):
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                time.sleep(1.0)          # don't spin if AE retries hard
+                continue
             log(f"[tcp] AE connected from {addr}")
             self.conn = conn
             self.ae_peer_ip = addr[0]; self.vita_dest = None
@@ -2150,6 +2168,41 @@ class Radio:
         while self.run and self.streaming:
             _t_iter = time.perf_counter() if _prof else 0.0
             now = time.time()
+            # THE RADIO HAS GONE -> DROP AE, don't keep serving a dead stream.
+            #
+            # Without this the gate stays connected with nothing behind it and AE
+            # paints its last frame forever: the operator sees a FROZEN waterfall
+            # and a radio that looks fine. Closing the socket is the honest
+            # signal — AE shows disconnected, which is what actually happened.
+            #
+            # ⚠ Deliberately NOT triggered by get_iq() returning None: that means
+            # "no data this frame" (a TX gap) and must not tear anything down.
+            # The adapter raises `device_lost` only after sustained failure.
+            if getattr(self.adapter, "device_lost", False):
+                why = getattr(self.adapter, "device_lost_reason", "") or "the radio stopped responding"
+                log(f"[adapter] DEVICE LOST: {why} — dropping AE and going off the air")
+                # STOP ADVERTISING TOO, not just drop the connection.
+                #
+                # ⚠ Dropping alone produces a FLAP LOOP: AE reconnects within a
+                # second, this check fires again, and around it goes — measured
+                # at 11 connect/drop cycles in a couple of minutes on a Pi 4,
+                # which is worse for the operator than the frozen waterfall it
+                # replaced. A gate with no radio behind it should not be
+                # offering itself for connection at all.
+                #
+                # `enabled` is the rack "power" flag: with it False the gate
+                # stops broadcasting discovery, so the radio simply DISAPPEARS
+                # from AE's list — which is what an unplugged radio should look
+                # like. Restarting the gate (or the setup page's Start) brings
+                # it back once the hardware is reconnected.
+                self.enabled = False
+                self.streaming = False
+                try:
+                    if self.conn is not None:
+                        self.conn.close()      # handle() unwinds -> the normal
+                except Exception:              # teardown disarms TX and clears state
+                    pass
+                break
             if self.paused:                                        # Stop: send nothing; AE's pan/wf go dead
                 time.sleep(0.1)                                    #       but the radio stays connected. Go resumes.
                 continue

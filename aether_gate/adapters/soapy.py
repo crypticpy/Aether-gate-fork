@@ -24,6 +24,25 @@ import time
 from .base import RadioAdapter, AdapterCaps, Meters
 
 AUDIO_RATE = 24000          # AE remote_audio_rx rate (must match core AUDIO_RATE)
+
+# How many consecutive readStream errors count as "transient" before backing
+# off, and how many mean the device is gone for good. 20 fast retries is ~20 ms,
+# comfortably longer than any real overflow; 2000 ends a hopeless loop rather
+# than spinning at ~1 kHz forever when the SDR has been unplugged.
+_ERR_FAST = 20
+# ⚠ DECLARE THE DEVICE LOST ON ELAPSED TIME, NOT ERROR COUNT.
+#
+# Counting errors couples detection speed to the backoff schedule, and the two
+# want opposite things: backing off hard saves CPU, but it also means fewer
+# errors per second, so a count-based threshold arrives LATER the better the
+# backoff works. Measured on a Pi 4: 40 errors took 15.3 s, not the ~5 s
+# intended, because the sleep hits its 1 s ceiling by error 28 and the last
+# dozen errors cost a second each. Nigel spotted it as "takes 14 seconds".
+#
+# 3 s of unbroken failure is comfortably longer than any real overflow and
+# quick enough that an operator sees AE react rather than sit frozen.
+_DEVICE_LOST_AFTER_S = 3.0
+_ERR_GIVE_UP = 2000
 SSB_BW_HZ = 2700.0          # SSB audio passband width
 
 
@@ -387,6 +406,8 @@ class SoapyAdapter(RadioAdapter):
         import os as _os, time as _time
         _prof = _os.environ.get("AETHER_GATE_PROFILE") == "1"
         _n_data = _n_none = _n_err = 0
+        consec_err = 0                      # consecutive readStream failures
+        err_since = 0.0                     # monotonic stamp of the first of them
         _t_read = 0.0
         _plast = _time.monotonic()
         while self._run:
@@ -424,12 +445,58 @@ class SoapyAdapter(RadioAdapter):
                 elif n == 0: _n_none += 1
                 else: _n_err += 1
             if n > 0:
+                consec_err = 0              # a good read clears the backoff
+                err_since = 0.0
                 block = buf[:n].copy()
                 with self._lock:
                     self._latest = block        # for the panadapter FFT (latest is fine)
                 self._audio_q.append(block)     # for the demod (continuous — every block consumed)
             elif n < 0:
-                time.sleep(0.001)           # overflow/timeout — keep the stream alive, don't spin hot
+                # BACK OFF ON A PERSISTENT ERROR, AND GIVE UP ON A DEAD DEVICE.
+                #
+                # A 1 ms retry is right for a transient overflow/timeout, which
+                # is what this branch was written for. It is badly wrong when
+                # the device has GONE - unplugged, or reset by the host - because
+                # that never recovers, and the loop then spins at ~1 kHz forever
+                # printing the driver's error each time. Measured twice on
+                # 2026-08-11: 42,291 lines filled a Pi 5's 2 GB /tmp, and an
+                # RSP swap left 185,927 on a Pi 4. Meanwhile AE keeps painting
+                # the last frame it received, so the operator sees a FROZEN
+                # display rather than an error.
+                consec_err += 1
+                if err_since == 0.0:
+                    err_since = _time.monotonic()
+                if consec_err <= _ERR_FAST:
+                    time.sleep(0.001)       # transient: retry immediately
+                else:
+                    # Escalate 10 ms -> 1 s so a long outage costs almost
+                    # nothing, while a brief one still recovers quickly.
+                    time.sleep(min(0.01 * (2 ** min(consec_err - _ERR_FAST, 7)), 1.0))
+                    if consec_err == _ERR_FAST + 1 or consec_err % 200 == 0:
+                        print(f"[soapy] read error x{consec_err} — backing off "
+                              f"(device unplugged or reset?)", flush=True)
+                    # Tell the core EARLY. Waiting for the give-up would leave
+                    # AE staring at a frozen waterfall for half an hour; a few
+                    # seconds of solid failure is already enough to say the
+                    # radio is not there.
+                if (not self.device_lost and err_since
+                        and _time.monotonic() - err_since >= _DEVICE_LOST_AFTER_S):
+                    self.device_lost = True
+                    self.device_lost_reason = (
+                        "the SDR stopped responding (unplugged, or reset by the host)")
+                if consec_err >= _ERR_GIVE_UP:
+                    # Stop rather than spin forever. The gate stays up and AE
+                    # sees the stream end, which is honest; a restart (or a
+                    # reconnect from the setup page) re-opens the device.
+                    print(f"[soapy] giving up after {consec_err} consecutive read "
+                          f"errors — the device is gone. Restart the gate once it "
+                          f"is plugged back in.", flush=True)
+                    self.device_lost = True
+                    self.device_lost_reason = (
+                        f"the SDR stopped responding after {consec_err} read errors "
+                        f"(unplugged, or reset by the host)")
+                    self._run = False
+                continue
             if _prof:
                 _tn = _time.monotonic()
                 if _tn - _plast >= 5.0:

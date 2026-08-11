@@ -64,6 +64,20 @@ class RadioAdapter(ABC):
     def open(self):
         """Acquire the source (open device, connect socket). Override as needed."""
 
+    # --- device-lost signalling ------------------------------------------
+    #
+    # An adapter sets this when its hardware has gone for good (unplugged, or
+    # reset by the host) and retrying is pointless. The core polls it and drops
+    # AE's connection, so the operator sees a radio that has GONE rather than a
+    # waterfall frozen on the last frame it received.
+    #
+    # ⚠ This is deliberately NOT `get_iq() -> None`. That already means "no data
+    # this frame" (a TX gap), which is momentary and must not tear anything
+    # down. The two states look identical from the return value and need
+    # opposite handling, which is why they get separate channels.
+    device_lost = False
+    device_lost_reason = ""
+
     def close(self):
         """Release the source. Override as needed."""
 
