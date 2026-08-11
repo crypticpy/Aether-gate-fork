@@ -181,6 +181,26 @@ AG_USER=$AG_SVC_USER bash /opt/aether-gate-src/deploy/install-pi.sh $SDR_ARG $SD
 echo $IMG_HOSTNAME > /etc/hostname
 sed -i "s/\braspberrypi\b/$IMG_HOSTNAME/g" /etc/hosts
 
+# ⚠ DISABLE THE FIRST-BOOT USER WIZARD. Stock Pi OS ships userconfig.service
+# (userconf-pi) enabled, to ask for a username/password on first boot. This
+# image BAKES ITS OWN service user and is meant to run headless, so the wizard
+# has nothing to ask and nobody to ask it.
+#
+# Left enabled it does real damage: on a headless boot it launches
+# `dpkg-reconfigure keyboard-configuration` on tty8, waits forever for input
+# nobody can give, and HOLDS /var/cache/debconf/config.dat. Every later
+# apt/dpkg configure then fails with "DbDriver config is locked" — on a Pi 4
+# that silently broke ~250 package configures during a desktop install, and
+# killing the process does not help because systemd restarts it. Found
+# 2026-08-11; the symptom looks like broken packages, not a stuck wizard.
+systemctl disable userconfig.service 2>/dev/null || true
+rm -f /etc/systemd/system/multi-user.target.wants/userconfig.service
+# and stop it wanting to ask about the keyboard at all
+debconf-set-selections <<'SEL' 2>/dev/null || true
+keyboard-configuration keyboard-configuration/layout select English (US)
+keyboard-configuration keyboard-configuration/variant select English (US)
+SEL
+
 # slim down: build sources + installer checkout + apt droppings
 rm -rf /home/$AG_SVC_USER/gate-build /opt/aether-gate-src
 apt-get clean
