@@ -225,6 +225,26 @@ def test_running_gate_is_detected_even_when_started_by_systemd():
         running, how = gsetup._gate_running()
         assert running, "a systemd-started gate was NOT detected - update would run under a live radio"
         assert how == "service", f"expected 'service', got {how!r}"
+
+        # ⚠ SECOND ESCAPE, also found on the Pi 4: `pgrep -af aether_gate`
+        # returns anything that MENTIONS the name, including the diagnostic
+        # shell command doing the search. A substring test made the guard fire
+        # with NO gate running, which blocks updates forever rather than
+        # permitting a bad one — the opposite failure, equally useless.
+        gsetup.subprocess.run = lambda *a, **k: _R(
+            b"982 /usr/bin/python3 -u -m aether_gate.setup --no-browser\n"
+            b'160264 bash -c pgrep -af aether_gate; echo "checking aether_gate"\n'
+            b"160300 tail -f /var/log/aether_gate.log\n"
+            b"160301 vim /home/aethergate/gate/aether_gate/setup.py\n")
+        running, how = gsetup._gate_running()
+        assert not running, (
+            "a shell/editor merely MENTIONING aether_gate was mistaken for a running gate")
+
+        # a different module in the package is not the gate either
+        gsetup.subprocess.run = lambda *a, **k: _R(
+            b"982 /usr/bin/python3 -m aether_gate.tests.test_updater\n")
+        running, how = gsetup._gate_running()
+        assert not running, "a helper module was mistaken for the gate"
     finally:
         gsetup.subprocess.run = real_run
 

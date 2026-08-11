@@ -230,11 +230,37 @@ def _gate_running():
                              capture_output=True, timeout=5).stdout.decode(errors="replace")
     except Exception:
         return False, None
+
+    me = os.getpid()
     for line in out.splitlines():
-        if "aether_gate.setup" in line or "-m aether_gate.setup" in line:
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if pid == me:
+            continue                      # this process
+        cmd = parts[1]
+
+        # ⚠ MATCH THE INVOCATION, NOT THE STRING. `pgrep -af aether_gate` also
+        # returns anything that merely MENTIONS the name — a shell running
+        # `pgrep -af aether_gate`, an editor, a log tail, an ssh command line.
+        # A substring test made the guard fire with no gate running at all
+        # (seen on the Pi 4: the matching line was the diagnostic command
+        # itself). Require an actual `-m aether_gate` module launch.
+        if "-m aether_gate" not in cmd:
+            continue
+        if "-m aether_gate.setup" in cmd:
             continue                      # that's this web UI
-        if "aether_gate" in line and str(os.getpid()) not in line.split()[:1]:
-            return True, "service"
+        # `-m aether_gate.something_else` is not the gate either; the gate is
+        # launched as the bare package.
+        tail = cmd.split("-m aether_gate", 1)
+        after = tail[1][:1] if len(tail) > 1 else ""
+        if after and after != " ":
+            continue
+        return True, "service"
     return False, None
 
 
