@@ -42,6 +42,18 @@ _ERR_FAST = 20
 # 3 s of unbroken failure is comfortably longer than any real overflow and
 # quick enough that an operator sees AE react rather than sit frozen.
 _DEVICE_LOST_AFTER_S = 3.0
+# ⚠ A DEVICE CAN FAIL WITHOUT EVER RETURNING AN ERROR.
+#
+# When an RSP re-enumerates on the USB bus (seen live 2026-08-11: kernel logs
+# "USB disconnect" then a new device number with the SAME serial, while the
+# SDRplay API logs "Device has been removed. Stopping."), readStream carries on
+# returning SUCCESS at full rate - 2534 blocks/s, err=0 - handing back buffers
+# whose contents never change. The engine loop stayed at 19.96 Hz and the
+# freshness counter fell to 1/100: AE was fed a FROZEN frame at full frame
+# rate, which is a worse failure than an error because nothing reports it.
+#
+# So staleness is its own liveness test, independent of return codes.
+_STALE_AFTER_S = 3.0
 _ERR_GIVE_UP = 2000
 SSB_BW_HZ = 2700.0          # SSB audio passband width
 
@@ -408,6 +420,8 @@ class SoapyAdapter(RadioAdapter):
         _n_data = _n_none = _n_err = 0
         consec_err = 0                      # consecutive readStream failures
         err_since = 0.0                     # monotonic stamp of the first of them
+        last_sig = None                     # fingerprint of the previous block
+        fresh_at = _time.monotonic()        # when the samples last actually CHANGED
         _t_read = 0.0
         _plast = _time.monotonic()
         while self._run:
@@ -447,6 +461,25 @@ class SoapyAdapter(RadioAdapter):
             if n > 0:
                 consec_err = 0              # a good read clears the backoff
                 err_since = 0.0
+                # LIVENESS BY CONTENT, NOT BY RETURN CODE. Two samples are
+                # enough to tell one block of live IQ from another and cost
+                # nothing per block; comparing the whole buffer would not be
+                # affordable at ~500 blocks/s. Identical consecutive blocks mean
+                # the hardware has stopped feeding us even though the driver
+                # says otherwise.
+                _sig = float(abs(buf[0])) + float(abs(buf[n // 2]))
+                _now = _time.monotonic()
+                if _sig != last_sig:
+                    last_sig = _sig
+                    fresh_at = _now
+                elif (not self.device_lost) and (_now - fresh_at) >= _STALE_AFTER_S:
+                    self.device_lost = True
+                    self.device_lost_reason = (
+                        "the SDR stopped producing new samples (it re-enumerated or "
+                        "was reset) - the driver still reports success")
+                    print(f"[soapy] IQ has not changed for {_now - fresh_at:.1f}s "
+                          f"while readStream still reports success — treating the "
+                          f"device as lost", flush=True)
                 block = buf[:n].copy()
                 with self._lock:
                     self._latest = block        # for the panadapter FFT (latest is fine)
