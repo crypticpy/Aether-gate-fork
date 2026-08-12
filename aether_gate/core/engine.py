@@ -1565,9 +1565,21 @@ class Radio:
             f"center={cfreq:.6f} bandwidth={self.span_mhz:.6f} min_dbm={self.min_dbm:.0f} "
             f"max_dbm={self.max_dbm:.0f} x_pixels={self.bins} y_pixels={self.y_pixels} fps={self.fps} "
             f"ant_list=ANT1 rxant=ANT1")
+        # LINE DURATION MUST MATCH THE RATE WE ACTUALLY SEND ROWS AT.
+        #
+        # This was hardcoded to 100 ms while the stream loop emits one waterfall
+        # row per iteration at `fps` — 20 fps, i.e. a row every 50 ms. AE paces
+        # its waterfall scroll off this declared cadence, so it was told 10
+        # rows/sec and handed 18.4: the scroll interpolation never catches up and
+        # the display FLUTTERS. Measured on an RSP1a (2026-08-12): declared 100
+        # ms vs 18.4 rows/sec actual = a 1.84x lie.
+        #
+        # Deriving it from fps keeps the two honest if the rate is ever changed;
+        # a fixed number here is a promise the sender has to keep, and it did not.
+        line_ms = max(1, int(round(1000.0 / max(1, self.fps))))
         self.status(conn,
             f"display waterfall 0x{wid:08X} client_handle=0x{self.handle_hex} panadapter=0x{pid:08X} "
-            f"line_duration=100 center={cfreq:.6f} bandwidth={self.span_mhz:.6f} "
+            f"line_duration={line_ms} center={cfreq:.6f} bandwidth={self.span_mhz:.6f} "
             f"auto_black=1 black_level=15 color_gain=50")
         log(f"[->] pan 0x{pid:08X} / wf 0x{wid:08X} status @ {cfreq:.5f}")
         if not self.streaming:
