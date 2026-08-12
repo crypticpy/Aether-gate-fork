@@ -605,6 +605,23 @@ class SoapyAdapter(RadioAdapter):
     def set_mode(self, mode):
         self._mode = (mode or "USB").upper()
 
+    def current_span_hz(self):
+        """The span our IQ actually covers — the device sample rate.
+
+        The core seeds the pan from this when a slice is created, because AE
+        NEVER SENDS A BANDWIDTH of its own (see engine.py "[radio-wins] pan span
+        seeded from adapter"). Without it the pan keeps AE's 0.25 MHz default
+        while the data covers the full sample rate, so the frequency axis is
+        wrong: signals paint too narrow and a click on the pan tunes short.
+
+        ⚠ This hook existed and this adapter simply did not implement it. At
+        2.04 MS/s the error was easy to miss; at 0.768 MS/s the pan read 0.25
+        MHz over 0.768 MHz of data — a 3x axis error — which is what exposed it
+        (2026-08-12). `set_span` alone is not enough: it is only called when the
+        operator zooms, and AE does not zoom on connect.
+        """
+        return float(self.samp_rate)
+
     def set_span(self, span_hz):
         """The pan window IS the device sample rate. get_iq hands the core
         full-rate blocks, so the engine must label the bins with the width the
