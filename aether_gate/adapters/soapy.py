@@ -18,6 +18,7 @@ module (e.g. SoapyRTLSDR). Import is deferred to open() so the package stays
 importable on hosts without Soapy (tests, the sim adapter).
 """
 import collections
+import os as _os
 import threading
 import time
 
@@ -145,12 +146,30 @@ class SoapyAdapter(RadioAdapter):
                   flush=True)
             self.samp_rate = actual
         self._sdr.setFrequency(SOAPY_SDR_RX, 0, self.center_hz)
+        # ⚠ SAY WHAT THE GAIN ACTUALLY ENDED UP AS, and never swallow a failure.
+        #
+        # Hardware AGC on an RSP swings the level by ~14 dB peak-to-peak on a
+        # DEAD-STEADY sig-gen carrier (measured 2026-08-12 on an RSP1a: 13.99 dB
+        # with AGC on vs 0.52 dB with it off, on the raw IQ before any of our
+        # DSP). That is audible as a warble and it makes the S-meter meaningless,
+        # so whether it is on is not a detail worth hiding behind `except: pass`.
         try:
             self._sdr.setGainMode(SOAPY_SDR_RX, 0, bool(self.agc))   # AGC on/off
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[soapy] could NOT set AGC mode: {e!r} — the device keeps its "
+                  f"default, which for SDRplay is AGC ON", flush=True)
         if not self.agc:
             self._sdr.setGain(SOAPY_SDR_RX, 0, self.gain_db)
+        try:
+            _agc_now = self._sdr.getGainMode(SOAPY_SDR_RX, 0)
+            _g_now = self._sdr.getGain(SOAPY_SDR_RX, 0)
+            print(f"[soapy] gain: AGC={_agc_now} overall={_g_now:.1f} dB "
+                  f"(requested AGC={bool(self.agc)} gain={self.gain_db:.1f})", flush=True)
+            if _agc_now and not self.agc:
+                print("[soapy] ⚠ AGC is ON despite being disabled — expect a "
+                      "warbling level on steady carriers", flush=True)
+        except Exception:
+            pass
         if self.direct_samp is not None:                            # RTL HF direct-sampling (non-V4 dongles)
             try:
                 self._sdr.writeSetting("direct_samp", str(self.direct_samp))
@@ -731,6 +750,12 @@ class SoapyAdapter(RadioAdapter):
         # stepped per-chunk gain modulates a steady carrier at the chunk rate
         # (20 ms chunks = 50 Hz flutter, heard on a sig gen 2026-08-01).
         rms = float(np.sqrt(np.mean(audio * audio)) + 1e-9)
+        # DIAGNOSTIC: AETHER_GATE_NO_AGC=1 freezes the AGC at a fixed gain so a
+        # steady carrier can be judged without the level tracker modulating it.
+        if _os.environ.get("AETHER_GATE_NO_AGC") == "1":
+            audio = audio * (self._agc_target / max(self._agc_level, 1e-4))
+            np.clip(audio, -1.0, 1.0, out=audio)
+            return audio.tolist()
         a = 0.3 if rms > self._agc_level else 0.02
         self._agc_level = (1 - a) * self._agc_level + a * rms
         g_new = self._agc_target / max(self._agc_level, 1e-4)
