@@ -1,0 +1,91 @@
+{
+  "schema_version": "0.1.1",
+  "$note": "First receive-only dossier — stresses the schema from the no-TX end (txPowerBands empty, whole sections tbd). Unit: the RTL-SDR Blog V4 on the Pi5 (10.0.0.128), driven by the gate's SoapySDR adapter.",
+
+  "identity": {
+    "$evidence": "hw-measured",
+    "$source": "the physical V4 dongle on the Pi5; gate soapy-adapter sessions 2026-08",
+    "model": "RTL-SDR Blog V4",
+    "manufacturer": "RTL-SDR Blog",
+    "family": "rtlsdr",
+    "aliases": ["RTL-SDR V4", "rtlsdr-v4"]
+  },
+
+  "transport": {
+    "$evidence": "hw-measured",
+    "kind": "usb",
+    "protocol": "rtl2832u",
+    "driver": { "value": "rtlsdr via SoapySDR", "$note": "V4 needs the RTL-SDR Blog fork of librtlsdr — the stock Osmocom driver mis-tunes the V4's R828D arrangement.", "$evidence": "cross-referenced", "$source": "RTL-SDR Blog V4 release notes" }
+  },
+
+  "capabilities": {
+    "$evidence": "cross-referenced",
+    "$source": "RTL-SDR Blog V4 product documentation",
+    "receivers": 1,
+    "vfos": 1,
+    "maxSlices": 1,
+    "canTransmit": { "value": false, "$evidence": "hw-measured", "$note": "Receive-only hardware; there is no TX section in this dossier at all — an absent facet is the honest shape, not an empty one." },
+    "hasTuner": false,
+    "canReboot": false,
+    "tuningRanges": [
+      { "band": "rx-general", "lowMhz": 0.5, "highMhz": 1766.0,
+        "$note": "Continuous 500 kHz - 1.766 GHz: the V4's built-in always-on upconverter covers HF natively (no V3-style direct-sampling mode switch)." }
+    ],
+    "txPowerBands": [],
+    "$txPowerBands_note": "Empty ON PURPOSE: rx-only. A consumer must render no TX affordance whatsoever.",
+    "sampleRatesHz": { "value": [240000, 960000, 1024000, 2048000, 2400000],
+      "$note": "2.4 Msps is the max reliable rate; 3.2 Msps exists but drops samples. 8-bit samples throughout.",
+      "$evidence": "cross-referenced" }
+  },
+
+  "family_specific": {
+    "$evidence": "cross-referenced",
+    "tuner_chip": "R828D",
+    "demod_chip": "RTL2832U",
+    "bias_tee": { "value": true, "$note": "Software-switchable 4.5 V bias tee." },
+    "gain_ladder": { "value": "tbd", "$evidence": "tbd", "$note": "R828D gain steps not yet enumerated from this unit — the soapy adapter reports gain state (recent gate work) but the ladder hasn't been captured into data. First evidence-upgrade candidate." },
+    "ppm_correction": { "value": "tbd", "$evidence": "tbd", "$note": "This unit's frequency error not yet measured (WWV method as used on the Radioberry would do it)." }
+  },
+
+  "modes": {
+    "$evidence": "hw-measured",
+    "$source": "gate soapy adapter — demodulation is entirely host-side",
+    "native": [],
+    "$native_note": "The hardware demodulates nothing: it ships raw IQ and every mode is the consumer's DSP. An empty native list with host-side demod is the correct receive-only-SDR shape (same class as AE's HL2 backend owning an engine-side WDSP chain)."
+  },
+
+  "meters": {
+    "$evidence": "tbd",
+    "$note": "No calibrated signal metering; RSSI from the tuner is uncalibrated. tbd until someone characterises it."
+  },
+
+  "scope": {
+    "$evidence": "hw-measured",
+    "$source": "gate soapy adapter span work (current_span_hz fix)",
+    "command": "host-side FFT over raw IQ",
+    "points": { "value": "consumer-chosen", "$note": "Like the Flex, no per-model frame constant — the host computes the FFT; span is bounded by the tuned sample rate." }
+  },
+
+  "audio": {
+    "$evidence": "hw-measured",
+    "rx": { "path": "host-dsp", "format": "demodulated by the consumer from raw IQ", "rate_hz": null },
+    "$note": "No radio-side audio path exists."
+  },
+
+  "quirks": {
+    "hf_via_builtin_upconverter": {
+      "$evidence": "cross-referenced",
+      "value": true,
+      "$note": "V4-specific: HF arrives through the always-on upconverter, so no direct-sampling mode switch and no V3-style Q-branch quirks. Spurs profile differs from V3.",
+      "$source": "RTL-SDR Blog V4 documentation"
+    }
+  },
+
+  "x-gate": {
+    "$note": "Gate presentation & deployment for this unit.",
+    "adapter": "soapy",
+    "soapy_driver": "driver=rtlsdr",
+    "host": { "value": "pi5 (10.0.0.128)", "$note": "Same Pi as the 9700 gate; a second gate instance needs its own port set." },
+    "service_unit": { "value": "tbd", "$evidence": "tbd", "$note": "No systemd unit yet — launcher/hand-started. Making aether-gate-rtl a proper unit is a known small bite." }
+  }
+}
