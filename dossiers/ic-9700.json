@@ -1,0 +1,173 @@
+{
+  "schema_version": "0.1.0",
+  "$note": "First dossier. Extracted 2026-08-23 from aether_gate/adapters/icom9700.py, adapters/icom/radios.py, and the gate's session history — see $source keys. Where the adapter and history disagree, history won and the code cite carries the note.",
+
+  "identity": {
+    "$evidence": "hw-measured",
+    "$source": "gate bring-up sessions 2026-06-30..07-16 on Nigel's IC-9700 (LAN)",
+    "model": "IC-9700",
+    "manufacturer": "Icom",
+    "family": "icom",
+    "aliases": []
+  },
+
+  "transport": {
+    "$evidence": "hw-measured",
+    "kind": "lan",
+    "protocol": "rs-ba1",
+    "control_port": 50001,
+    "civ_port": 50002,
+    "audio_port": 50003,
+    "usb_is_civ_only": {
+      "value": true,
+      "$note": "The 9700's USB has NO audio codec (bInterfaceClass 255, confirmed on the Pi) — USB is CI-V only; LAN is the ONLY audio path. Contrast IC-7300 (USB audio present).",
+      "$source": "lsusb on Pi5, 2026-07-07 session (project memory: 'LAN AUDIO NOW WORKS')"
+    },
+    "single_client": {
+      "value": true,
+      "$note": "One RS-BA1 client at a time: a second session gets 'radio reports BUSY' and token renewals are rejected while another client holds the login.",
+      "$source": "SDR9700-vs-gate A/B, 2026-07-08"
+    },
+    "remembers_peer_audio_port": {
+      "value": true,
+      "$note": "The radio keeps streaming audio to the PREVIOUS session's port after a client restart, ignoring the freshly advertised one. Consumers must bind FIXED local ports across restarts (gate uses civ=40410, audio=40411).",
+      "$source": "deaf-audio diagnosis 2026-07-10 (fix: _bind_local fixed ports)"
+    }
+  },
+
+  "capabilities": {
+    "$evidence": "hw-measured",
+    "receivers": 2,
+    "vfos": 2,
+    "maxSlices": 2,
+    "canTransmit": true,
+    "hasTuner": false,
+    "canReboot": { "value": false, "$evidence": "cross-referenced", "$note": "No remote reboot verb known for RS-BA1; AE's Icom backend also declines (over WiFi models, power-off is a one-way trip). Untested here." },
+    "tuningRanges": [
+      { "band": "2m",   "lowMhz": 144.0,  "highMhz": 148.0 },
+      { "band": "440",  "lowMhz": 420.0,  "highMhz": 450.0 },
+      { "band": "23cm", "lowMhz": 1240.0, "highMhz": 1300.0 }
+    ],
+    "$tuningRanges_note": "Region-neutral widest edges; band names use AE BandDefs vocabulary ('440', not '70cm'). Disjoint ranges — a single min/max envelope would falsely claim 148–420 MHz coverage.",
+    "txPowerBands": [
+      { "lowMhz": 144.0,  "highMhz": 148.0,  "maxWatts": 100.0 },
+      { "lowMhz": 420.0,  "highMhz": 450.0,  "maxWatts": 75.0,
+        "$evidence": "cross-referenced",
+        "$note": "Icom spec sheet says 75 W on 70cm; the gate's meter scaling currently uses 100 W for all non-23cm bands (icom9700.py _fwd_power_w band_max) — a known approximation to refine. hw evidence exists only for 2m." },
+      { "lowMhz": 1240.0, "highMhz": 1300.0, "maxWatts": 10.0 }
+    ],
+    "second_receiver_readback": {
+      "value": "07 B0 swap-read",
+      "$note": "RX2 freq/mode read reliably via the 07 B0 swap-read (cached at connect + on tune), NOT via 25 01 which is ambiguous. See receivers() ordering fix.",
+      "$source": "icom9700.py receivers(), RX2 cache work"
+    }
+  },
+
+  "modes": {
+    "$evidence": "hw-measured",
+    "$source": "mode snap-back fix session 2026-07-10 (wire-verified FM/DFM/DIGU/USB)",
+    "native": ["LSB", "USB", "AM", "CW", "FM", "RTTY", "CW-R", "RTTY-R", "DV", "FM-N"],
+    "no_data_mode_byte": {
+      "value": true,
+      "$note": "The 9700 has NO distinct data-mode byte: DFM≡FM, DIGU≡USB on the rig — the 'data' part is purely the consumer's audio routing. Consumers with superset vocabularies (Flex) must fold to the base mode and echo the alias, or the radio→client sync snaps the display back."
+    },
+    "consumer_fold": {
+      "$note": "Fold table for Flex-vocabulary consumers (from AE_MODE_ALIASES). An unmappable pick must be refused loudly, never silently dropped.",
+      "DFM": "FM", "NFM": "FM", "FMN": "FM-N",
+      "DIGU": "USB", "DIGL": "LSB",
+      "SAM": "AM", "DSB": "AM", "AME": "AM",
+      "DCW": "CW", "CWL": "CW-R", "CWU": "CW",
+      "FDV": "DV"
+    }
+  },
+
+  "meters": {
+    "rf_power_level_semantics": {
+      "$evidence": "hw-measured",
+      "value": "percent-of-max",
+      "$note": "CI-V 14 0A returns 0–255 mapping to a 0–100% LEVEL of band max — NOT watts. First gate attempt converted %→fake watts; corrected. At the rig's 1% setting the raw read was 3 → level 1, while actual output measured ~0.78 W: the setting and the output are DIFFERENT quantities.",
+      "$source": "TX power correction 2945aa5, 2026-07-11"
+    },
+    "forward_power": {
+      "command": "15 11",
+      "curve_raw_to_fraction": [[0, 0.0], [41, 0.10], [75, 0.25], [100, 0.33], [143, 0.50], [190, 0.75], [213, 1.00], [255, 1.00]],
+      "$evidence": "cross-referenced",
+      "$note": "Standard Icom Po scale (0/50/100% at raw 0/143/213), interpolated; scale to band max watts. Spot-checked on hardware at the very low end: 1% setting → 15 11 read 0.73 W vs 0.78 W on the bench wattmeter (~6%). A full per-band bench cal would upgrade this to hw-measured.",
+      "$source": "icom9700.py _PO_CURVE; live cal 52e655d, 2026-07-11",
+      "poll_gating": { "value": "only-while-keyed, ~5 Hz", "$note": "Polling Po while unkeyed is useless and wastes the CI-V budget; clear to 0 on unkey." }
+    }
+  },
+
+  "scope": {
+    "$evidence": "hw-measured",
+    "command": "27",
+    "points": 475,
+    "amplitude_range": [0, 160],
+    "$geometry_source": "618 consecutive frames decoded off this radio via RS-BA1, every one 475 px; bounds header cross-checked (centre 439.86406 MHz, 500 kHz span → 1052.6 Hz/px). AE-side measurement 2026-08-05.",
+    "keepalive": {
+      "value": "S-meter poll ~10 Hz",
+      "$note": "The 9700 stops scope output without regular CI-V traffic; the gate's 10 Hz S-meter poll IS the scope keepalive (packet-capture derived).",
+      "$source": "icom9700.py scope-only hybrid notes"
+    },
+    "stall_recovery": {
+      "value": "full session recycle (0x05 → are-you-there → login → conninfo), accepted in ~1 ms",
+      "$evidence": "hw-measured",
+      "$note": "When scope output stalls, in-session re-arm (27 10 01) and data-reopen do NOT restart it; only a fresh session does. ⚠ HISTORY: a '~2650-frame Icom firmware cap' was hypothesized and later REFUTED — SDR9700 sustained 179 pkt/s scope for 3m20s uninterrupted on the same radio; the stall signature was the gate port's own protocol drift. Recorded here so the refuted claim is never re-promoted to radio fact.",
+      "$source": "pcap sessions 2026-07-07/08; refutation sdr9700-clean-20260709-020232.pcap"
+    },
+    "scope_frames_own_datagrams": {
+      "value": true,
+      "$note": "A scope datagram (FE FE E0 A2 27 00 00 …FD) contains raw amplitude bytes that routinely include stray FD / FE FE — generic CI-V frame-scanning INSIDE a scope datagram mis-decodes amplitude bytes as BCD frequency (the 'freq jumping around the band' bug). Detect 27 00 00, extract, and return; freq/mode/S-meter replies arrive in their own datagrams.",
+      "$evidence": "hw-measured",
+      "$source": "e76c483 fix, 2026-07-10"
+    }
+  },
+
+  "audio": {
+    "$evidence": "hw-measured",
+    "$source": "PR #9 (Ic9700Audio), 2026-07-07",
+    "rx": {
+      "path": "lan",
+      "format": "LPCM16 mono, 0x18-header datagrams",
+      "rate_hz": 48000,
+      "$note": "Requires its own RS-BA1 session on the audio port with the same are-you-there handshake; measured delivery 48192 samples/s (~+0.4%)."
+    },
+    "tx": {
+      "path": "lan",
+      "$evidence": "hw-measured",
+      "$note": "TX audio session needs txenable=1 in conninfo AND a valid remote_id from the are-you-there handshake — with remote_id=0 the radio silently REJECTS every TX-audio packet. Packet layout per SDR9700 audio_packet (ident 0x10 / sendseq 0x12 / datalen 0x16, frag 1364).",
+      "$source": "AX.25 TX chain sessions 2026-07-11..16"
+    }
+  },
+
+  "quirks": {
+    "mode_set_needs_optimistic_echo": {
+      "$evidence": "hw-measured",
+      "value": true,
+      "$note": "After 06 <mode> the radio's next poll still reports the OLD mode briefly; a consumer that trusts the poll snaps the user's selection back. Set the local mirror optimistically on send.",
+      "$source": "a72c3c3, 2026-07-10"
+    },
+    "initial_mode_needs_wait": {
+      "$evidence": "hw-measured",
+      "value": true,
+      "$note": "26 00 reply lands asynchronously; reading immediately after connect seeds a default (USB) even when the rig is on FM. Wait for the real reply.",
+      "$source": "initial_mode() fix, 2026-07-10"
+    }
+  },
+
+  "x-gate": {
+    "$note": "Aether-gate presentation & operator policy — NOT radio truth.",
+    "advertise": "FLEX-6700",
+    "$advertise_note": "Costume: FLEX-6700 unlocks AE's native 2m band; 70cm/23cm ride AE's XVTR mapping.",
+    "xvtr_bands": ["440", "23cm"],
+    "tx_allowed_bands": {
+      "value": ["2m", "440"],
+      "$note": "OPERATOR POLICY (Nigel): 23cm TX deliberately refused by the gate's key_tx guard — RX on 1.2 GHz is fine. A hard guard, not a remembered rule. Distinct from capabilities.txPowerBands, which states what the RADIO can do."
+    },
+    "rf_power_read_only": {
+      "value": true,
+      "$note": "OPERATOR POLICY: AE's rfpower/tunepower sets stay unparsed; power is set at the rig."
+    },
+    "fixed_local_ports": { "civ": 40410, "audio": 40411 }
+  }
+}
