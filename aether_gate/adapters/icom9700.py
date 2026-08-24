@@ -29,6 +29,7 @@ from .icom.civ import Ic9700Civ, CONTROLLER_CIV
 from .icom.audio import Ic9700Audio, RADIO_RATE
 from .icom.radios import _2M, _70CM, _23CM
 from .icom.radios import get as get_icom
+from ..dossiers import load as load_dossier
 
 MODE_TO_CIV = {"LSB": 0x00, "USB": 0x01, "AM": 0x02, "CW": 0x03, "RTTY": 0x04,
                "FM": 0x05, "CW-R": 0x06, "RTTY-R": 0x07, "DV": 0x08, "FM-N": 0x12}
@@ -502,6 +503,41 @@ class Icom9700Adapter(RadioAdapter):
         # to the 9700's VHF/UHF set. TX_BANDS_MHZ is deliberately NOT derived -- see
         # the note on that constant.
         self.BAND_RANGES_MHZ = tuple((b.low_mhz, b.high_mhz) for b in self._row.bands)
+        # --- radio dossier (vendored dossiers/<model>.json) -----------------
+        # Evidence-tagged data overrides baked constants where present; a
+        # MISSING dossier is a fail-soft fallback to the baked values, but an
+        # explicitly EMPTY x-gate.tx_allowed_bands is honoured FAIL-CLOSED
+        # (no TX anywhere) — absence is a fallback, an instruction is not.
+        # Canonical schema: shack-experiments/radio-dossiers (see dossiers/README.md).
+        self._dossier = load_dossier(self.icom_model)
+        self._po_curve = self._PO_CURVE
+        self._tx_power_bands = None    # ((low_mhz, high_mhz, max_w), ...) or None
+        if self._dossier:
+            _loaded = []
+            _ranges = self._dossier.get("capabilities.tuningRanges")
+            if _ranges:
+                self.BAND_RANGES_MHZ = tuple((r["lowMhz"], r["highMhz"]) for r in _ranges)
+                _loaded.append("tuning_ranges")
+            _curve = self._dossier.get("meters.forward_power.curve_raw_to_fraction")
+            if _curve:
+                self._po_curve = tuple((int(r), float(f)) for r, f in _curve)
+                _loaded.append("po_curve")
+            _tpb = self._dossier.get("capabilities.txPowerBands")
+            if _tpb:
+                self._tx_power_bands = tuple(
+                    (b["lowMhz"], b["highMhz"], b["maxWatts"]) for b in _tpb)
+                _loaded.append("tx_power_bands")
+            _allowed = self._dossier.get("x-gate.tx_allowed_bands")
+            if _allowed is not None:
+                # Band names resolve through the dossier's own tuningRanges;
+                # unresolvable names are dropped (they can only NARROW the
+                # whitelist, never widen it), and an empty result = no TX.
+                _byname = {r["band"]: (r["lowMhz"], r["highMhz"]) for r in (_ranges or [])}
+                self.TX_BANDS_MHZ = tuple(_byname[n] for n in _allowed if n in _byname)
+                _loaded.append(f"tx_allowed={list(_allowed)}")
+            print(f"[dossier] {self._dossier.model} schema {self._dossier.schema_version}"
+                  f" ({os.path.basename(self._dossier.path)}): {', '.join(_loaded) or 'nothing usable'}",
+                  flush=True)
         # IC-9700 covers 2m/70cm/23cm; RX-only here (no TX/PTT wired -> never keys the rig).
         # Span honesty: the 9700 scope does ±2.5k..±500k -> pan width 5 kHz..1 MHz;
         # don't let AE zoom the axis past what the scope can actually show.
@@ -1345,18 +1381,27 @@ class Icom9700Adapter(RadioAdapter):
 
     def _fwd_power_w(self):
         """Measured forward power in WATTS from the 15 11 Po meter, or None.
-        Non-linear Icom Po curve -> fraction of rated, scaled to band max."""
+        Non-linear Icom Po curve -> fraction of rated, scaled to band max.
+        Curve + per-band max come from the dossier when loaded (which knows
+        70cm is rated 75 W, not 100 W); baked values otherwise."""
         raw = self._civ.fwdpwr_raw if self._civ else None
         if raw is None:
             return None
-        frac = self._PO_CURVE[-1][1]
-        for (r0, f0), (r1, f1) in zip(self._PO_CURVE, self._PO_CURVE[1:]):
+        curve = getattr(self, "_po_curve", None) or self._PO_CURVE
+        frac = curve[-1][1]
+        for (r0, f0), (r1, f1) in zip(curve, curve[1:]):
             if raw <= r1:
                 frac = f0 + (f1 - f0) * ((raw - r0) / (r1 - r0)) if r1 > r0 else f0
                 break
         f = self._civ.freq_hz if self._civ else None
         mhz = (f / 1e6) if f else 145.0
-        band_max = 10.0 if 1200.0 <= mhz <= 1400.0 else 100.0      # 23cm = 10 W
+        band_max = None
+        for lo, hi, max_w in (getattr(self, "_tx_power_bands", None) or ()):
+            if lo <= mhz <= hi:
+                band_max = max_w
+                break
+        if band_max is None:
+            band_max = 10.0 if 1200.0 <= mhz <= 1400.0 else 100.0  # baked fallback; 23cm = 10 W
         return round(frac * band_max, 2)
 
     def receivers(self):

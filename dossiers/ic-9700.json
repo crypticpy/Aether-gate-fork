@@ -1,5 +1,5 @@
 {
-  "schema_version": "0.1.0",
+  "schema_version": "0.1.1",
   "$note": "First dossier. Extracted 2026-08-23 from aether_gate/adapters/icom9700.py, adapters/icom/radios.py, and the gate's session history — see $source keys. Where the adapter and history disagree, history won and the code cite carries the note.",
 
   "identity": {
@@ -60,6 +60,17 @@
       "value": "07 B0 swap-read",
       "$note": "RX2 freq/mode read reliably via the 07 B0 swap-read (cached at connect + on tune), NOT via 25 01 which is ambiguous. See receivers() ordering fix.",
       "$source": "icom9700.py receivers(), RX2 cache work"
+    }
+  },
+
+  "family_specific": {
+    "$evidence": "hw-measured",
+    "$note": "Icom CI-V wire vocabulary (schema rule 5: family facts live here, mirroring AE's IcomModel/IcomModelProfile split).",
+    "civ_address": { "value": 162, "$note": "0xA2 — the model default; user-changeable on the radio." },
+    "mode_bytes": {
+      "$note": "CI-V mode byte per native mode name (06/26 commands). FM-N is 0x12.",
+      "LSB": 0, "USB": 1, "AM": 2, "CW": 3, "RTTY": 4,
+      "FM": 5, "CW-R": 6, "RTTY-R": 7, "DV": 8, "FM-N": 18
     }
   },
 
