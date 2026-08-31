@@ -23,6 +23,19 @@ from .adapters import get_adapter, available
 from .adapters.icom.radios import get as get_icom, lan_radios
 
 
+# How long adapter.close() gets before we stop waiting for it. Generous enough
+# for a healthy USB teardown or an Icom 0x05 disconnect round-trip, short enough
+# that a stop still feels like a stop.
+SHUTDOWN_GRACE_S = 5.0
+
+
+def _force_exit():
+    log(f"cleanup did not finish in {SHUTDOWN_GRACE_S:.0f}s - exiting anyway. A "
+        f"driver is wedged; for an SDRplay device the API service may need a "
+        f"restart before the next start.")
+    os._exit(0)
+
+
 def wants_setup_ui(raw, environ=None):
     """Should a bare launch open the Radio Setup page rather than start a gate?
 
@@ -319,10 +332,30 @@ def main(argv=None):
             pass
         log("bye")
     finally:
+        # ⚠ A WEDGED DRIVER MUST NOT BE ABLE TO HOLD THE EXIT.
+        #
+        # Measured 2026-08-31 on an RSPdx that had left the USB bus: SIGTERM was
+        # delivered and "bye" was logged, then the process sat in
+        # adapter.close() for over three minutes, because SoapySDRPlay3's stream
+        # teardown never returns for a device that is no longer there. Two
+        # further SIGTERMs did nothing — the main thread was blocked inside a C
+        # call, so _graceful could never run; a Python signal handler only runs
+        # between bytecodes. It took SIGKILL, which skips ReleaseDevice and
+        # leaves the SDRplay API service holding a stale device: exactly the
+        # state that then needs a service restart to clear.
+        #
+        # Cleanup is best-effort by nature, so bound it. Exit 0, not 1: a stop
+        # that had to be forced is still a STOP, and a supervisor running
+        # Restart=on-failure must not bounce us straight back into the same
+        # wedged driver.
+        _watchdog = threading.Timer(SHUTDOWN_GRACE_S, _force_exit)
+        _watchdog.daemon = True
+        _watchdog.start()
         try:
             adapter.close()
         except Exception:
             pass
+        _watchdog.cancel()
 
 
 if __name__ == "__main__":
