@@ -1251,6 +1251,26 @@ class Radio:
             self.emit_slice_status(conn, idx)
             self.emit_meter_status(conn)                   # (re)define S-meters incl. the new slice
             self.emit_pan_status(conn, pid)                # centre this pan/waterfall on its slice
+        elif c.startswith("display pan rfgain_info"):
+            # AE asks each panadapter for its RF-gain travel and sizes the ANT
+            # panel's slider from the reply: body is "low,high,step" in dB.
+            # UNANSWERED IS NOT HARMLESS — AE then keeps the Flex 6000 default
+            # of -8..32 step 8 (AetherSDR PanadapterModel), five positions on a
+            # scale unrelated to the actual front end, so every gain the
+            # operator picks lands somewhere the device never agreed to. An
+            # adapter opts in by implementing gain_range(); the rest reply empty
+            # and AE keeps its default, exactly as before.
+            rng = None
+            if self.adapter is not None and hasattr(self.adapter, "gain_range"):
+                try:
+                    rng = self.adapter.gain_range()
+                except Exception as e:
+                    log("[adapter] gain_range error:", e)
+            if rng:
+                lo, hi, step = int(rng[0]), int(rng[1]), int(rng[2])
+                self.reply(conn, seq, f"{lo},{hi},{max(1, step)}")
+            else:
+                self.reply(conn, seq)
         elif c.startswith("display pan set"):
             kvs = parse_kvs(c)
             pid = None                                     # which panadapter this set targets
@@ -1265,8 +1285,16 @@ class Radio:
             if "min_dbm" in kvs: self.min_dbm = float(kvs["min_dbm"])
             if "max_dbm" in kvs: self.max_dbm = float(kvs["max_dbm"])
             # AE's RF-gain slider -> a real adapter's front-end gain (e.g. the
-            # HPSDR/Radioberry LNA). Optional seam: no-op unless the adapter
-            # implements set_gain. AE sends rfgain 0..100.
+            # HPSDR/Radioberry LNA, or the SDR front end behind the soapy
+            # adapter). Optional seam: no-op unless the adapter implements
+            # set_gain.
+            #
+            # ⚠ THE VALUE IS dB, NOT 0..100. AE sends the operator's setting in
+            # the range the adapter advertised via rfgain_info above
+            # (AetherSDR IRadioBackend::setPanRfGain -> RadioModel's
+            # `display pan set %1 rfgain=%2`). This comment used to say 0..100,
+            # and the one adapter that implemented the seam rescaled against
+            # that, which quietly divided every gain the operator chose.
             if "rfgain" in kvs and self.adapter is not None \
                     and hasattr(self.adapter, "set_gain"):
                 try:
