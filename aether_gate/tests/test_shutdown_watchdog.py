@@ -29,7 +29,9 @@ import pytest
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # A gate whose adapter.close() blocks forever, with the grace cut down so the
-# test is quick. Everything else is the shipping code path.
+# test is quick. Everything else is the shipping code path. Bound to loopback
+# because serve() binds the radio's own IP (engine.serve), which is the LAN
+# address by default -- this test has no business listening on the network.
 SCRIPT = """
 import sys, time
 import aether_gate.__main__ as M
@@ -40,8 +42,10 @@ class Hanging(SimAdapter):
         while True:
             time.sleep(3600)
 M.build_adapter = lambda name, args: Hanging()
-sys.exit(M.main(["--adapter", "sim", "--port", "{port}", "--ctl-port", "0"]))
+sys.exit(M.main(["--adapter", "sim", "--ip", "127.0.0.1",
+                 "--port", "{port}", "--ctl-port", "0"]))
 """
+
 
 
 def _free_port():
@@ -50,29 +54,49 @@ def _free_port():
         return s.getsockname()[1]
 
 
+def _await_listening(port, proc, timeout_s=20.0):
+    """Block until the gate actually accepts a connection on `port`.
+
+    This is the readiness signal that matters: __main__ installs the SIGTERM
+    handler BEFORE it opens the adapter and serves, so a successful connect
+    proves the signal will reach _graceful instead of the default disposition.
+
+    The first version of this test slept a flat 3s instead, and flaked roughly
+    one run in seven under a full-suite load: SIGTERM landed before the handler
+    existed, the process died at -SIGTERM, and none of the output asserted on
+    below was ever produced.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            pytest.fail("gate exited before it served: " + proc.communicate()[0])
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return
+        except OSError:
+            time.sleep(0.1)
+    proc.kill()
+    pytest.fail(f"gate never listened on port {port} within {timeout_s:.0f}s")
+
+
 @pytest.mark.skipif(not hasattr(signal, "SIGTERM"), reason="no SIGTERM here")
 def test_sigterm_wins_over_a_driver_that_never_returns(tmp_path):
     grace = 2.0
+    port = _free_port()
     script = tmp_path / "hang.py"
-    script.write_text(SCRIPT.format(grace=grace, port=_free_port()))
+    script.write_text(SCRIPT.format(grace=grace, port=port))
     env = dict(os.environ, PYTHONPATH=REPO, PYTHONUNBUFFERED="1")
     p = subprocess.Popen([sys.executable, str(script)], env=env,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True)
     try:
-        deadline = time.monotonic() + 20.0
-        while time.monotonic() < deadline:                 # wait for it to be up
-            if p.poll() is not None:
-                pytest.fail("gate exited before it served: " + p.communicate()[0])
-            time.sleep(0.2)
-            if time.monotonic() > deadline - 17.0:
-                break
+        _await_listening(port, p)
         p.send_signal(signal.SIGTERM)                      # exactly ONE, as a supervisor sends
         # Generous ceiling: the point is that it terminates at all, unassisted.
         out = p.communicate(timeout=grace + 15.0)[0]
     except subprocess.TimeoutExpired:
         p.kill()
-        pytest.fail("adapter.close() held the exit — the watchdog did not fire")
+        pytest.fail("adapter.close() held the exit - the watchdog did not fire")
     assert p.returncode == 0, (
         f"forced stop returned {p.returncode}; it must be 0 so a supervisor "
         f"running Restart=on-failure does not bounce straight back into the "
