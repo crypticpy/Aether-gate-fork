@@ -229,6 +229,46 @@ def wf_packet(stream_id, seq, intens, low_hz, binbw_hz, timecode, auto_black=20)
     return vita_header(stream_id, PCC_WF, seq, len(payload)) + payload
 
 
+_UDP_MAXDGRAM = None
+
+
+def udp_maxdgram():
+    """Largest UDP payload this host will actually send in ONE datagram.
+
+    NOT the 65507-byte IP ceiling: macOS ships net.inet.udp.maxdgram at 9216
+    and sendto() past it raises EMSGSIZE. Cached — it is a boot-time constant.
+    """
+    global _UDP_MAXDGRAM
+    if _UDP_MAXDGRAM is None:
+        limit = 65507
+        if sys.platform == "darwin":
+            limit = 9216                       # the macOS default, if the read fails
+            try:
+                out = subprocess.run(["sysctl", "-n", "net.inet.udp.maxdgram"],
+                                     capture_output=True, text=True, timeout=2)
+                limit = int(out.stdout.strip()) or limit
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass
+        _UDP_MAXDGRAM = limit
+    return _UDP_MAXDGRAM
+
+
+def max_pan_bins():
+    """How many bins one pan/waterfall frame can carry.
+
+    A frame is one datagram per bin array, so the bin count is capped by the
+    host's UDP limit, not by anything in the protocol. Measured from the real
+    builders rather than guessed, because guessing is what hurt: 16384 bins
+    made sendto raise EMSGSIZE, the stream loop broke out of its send and the
+    panadapter went off the air until the gate was restarted (2026-08-31).
+    On macOS's 9216-byte limit this comes out at 4576 — so 4096 is the largest
+    usable power of two, and finer resolution has to come from a narrower span.
+    """
+    overhead = max(len(fft_packet(0, 0, [], 0)),
+                   len(wf_packet(0, 0, [], 0.0, 1.0, 0)))
+    return max(64, (udp_maxdgram() - overhead) // 2)
+
+
 def meter_packet(stream_id, seq, meter_id, dbm):
     # PCC 0x8002 payload: N x (uint16 meter_id, int16 raw). AE: dBm = raw / 128.0
     raw = max(-32768, min(32767, int(round(dbm * 128.0))))
@@ -1675,6 +1715,57 @@ class Radio:
                 pass
         return self.span_mhz
 
+    def resolution(self):
+        """Current panadapter geometry: bin width = span / bins."""
+        span_hz = self.span_mhz * 1e6
+        a = getattr(self, "adapter", None)
+        rates = a.supported_rates() if hasattr(a, "supported_rates") else []
+        return {
+            "bins": self.bins,
+            "max_bins": max_pan_bins(),
+            "span_hz": round(span_hz, 1),
+            "bin_hz": round(span_hz / max(1, self.bins), 3),
+            "samp_rate": round(float(a.samp_rate), 1) if hasattr(a, "samp_rate") else None,
+            "rates": [int(round(r)) for r in rates],
+            "can_set_rate": hasattr(a, "set_samp_rate"),
+        }
+
+    def set_resolution(self, bins=None, samp_rate_hz=None):
+        """Operator resolution knob. Two independent ways to get finer bins:
+
+          * more bins over the same span — a pure FFT size change, free, the
+            radio is never touched;
+          * a narrower span, i.e. a lower device sample rate — the adapter
+            stops and restarts its stream, and only rates the device actually
+            supports are used (the request is snapped; see set_samp_rate).
+
+        AE learns the geometry from the pan status — bandwidth and x_pixels are
+        both advertised there — so this MUST re-emit it. Changing either without
+        re-emitting leaves AE drawing the old grid over the new data, which is
+        the same class of axis error current_span_hz was added to fix.
+        """
+        if bins is not None:
+            b = max(64, min(max_pan_bins(), int(bins)))   # a frame is one datagram
+            if b != self.bins:
+                log(f"[ctl] bins {self.bins} -> {b}")
+                self.bins = b
+        if samp_rate_hz is not None:
+            a = getattr(self, "adapter", None)
+            if hasattr(a, "set_samp_rate"):
+                applied = a.set_samp_rate(float(samp_rate_hz))
+                if applied:
+                    self._set_pan_span_hz(applied)
+                    log(f"[ctl] sample rate -> {applied:.0f} S/s "
+                        f"(span {self.span_mhz:.6f} MHz)")
+            else:
+                log("[ctl] this adapter has no sample-rate control")
+        if self.conn is not None:
+            self.emit_pan_status(self.conn)
+        r = self.resolution()
+        log(f"[ctl] resolution: {r['bins']} bins over {r['span_hz']/1e6:.6f} MHz "
+            f"= {r['bin_hz']:.1f} Hz/bin")
+        return r
+
     def _zoom_span_hz(self, mode):
         caps = getattr(getattr(self, "adapter", None), "capabilities", None)
         min_hz = float(getattr(caps, "min_span_hz", 5_000.0) or 5_000.0)
@@ -2252,6 +2343,8 @@ class Radio:
             #                                                        wall-clock so it JUMPS across a TX gap
             #                                                        (real-radio behaviour -> AE history reproj).
             ctx.min_dbm, ctx.max_dbm = self.min_dbm, self.max_dbm   # track AE's display-pan-set
+            if ctx.n != self.bins:                                 # track a live resolution change
+                ctx.n, ctx.center = self.bins, self.bins // 2      # (ctx is built once, before this loop)
             ctx.floor = self.noise_floor_dbm                        # live (control panel, dBm)
             ctx.sig_level = self.sig_level_dbm
             ctx.noise_color = self.noise_color
@@ -2442,6 +2535,10 @@ class Radio:
                         f"| iter {_pstat['total'][0]/n*1000:6.2f}ms avg | IQ {_fr}")
                     _pstat = {k: [0.0, 0] for k in _pstat}
                     _plast = _tn
+        # emit_pan_status only starts a loop when this is False. Leaving it set
+        # meant any send error stopped the panadapter PERMANENTLY — the status
+        # said "streaming" and nothing would ever restart it.
+        self.streaming = False
         log("[stream] stopped")
 
 
@@ -2781,6 +2878,18 @@ h2{{color:#5cf}} label{{display:block;margin:16px 0 4px}} select,input[type=rang
     <div id=streamstat style="font-size:12px;color:#9ab;margin-top:2px">&nbsp;</div>
   </div>
 </div>
+<div id=resbox style="background:#15202b;border:1px solid #243;border-radius:6px;padding:10px 12px;margin:0 0 14px">
+  <div style="display:flex;align-items:baseline;justify-content:space-between">
+    <b style="color:#5cf">Panadapter resolution</b><span class=v id=resv style="font-size:15px">&mdash;</span>
+  </div>
+  <div style="display:flex;gap:14px;margin-top:8px">
+    <div style="flex:1"><label style="margin:0 0 3px;font-size:12px;color:#9ab">FFT bins</label>
+      <select id=binsel style="width:100%" onchange="setRes()"></select></div>
+    <div style="flex:1" id=ratewrap><label style="margin:0 0 3px;font-size:12px;color:#9ab">Span (sample rate)</label>
+      <select id=ratesel style="width:100%" onchange="setRes()"></select></div>
+  </div>
+  <div id=resnote style="font-size:12px;color:#789;margin-top:7px">&nbsp;</div>
+</div>
 <label>Pattern</label><select id=pat onchange=upd()>{options}</select>
 <div id=hint style="background:#15202b;border-left:3px solid #5cf;padding:8px 11px;margin:8px 0;font-size:13px;color:#bcd;line-height:1.45"></div>
 <label>Noise floor: <span class=v id=floorv>-120</span> dBm <span class=v id=floors>(S1)</span></label>
@@ -2932,8 +3041,55 @@ function renderGo(){{
   if(paused){{b.innerHTML='&#9654; Go';b.style.background='#3a7';}}
   else{{b.innerHTML='&#9632; Stop';b.style.background='#c33';}}
 }}
+// ---- panadapter resolution: bin width = span / bins ----
+// Two knobs. Bins is a pure FFT size (free). Sample rate IS the span on an IQ
+// adapter, so narrowing it restarts the radio's stream — hence the 'applying'
+// state and the repaint lock, so a status poll can't stomp a pending change.
+var BINCHOICES=[1024,2048,4096,8192,16384];
+var resBusy=false;
+function fmtHz(h){{return h>=1e6?(h/1e6).toFixed(3)+' MHz':(h/1e3).toFixed(1)+' kHz';}}
+function fmtBin(h){{return h>=1000?(h/1000).toFixed(2)+' kHz':h.toFixed(1)+' Hz';}}
+function fillSel(sel,vals,label){{
+  if(sel.options.length===vals.length)return;
+  sel.innerHTML='';
+  vals.forEach(function(n){{var o=document.createElement('option');o.value=n;o.text=label(n);sel.appendChild(o);}});
+}}
+function paintRes(r){{
+  if(resBusy)return;
+  // A frame is one UDP datagram, so the host caps the bin count (macOS: 4576).
+  // Offering a value the sender cannot transmit takes the panadapter off the air.
+  var cap=r.max_bins||4576;
+  var bins=BINCHOICES.filter(function(n){{return n<=cap;}});
+  if(bins.indexOf(r.bins)<0){{bins.push(r.bins);bins.sort(function(a,b){{return a-b;}});}}
+  fillSel(document.getElementById('binsel'),bins,function(n){{return n;}});
+  var rw=document.getElementById('ratewrap'),rates=r.rates||[];
+  var haveRates=!!(r.can_set_rate&&rates.length);
+  rw.style.display=haveRates?'':'none';
+  if(haveRates){{
+    fillSel(document.getElementById('ratesel'),rates,function(n){{return fmtHz(n);}});
+    if(r.samp_rate)document.getElementById('ratesel').value=Math.round(r.samp_rate);
+  }}
+  document.getElementById('binsel').value=r.bins;
+  document.getElementById('resv').textContent=fmtBin(r.bin_hz)+' / bin';
+  document.getElementById('resnote').textContent=r.bins+' bins across '+fmtHz(r.span_hz)
+    +(r.bins>=cap?'  \u2014 bins maxed for one UDP frame; narrow the span for finer':'');
+}}
+function setRes(){{
+  resBusy=true;
+  var p='bins='+document.getElementById('binsel').value;
+  var rs=document.getElementById('ratesel');
+  if(document.getElementById('ratewrap').style.display!=='none'&&rs.value)p+='&rate='+rs.value;
+  document.getElementById('resnote').textContent='applying…';
+  fetch('/resolution?'+p).then(r=>r.json()).then(function(r){{
+    resBusy=false;
+    if(r.error){{document.getElementById('resnote').textContent=r.error;return;}}
+    paintRes(r);
+  }}).catch(function(e){{resBusy=false;
+    document.getElementById('resnote').textContent='failed: '+e;}});
+}}
 function pollStatus(){{fetch('/status').then(r=>r.json()).then(s=>{{
   paused=s.paused;renderGo();
+  if(s.res)paintRes(s.res);
   var dot=document.getElementById('dot'),conn=document.getElementById('conn'),ss=document.getElementById('streamstat');
   if(!s.connected){{dot.style.background='#888';conn.textContent='waiting for AetherSDR…';ss.innerHTML='&nbsp;';}}
   else{{
@@ -3053,6 +3209,7 @@ def start_control_server(radio, port):
                     "pattern": radio.pattern,
                     "tx": radio.tx_on,
                     "meter_dbm": round(radio.last_vfo_dbm, 1),
+                    "res": radio.resolution(),
                 })
             # ---- radio diagnostics: 'what the gate sees from the radio' ----
             if u.path == "/diagnostics":
@@ -3159,6 +3316,18 @@ def start_control_server(radio, port):
                 with open(fp, "rb") as f:
                     self.wfile.write(f.read())
                 return
+            # ---- panadapter resolution (bins and/or device sample rate) ----
+            # Its own route, not /set: changing the rate restarts the adapter's
+            # stream, so it can block for a second or two and it answers with
+            # the geometry that actually landed rather than a bare "ok".
+            if u.path == "/resolution":
+                q = urllib.parse.parse_qs(u.query)
+                try:
+                    return self._json(radio.set_resolution(
+                        bins=int(q["bins"][0]) if "bins" in q else None,
+                        samp_rate_hz=float(q["rate"][0]) if "rate" in q else None))
+                except (ValueError, TypeError) as e:
+                    return self._json({"error": f"bad value: {e}"})
             if u.path == "/set":
                 q = urllib.parse.parse_qs(u.query)
                 try:

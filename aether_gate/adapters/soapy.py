@@ -112,6 +112,7 @@ class SoapyAdapter(RadioAdapter):
         self._reader = None
         self._retune_to = None              # pending centre change (applied in the reader thread)
         self._gain_to = None                # pending RF gain dB (ditto — see set_gain)
+        self._rate_to = None                # pending sample rate (ditto — see set_samp_rate)
         self._gain_lo = 0.0                 # device gain range, filled in by _open_hw
         self._gain_hi = 50.0
         self._ae_center_hz = None           # last centre AE asked for, offset-free (see get_iq)
@@ -358,6 +359,42 @@ class SoapyAdapter(RadioAdapter):
             print(f"[soapy] stream restart raised: {e!r}", flush=True)
             return False
         return self._verify_stream()
+
+    def _apply_samp_rate(self, want):
+        """Change the sample rate. READER THREAD ONLY — it touches the stream.
+
+        setSampleRate on a LIVE stream is ignored by SoapySDRPlay3, and the
+        rate defines both the panadapter span (see set_span) and the whole
+        audio decimation chain, so the order is forced: stop the stream, set,
+        READ BACK (this driver's setters lie — see _verify_stream), rebuild
+        the demod chain for the rate we actually got, then restart.
+
+        Deliberately does NOT reopen the device — see _recover_device for why
+        dropping the Soapy handle is a std::terminate, not an exception.
+        """
+        prev = self.samp_rate
+        self._stop_stream()
+        try:
+            self._sdr.setSampleRate(self._SOAPY_SDR_RX, 0, want)
+            got = float(self._sdr.getSampleRate(self._SOAPY_SDR_RX, 0))
+        except Exception as e:
+            print(f"[soapy] SET RATE FAILED at {want:.0f} S/s: {e!r} "
+                  f"(still {prev:.0f} S/s)", flush=True)
+            got = prev
+        self.samp_rate = got if got > 0 else prev
+        self.capabilities.max_span_hz = self.samp_rate
+        self._init_demod()                  # decimation chain is a function of the rate
+        self._iq_resid = None               # leftovers are at the OLD rate: they would click
+        self._audio_q.clear()               # ditto for anything already queued
+        try:
+            self._start_stream()
+        except Exception as e:
+            print(f"[soapy] stream restart after rate change raised: {e!r}", flush=True)
+            return False
+        ok = self._verify_stream()
+        print(f"[soapy] sample rate -> {self.samp_rate:.0f} S/s (asked {want:.0f}, "
+              f"was {prev:.0f}); stream {'ok' if ok else 'DEAD'}", flush=True)
+        return ok
 
     def _init_demod(self):
         """Build the staged-decimation + fractional-resampler audio chain.
@@ -643,6 +680,13 @@ class SoapyAdapter(RadioAdapter):
                 except Exception as e:
                     print(f"[soapy] SET GAIN FAILED at {want:.1f} dB: {e!r} "
                           f"(still {self.gain_db:.1f} dB)", flush=True)
+            # apply any pending sample-rate change on this thread, for the same
+            # reason — and because it has to bracket setupStream/activateStream.
+            if self._rate_to is not None:
+                want = float(self._rate_to)
+                if abs(want - self.samp_rate) > 1.0:
+                    self._apply_samp_rate(want)
+                self._rate_to = None            # cleared LAST: it is set_samp_rate's done-signal
             # ── REOPEN A DROPPED DEVICE INSTEAD OF GOING OFF THE AIR ──────
             # Set by either liveness test below. See _recover_device for why
             # reopening is the only way back once the driver has stopped.
@@ -896,6 +940,60 @@ class SoapyAdapter(RadioAdapter):
         on the pan tuned ~8x short of the signal — off-tuned SSB = robotic
         'Dalek' audio (found with a sig gen on 2 m, 2026-08-01)."""
         return float(self.samp_rate)
+
+    def supported_rates(self):
+        """Sample rates this device will actually accept, ascending.
+
+        Asked of the driver, never hardcoded: SoapySDRPlay3 takes decimations
+        of 2 MS/s, an RTL stick takes an entirely different set.
+        """
+        if self._sdr is None:
+            return []
+        try:
+            return sorted(float(r) for r in
+                          self._sdr.listSampleRates(self._SOAPY_SDR_RX, 0)
+                          if float(r) > 0)
+        except Exception:
+            return []
+
+    def set_samp_rate(self, rate_hz, wait_s=5.0):
+        """Ask for a new sample rate; the reader thread applies it.
+
+        The rate IS the panadapter span here (see set_span), so this is the
+        operator's resolution knob: bin width = rate / bins.
+
+        ⚠ SNAPS TO A SUPPORTED RATE — never passes the request through. An
+        unsupported rate is not an error on this driver: setSampleRate logs
+        "[WARNING] invalid sample rate. Sample rate unchanged." and returns,
+        leaving the device where it was. Asking an RSPdx for 256 kS/s (a
+        plausible-looking number that is not a 2 MS/s decimation) left it at
+        2 MS/s — the operator asked for finer bins and silently got bins 4x
+        COARSER, with only a driver warning to say so (2026-08-31).
+
+        Blocks until the reader thread has applied it, then returns the rate
+        the device ACTUALLY reports, or None if no device is open.
+        """
+        if self._sdr is None:
+            return None
+        want = float(rate_hz)
+        rates = self.supported_rates()
+        snapped = min(rates, key=lambda r: abs(r - want)) if rates else want
+        if rates and abs(snapped - want) > 1.0:
+            print(f"[soapy] sample rate {want:.0f} unsupported — snapping to "
+                  f"{snapped:.0f} (device offers: "
+                  f"{', '.join(f'{r:.0f}' for r in rates)})", flush=True)
+        self._rate_to = snapped
+        # Wait for the reader thread to land it. The core re-advertises the pan
+        # geometry from our samp_rate the moment we return, and labelling new
+        # data with the old span is precisely the axis error current_span_hz
+        # exists to prevent — so return truth, not the request.
+        deadline = time.monotonic() + float(wait_s)
+        while self._rate_to is not None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if self._rate_to is not None:
+            print(f"[soapy] sample-rate change to {snapped:.0f} still pending after "
+                  f"{wait_s:.0f}s — reader thread is not consuming", flush=True)
+        return self.samp_rate
 
     # --- the IQ source (core FFTs this) ---------------------------------
     def get_iq(self, n, center_hz, span_hz):
