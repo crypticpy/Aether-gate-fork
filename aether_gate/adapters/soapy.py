@@ -25,6 +25,13 @@ import time
 
 from .base import RadioAdapter, AdapterCaps, Meters
 
+# How long a rate request must sit still before the reader thread acts on it.
+# AE's pan zoom is a DRAG: it delivers a stream of bandwidth= commands, and each
+# one applied would be a stop/set/rebuild/start cycle on the device. Trailing
+# edge (not leading, as Hl2Backend uses) because the value the operator wants is
+# the one they let go on, and a restart costs ~1 s here.
+RATE_DEBOUNCE_S = 0.40
+
 AUDIO_RATE = 24000          # AE remote_audio_rx rate (must match core AUDIO_RATE)
 
 # How many consecutive readStream errors count as "transient" before backing
@@ -113,6 +120,7 @@ class SoapyAdapter(RadioAdapter):
         self._retune_to = None              # pending centre change (applied in the reader thread)
         self._gain_to = None                # pending RF gain dB (ditto — see set_gain)
         self._rate_to = None                # pending sample rate (ditto — see set_samp_rate)
+        self._rate_req_at = 0.0             # monotonic stamp of the newest rate request
         self._gain_lo = 0.0                 # device gain range, filled in by _open_hw
         self._gain_hi = 50.0
         self._ae_center_hz = None           # last centre AE asked for, offset-free (see get_iq)
@@ -231,6 +239,23 @@ class SoapyAdapter(RadioAdapter):
         # ASK THE DEVICE ITS RANGE — do not guess one. AE sizes its RF Gain
         # slider from whatever we report to `display pan rfgain_info`, and an
         # RSPdx, an RTL dongle and an Airspy share no gain scale at all.
+        # Span limits = the rates this device offers, now that AE's zoom can
+        # change the rate (see set_span). Pinning max_span to the rate we happen
+        # to be running would mean zooming IN stranded you there: the band-zoom
+        # button reads max_span_hz, so it would only ever offer the width you
+        # already had.
+        _rates = self.supported_rates()
+        if _rates:
+            self.capabilities.min_span_hz = min(_rates)
+            # Capped well below the device's ceiling (an RSPdx offers 10 MS/s).
+            # A zoom-out is one click and the decimation chain grows with the
+            # rate — _init_demod documents a single FIR at 2.048 MS/s already
+            # being ~13x too slow on a Pi5. Explicit /resolution requests are
+            # not bound by this; an accidental zoom-out should not be able to
+            # ask for 10 MS/s of DSP.
+            self.capabilities.max_span_hz = min(max(_rates), 2_000_000.0)
+            print(f"[soapy] rates {min(_rates):.0f}..{max(_rates):.0f} S/s; "
+                  f"zoom span capped at {self.capabilities.max_span_hz:.0f}", flush=True)
         try:
             _gr = self._sdr.getGainRange(SOAPY_SDR_RX, 0)
             self._gain_lo, self._gain_hi = float(_gr.minimum()), float(_gr.maximum())
@@ -382,7 +407,6 @@ class SoapyAdapter(RadioAdapter):
                   f"(still {prev:.0f} S/s)", flush=True)
             got = prev
         self.samp_rate = got if got > 0 else prev
-        self.capabilities.max_span_hz = self.samp_rate
         self._init_demod()                  # decimation chain is a function of the rate
         self._iq_resid = None               # leftovers are at the OLD rate: they would click
         self._audio_q.clear()               # ditto for anything already queued
@@ -682,7 +706,8 @@ class SoapyAdapter(RadioAdapter):
                           f"(still {self.gain_db:.1f} dB)", flush=True)
             # apply any pending sample-rate change on this thread, for the same
             # reason — and because it has to bracket setupStream/activateStream.
-            if self._rate_to is not None:
+            if (self._rate_to is not None
+                    and _time.monotonic() - self._rate_req_at >= RATE_DEBOUNCE_S):
                 want = float(self._rate_to)
                 if abs(want - self.samp_rate) > 1.0:
                     self._apply_samp_rate(want)
@@ -933,12 +958,39 @@ class SoapyAdapter(RadioAdapter):
         return float(self.samp_rate)
 
     def set_span(self, span_hz):
-        """The pan window IS the device sample rate. get_iq hands the core
+        """AE zoomed the panadapter — retune the device to match.
+
+        The pan window IS the device sample rate. get_iq hands the core
         full-rate blocks, so the engine must label the bins with the width the
-        data actually covers. Before this, AE's default 250 kHz label sat on
-        2.04 MHz of spectrum: every signal painted ~8x too narrow and a click
-        on the pan tuned ~8x short of the signal — off-tuned SSB = robotic
-        'Dalek' audio (found with a sig gen on 2 m, 2026-08-01)."""
+        data actually covers. Before that was honoured, AE's default 250 kHz
+        label sat on 2.04 MHz of spectrum: every signal painted ~8x too narrow
+        and a click on the pan tuned ~8x short of the signal — off-tuned SSB =
+        robotic 'Dalek' audio (found with a sig gen on 2 m, 2026-08-01).
+
+        The corollary went unimplemented until 2026-08-31: if the span is the
+        rate, then a zoom IS a rate change, and this returned the current rate
+        while discarding the request. AE's zoom reached the gate and died here,
+        one call short of the radio, so the only way to change resolution was
+        to restart the gate.
+
+        RETURNS THE RATE RUNNING RIGHT NOW, NOT THE REQUEST. The change is
+        applied by the reader thread after a debounce, so the core labels the
+        bins with the width the IQ currently has and re-advertises when the new
+        rate actually lands (see the span sync in stream_loop). This is the
+        contract AetherSDR already documents for the seam — IRadioBackend.h:
+        "hz is a REQUEST: a backend whose hardware offers a fixed set of rates
+        snaps to the nearest one it can actually run".
+
+        Deliberately NON-BLOCKING: this runs on the TCP command thread, and
+        waiting here for a ~1 s stream restart would stall every other command
+        AE has in flight.
+        """
+        if span_hz and self._sdr is not None:
+            snapped = self._request_rate(span_hz)
+            if snapped is not None and abs(snapped - self.samp_rate) > 1.0:
+                print(f"[soapy] AE zoom -> {snapped:.0f} S/s "
+                      f"(asked {float(span_hz):.0f}, now {self.samp_rate:.0f})",
+                      flush=True)
         return float(self.samp_rate)
 
     def supported_rates(self):
@@ -955,6 +1007,29 @@ class SoapyAdapter(RadioAdapter):
                           if float(r) > 0)
         except Exception:
             return []
+
+    def _request_rate(self, rate_hz):
+        """Snap a rate request onto the device's grid and queue it.
+
+        Shared by the operator's explicit control (set_samp_rate) and AE's pan
+        zoom (set_span). Stamping the request is what makes the reader thread's
+        debounce work: a zoom DRAG delivers ~30 of these a second and each one
+        would otherwise be a full stream restart.
+
+        Returns the snapped rate, or None if no device is open.
+        """
+        if self._sdr is None:
+            return None
+        want = float(rate_hz)
+        rates = self.supported_rates()
+        snapped = min(rates, key=lambda r: abs(r - want)) if rates else want
+        if rates and abs(snapped - want) > 1.0:
+            print(f"[soapy] sample rate {want:.0f} unsupported — snapping to "
+                  f"{snapped:.0f} (device offers: "
+                  f"{', '.join(f'{r:.0f}' for r in rates)})", flush=True)
+        self._rate_to = snapped
+        self._rate_req_at = time.monotonic()
+        return snapped
 
     def set_samp_rate(self, rate_hz, wait_s=5.0):
         """Ask for a new sample rate; the reader thread applies it.
@@ -973,16 +1048,9 @@ class SoapyAdapter(RadioAdapter):
         Blocks until the reader thread has applied it, then returns the rate
         the device ACTUALLY reports, or None if no device is open.
         """
-        if self._sdr is None:
+        snapped = self._request_rate(rate_hz)
+        if snapped is None:
             return None
-        want = float(rate_hz)
-        rates = self.supported_rates()
-        snapped = min(rates, key=lambda r: abs(r - want)) if rates else want
-        if rates and abs(snapped - want) > 1.0:
-            print(f"[soapy] sample rate {want:.0f} unsupported — snapping to "
-                  f"{snapped:.0f} (device offers: "
-                  f"{', '.join(f'{r:.0f}' for r in rates)})", flush=True)
-        self._rate_to = snapped
         # Wait for the reader thread to land it. The core re-advertises the pan
         # geometry from our samp_rate the moment we return, and labelling new
         # data with the old span is precisely the axis error current_span_hz

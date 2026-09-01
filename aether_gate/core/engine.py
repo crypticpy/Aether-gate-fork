@@ -839,6 +839,7 @@ class Radio:
         self.vita_dest = None
         self._ae_drive_at = 0.0      # when AE last drove the tune (suppresses radio->AE echo)
         self._radio_sync_at = 0.0    # last radio->AE dial-sync check
+        self._span_sync_at = 0.0     # last radio->AE span-sync check
         self.run = True
         self.send_lock = threading.Lock()   # serialize TCP writes: stream thread (status) vs command thread (replies)
         self.streaming = False
@@ -1341,7 +1342,8 @@ class Radio:
                     self.adapter.set_gain(float(kvs["rfgain"]))
                 except Exception as e:
                     log("[adapter] set_gain error:", e)
-            if "bandwidth" in kvs:
+            span_requested = "bandwidth" in kvs
+            if span_requested:
                 self._set_pan_span_hz(float(kvs["bandwidth"]) * 1e6)
             zoom_changed = self._handle_pan_zoom(pid, kvs)
             # Retune THIS panadapter by absolute centre= or by band= (AE's band buttons).
@@ -1366,7 +1368,16 @@ class Radio:
                     self.center_mhz = new_center           # no pan id: legacy radio-global behaviour
                 self._sync_active_slice()
             self.reply(conn, seq)
-            if pan is not None and (new_center is not None or zoom_changed):
+            # A bandwidth= is re-announced even when nothing else moved. The
+            # adapter may have SNAPPED the request to a rate its hardware can
+            # run, or deferred it to its reader thread — either way AE would
+            # otherwise keep drawing its frequency axis at the width it asked
+            # for while the bins it receives cover the width the radio actually
+            # has. That mismatch is the axis error current_span_hz exists to
+            # prevent; the span sync in stream_loop re-announces again once a
+            # deferred change lands.
+            if pan is not None and (new_center is not None or zoom_changed
+                                    or span_requested):
                 self.emit_pan_status(conn, pid)            # re-announce the pan's new centre to AE
                 sidx = pan.get("slice")
                 if new_center is not None and sidx is not None and sidx in self.slices:
@@ -1714,6 +1725,34 @@ class Radio:
             except Exception:
                 pass
         return self.span_mhz
+
+    def _sync_span(self):
+        """Adopt the span the adapter is ACTUALLY running, and tell AE.
+
+        An adapter applies a rate change on its own reader thread, so the new
+        width lands after the command that asked for it was already answered —
+        set_span deliberately returns the rate running at the time rather than
+        the request (IRadioBackend.h: "Callers must not assume the requested
+        value was taken"). Nothing else would ever correct AE, and a pan
+        labelled with the old span over new data is the axis error
+        current_span_hz was added to prevent.
+
+        Returns True if the span moved.
+        """
+        a = getattr(self, "adapter", None)
+        if not hasattr(a, "current_span_hz"):
+            return False
+        shz = a.current_span_hz()
+        if not shz or abs(shz - self.span_mhz * 1e6) <= 1.0:
+            return False
+        was = self.span_mhz
+        self.span_mhz = float(shz) / 1e6
+        if self.conn is not None:
+            self.emit_pan_status(self.conn)
+        log(f"[radio-wins] span {was:.6f} -> {self.span_mhz:.6f} MHz "
+            f"({(self.span_mhz * 1e6) / max(1, self.bins):.1f} Hz/bin)"
+            f" — re-advertised to AE")
+        return True
 
     def resolution(self):
         """Current panadapter geometry: bin width = span / bins."""
@@ -2442,6 +2481,26 @@ class Radio:
                     log("[stream] send error:", e); break
                 fi += 1
                 last_tc = tc
+            # Aether-gate seam: radio -> AE SPAN sync. An adapter applies a rate
+            # change on its own reader thread (AE's pan zoom, or the control
+            # panel), so the new width lands AFTER the command that asked for it
+            # has already been answered. Nothing else would ever tell AE, and a
+            # pan labelled with the old span over new data is exactly the axis
+            # error current_span_hz was added to prevent.
+            #
+            # NOT held off after an AE-driven command the way the dial sync below
+            # is: the span IS the frequency axis, and drawing it wrong for two
+            # seconds is worse than a ping-pong that cannot happen here — the
+            # value we report back is the one AE asked for, snapped to a rate the
+            # device can actually run.
+            if (self.adapter is not None and self.conn is not None
+                    and time.time() - self._span_sync_at > 0.5):
+                self._span_sync_at = time.time()
+                try:
+                    self._sync_span()        # radio -> AE: adopt the width the IQ really has
+                except Exception as e:
+                    log("[adapter] span sync failed:", e)
+
             # Aether-gate seam: radio -> AE dial sync. If the rig was tuned at
             # its front panel (CI-V transceive or the adapter's slow poll), the
             # active slice + its pan follow, and AE is told via status. Held

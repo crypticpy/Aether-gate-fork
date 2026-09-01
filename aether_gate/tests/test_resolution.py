@@ -21,7 +21,9 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-from aether_gate.adapters.soapy import SoapyAdapter
+import time
+
+from aether_gate.adapters.soapy import SoapyAdapter, RATE_DEBOUNCE_S
 
 
 class _FakeDevice:
@@ -52,12 +54,19 @@ def _adapter(rate=250000.0):
     return a
 
 
-def _reader_tick(a):
-    """Do what _read_loop does with a pending rate, without a real stream."""
+def _reader_tick(a, settled=True):
+    """Do what _read_loop does with a pending rate, without a real stream.
+
+    `settled` models the debounce: the real loop only acts once a request has
+    sat still for RATE_DEBOUNCE_S, so a tick mid-drag must do nothing.
+    """
     a._stop_stream = lambda: None
     a._start_stream = lambda: None
     a._verify_stream = lambda timeout_s=2.0: True
-    if a._rate_to is not None:
+    if settled:
+        a._rate_req_at -= RATE_DEBOUNCE_S + 0.01     # as if the operator let go
+    if (a._rate_to is not None
+            and time.monotonic() - a._rate_req_at >= RATE_DEBOUNCE_S):
         want = float(a._rate_to)
         if abs(want - a.samp_rate) > 1.0:
             a._apply_samp_rate(want)
@@ -130,7 +139,60 @@ def test_the_span_follows_the_rate():
     a.set_samp_rate(125_000, wait_s=0.0)
     _reader_tick(a)
     assert a.current_span_hz() == 125_000.0
-    assert a.capabilities.max_span_hz == 125_000.0
+
+
+def test_zooming_in_does_not_strand_the_zoom_out():
+    # max_span_hz drives AE's band-zoom button. Pinning it to the rate we happen
+    # to run meant zooming in shrank the only width you could ever get back to.
+    a = _adapter(500_000.0)
+    a.capabilities.max_span_hz = 2_000_000.0
+    a.set_samp_rate(62_500, wait_s=0.0)
+    _reader_tick(a)
+    assert a.capabilities.max_span_hz == 2_000_000.0
+
+
+# --- AE's pan zoom reaches the radio ---------------------------------------
+
+def test_set_span_queues_a_rate_change_instead_of_discarding_it():
+    # The regression: set_span returned samp_rate and threw the request away, so
+    # AE's zoom reached the gate and died one call short of the radio.
+    a = _adapter(500_000.0)
+    a.set_span(125_000.0)
+    assert a._rate_to == 125_000.0
+
+
+def test_set_span_snaps_to_a_rate_the_device_can_run():
+    a = _adapter(500_000.0)
+    a.set_span(100_000.0)                     # between two offered rates
+    assert a._rate_to in _FakeDevice.RATES
+
+
+def test_set_span_reports_the_rate_running_now_not_the_request():
+    # IRadioBackend.h: "Callers must not assume the requested value was taken."
+    # The core labels the bins with the width the IQ CURRENTLY has; the change
+    # is re-advertised by the span sync once it lands.
+    a = _adapter(500_000.0)
+    assert a.set_span(62_500.0) == 500_000.0
+
+
+def test_set_span_never_blocks_the_command_thread():
+    import time as _t
+    a = _adapter(500_000.0)
+    t0 = _t.monotonic()
+    a.set_span(62_500.0)                      # no reader thread is running
+    assert _t.monotonic() - t0 < 0.25, "set_span waited; it runs on the TCP command thread"
+
+
+def test_a_zoom_drag_is_coalesced_into_one_rate_change():
+    # ~30 bandwidth commands a second, each a stop/set/rebuild/start cycle.
+    from aether_gate.adapters.soapy import RATE_DEBOUNCE_S
+    a = _adapter(2_000_000.0)
+    for hz in (1_000_000, 500_000, 250_000, 125_000, 62_500):
+        a.set_span(hz)
+        _reader_tick(a, settled=False)        # the reader runs THROUGHOUT the drag
+    assert a._sdr.sets == [], "applied a rate mid-drag instead of waiting for it to settle"
+    _reader_tick(a)                           # the operator lets go
+    assert a._sdr.sets == [62_500.0], "must apply the value the drag ENDED on, once"
 
 
 # --- the wire: AE has to be told the geometry changed -----------------------
@@ -206,3 +268,79 @@ def test_an_adapter_without_the_seam_reports_no_rate_control():
     assert res["can_set_rate"] is False
     assert res["rates"] == []
     r.set_resolution(samp_rate_hz=125_000)        # must be a no-op, not a crash
+
+
+def test_AE_pan_zoom_wire_text_reaches_the_radio():
+    """The whole seam, end to end: AE's wire text -> engine -> adapter.
+
+    This is the link that was missing. AE has always sent
+    "display pan set <id> bandwidth=<MHz>" (AetherSDR RadioModel.cpp), the
+    engine has always parsed it into _set_pan_span_hz, and set_span threw it
+    away — so the operator's zoom reached the gate and stopped one call short
+    of the radio, and resolution could only be changed by restarting the gate.
+    """
+    a = _adapter(500_000.0)
+    r = _radio(a)
+    pid = r._new_pan()
+    r.on_line(FakeConn(), f"C1|display pan set 0x{pid:08X} bandwidth=0.062500")
+    assert a._rate_to == 62_500.0
+
+
+def test_AE_zoom_to_an_impossible_span_snaps_rather_than_refusing():
+    # AE's zoom is continuous; the device has ~19 discrete rates. A zoom past
+    # the bottom must land on the narrowest the device can run, not be dropped.
+    a = _adapter(500_000.0)
+    r = _radio(a)
+    pid = r._new_pan()
+    r.on_line(FakeConn(), f"C1|display pan set 0x{pid:08X} bandwidth=0.001000")
+    assert a._rate_to == min(_FakeDevice.RATES)
+
+
+def test_the_pan_status_advertises_the_span_the_radio_actually_runs():
+    # AE draws its frequency axis from bandwidth= in the pan status. Echoing
+    # the REQUEST rather than the running rate is the axis error that made
+    # signals paint at the wrong width and clicks tune short.
+    a = _adapter(500_000.0)
+    r = _radio(a)
+    pid = r._new_pan()
+    conn = FakeConn()
+    r.conn = conn
+    r.on_line(conn, f"C1|display pan set 0x{pid:08X} bandwidth=0.062500")
+    assert "bandwidth=0.500000" in conn.out.decode(), \
+        "advertised the requested span before the radio had taken it"
+
+
+# --- the span sync: how AE finally learns what the radio took ---------------
+
+def test_the_span_sync_adopts_the_rate_the_radio_actually_took():
+    # AE zooms, the adapter snaps and defers; this is the only thing that ever
+    # tells AE the width its bins really cover.
+    a = _adapter(500_000.0)
+    r = _radio(a)
+    r._new_pan()
+    r.conn = FakeConn()
+    r.span_mhz = 0.5
+    r.on_line(r.conn, "C1|display pan set 0x40000000 bandwidth=0.062500")
+    _reader_tick(a)                                   # the change lands later
+    assert r.span_mhz == 0.5, "adopted the request before the radio had taken it"
+    assert r._sync_span() is True
+    assert r.span_mhz == pytest.approx(0.0625)
+    assert "bandwidth=0.062500" in r.conn.out.decode()
+
+
+def test_the_span_sync_is_quiet_when_nothing_moved():
+    # It runs twice a second on the stream thread; it must not re-emit forever.
+    a = _adapter(250_000.0)
+    r = _radio(a)
+    r._new_pan()
+    r.conn = FakeConn()
+    r._sync_span()                                    # adopt 250 kHz once
+    r.conn.out.clear()
+    assert r._sync_span() is False
+    assert r.conn.out == bytearray()
+
+
+def test_the_span_sync_ignores_an_adapter_without_the_seam():
+    from aether_gate.adapters import SimAdapter
+    r = _radio(SimAdapter(model="FLEX-6600"))
+    assert r._sync_span() is False
