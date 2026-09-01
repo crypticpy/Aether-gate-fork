@@ -1452,6 +1452,9 @@ class SoapyAdapter(RadioAdapter):
         # show. The absolute scale is untouched — this is a different quantity,
         # not a fudged one.
         psd = np.abs(spec) ** 2
+        # wg is needed for the noise figure below as well as the signal, so it
+        # is hoisted above the early return.
+        wg = float(np.mean(win * win))
         # Median, not mean: signals occupy a handful of the window's bins and
         # would drag a mean estimate up toward whatever we are trying to measure.
         # Noise-only bin powers are exponentially distributed, whose median is
@@ -1459,15 +1462,21 @@ class SoapyAdapter(RadioAdapter):
         # and every weak signal is over-reported by the same amount.
         noise_per_bin = float(np.median(psd)) / _LN2
         excess = float(np.sum(psd[sel])) - noise_per_bin * float(np.count_nonzero(sel))
+        noise_dbm = (10.0 * np.log10(max(noise_per_bin * float(np.count_nonzero(sel)),
+                                          1e-30) / (n * n * wg))
+                     + dbm_offset_for(self.gain_db, self.dbm_trim))
         if excess <= 0.0:
-            return Meters(s_meter_dbm=-140.0)      # nothing above the floor
+            # Nothing above the floor. Still report the floor: on a quiet band
+            # that is the only real measurement there is, and it is the half of
+            # SNR an operator tunes an antenna against.
+            return Meters(s_meter_dbm=-140.0, noise_dbm=float(noise_dbm))
         # Normalised by the window's power gain so the reading is a property of
         # the signal, not of the window we chose.
-        wg = float(np.mean(win * win))
         rms = float(np.sqrt(excess / (n * n * wg))) + 1e-12
         # ONE calibration, shared with the panadapter (core.fft). Backing the
         # RF gain out here is what stops our own front-end setting masquerading
         # as signal strength; the panadapter does the same, so the two scales
         # agree instead of drifting apart as the gain moves.
         dbm = 20.0 * np.log10(rms) + dbm_offset_for(self.gain_db, self.dbm_trim)
-        return Meters(s_meter_dbm=max(-140.0, min(0.0, dbm)))
+        return Meters(s_meter_dbm=max(-140.0, min(0.0, dbm)),
+                      noise_dbm=float(noise_dbm))

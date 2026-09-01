@@ -946,6 +946,7 @@ class Radio:
         self.qsk = False             # full break-in (RX between elements); AE sets via cwx qsk_enabled
         self.enabled = True          # "power": when False, stop advertising (radio drops off AE)
         self.last_vfo_dbm = -130.0   # last level at the VFO — drives the rack strip's signal meter
+        self.last_noise_dbm = None   # floor the signal was measured against, when the adapter separates them
         # remote_audio_rx stream state
         self.audio_stream_id = None
         self.audio_stop = threading.Event()
@@ -992,6 +993,11 @@ class Radio:
                 "freq": round(self.slice_freq, 5), "mode": self.slice_mode, "tx": self.tx_on,
                 "pattern": self.pattern, "power_w": round(self.tx_power_w),
                 "meter_dbm": round(self.last_vfo_dbm, 1),
+                "noise_dbm": (round(self.last_noise_dbm, 1)
+                              if self.last_noise_dbm is not None else None),
+                "snr_db": (round(self.last_vfo_dbm - self.last_noise_dbm, 1)
+                           if self.last_noise_dbm is not None
+                           and self.last_vfo_dbm > -140.0 else None),
                 "slices": len(self.slices), "max_slices": self.max_slices}
 
     def dbm_to_pixel(self, dbm):
@@ -2514,6 +2520,10 @@ class Radio:
                         _pstat["meters"][0] += time.perf_counter() - _t0; _pstat["meters"][1] += 1
                 self.last_vfo_dbm = m.s_meter_dbm if m is not None \
                     else levels[ctx.center]                         # active slice (pan centre) -> rack strip
+                # The floor the signal was measured against, when the adapter
+                # separates them. Their difference is the SNR an antenna change
+                # actually has to move.
+                self.last_noise_dbm = getattr(m, "noise_dbm", None) if m is not None else None
                 # Which pan owns the live scope? The 9700 streams ONLY the
                 # selected/TX receiver's scope, so only that pan gets the real
                 # pixels; a SUB pan (non-selected receiver) shows a floor until
@@ -2964,6 +2974,8 @@ function render(d){
   h+='<div class=grid>';
   var M=d.meters||{},S=d.scope||{},F=d.flags||{},C=d.counters||{};
   h+='<div class=card><h2>s-meter</h2>'+row('signal',(M.s_meter_dbm!=null?(M.s_meter_dbm+' dBm'):null))
+     +row('noise',(M.noise_dbm!=null?(M.noise_dbm+' dBm'):null))
+     +row('snr',(M.snr_db!=null?(M.snr_db+' dB'):null))
      +row('s-unit',M.s_unit)+row('raw',M.raw)+'</div>';
   var scDot=(S.live?'on':(S.fps===0?'warn':'off'));
   var scTxt=(S.live?('LIVE '+S.fps+' fps'):(S.fps===0?'STALLED':'&mdash;'));
@@ -3338,6 +3350,11 @@ def start_control_server(radio, port):
                     "pattern": radio.pattern,
                     "tx": radio.tx_on,
                     "meter_dbm": round(radio.last_vfo_dbm, 1),
+                    "noise_dbm": (round(radio.last_noise_dbm, 1)
+                                  if radio.last_noise_dbm is not None else None),
+                    "snr_db": (round(radio.last_vfo_dbm - radio.last_noise_dbm, 1)
+                               if radio.last_noise_dbm is not None
+                               and radio.last_vfo_dbm > -140.0 else None),
                     "res": radio.resolution(),
                 })
             # ---- radio diagnostics: 'what the gate sees from the radio' ----

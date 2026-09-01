@@ -44,7 +44,8 @@ def _pan_peak(iq, gain_db, trim=0.0):
     return float(np.max(_pan_bins(iq, gain_db, trim)))
 
 
-def _meter(iq, gain_db, trim=0.0):
+def _meter_full(iq, gain_db, trim=0.0):
+    """The whole Meters object — signal AND the floor it was measured against."""
     a = SoapyAdapter(driver="none", samp_rate=FS, center_hz=CENTER, gain_db=gain_db)
     a._np = np
     a._init_demod()
@@ -52,7 +53,11 @@ def _meter(iq, gain_db, trim=0.0):
     a._slice_hz = CENTER
     a.dbm_trim = trim
     a._latest = iq
-    return a.read_meters().s_meter_dbm
+    return a.read_meters()
+
+
+def _meter(iq, gain_db, trim=0.0):
+    return _meter_full(iq, gain_db, trim).s_meter_dbm
 
 
 def _at_gain(gain_db, trim=0.0):
@@ -131,3 +136,25 @@ def test_full_scale_carrier_reads_zero_dbfs():
     carrier = np.exp(2j * np.pi * 10_000.0 * np.arange(n) / FS).astype(np.complex128)
     peak = max(iq_to_dbm(carrier, BINS, -200.0, 20.0))
     assert peak == pytest.approx(0.0, abs=0.5), f"full-scale carrier read {peak:.1f} dBFS"
+
+
+def test_the_meter_reports_the_floor_it_measured_against():
+    """SNR is the number an antenna change has to move, so both halves ship.
+
+    A better antenna raises signal AND noise, and so does turning the gain up;
+    only their difference says whether anything was gained. The adapter already
+    computes the floor to subtract it, so throwing it away was the waste.
+    """
+    iq = (_noise() + _tone()) * (10 ** ((12.0 - 12.0) / 20.0))
+    m = _meter_full(iq, 12.0, 0.0)
+    assert m.noise_dbm is not None
+    # The tone is well clear of the floor it was measured against.
+    assert m.s_meter_dbm - m.noise_dbm > 6.0
+
+
+def test_static_alone_still_reports_a_floor():
+    """No signal is not the same as no measurement. On a quiet band the floor
+    is the only real number there is, and it is the half being tuned against."""
+    m = _meter_full(_noise(), 12.0, 0.0)
+    assert m.s_meter_dbm == -140.0          # nothing above the floor
+    assert m.noise_dbm is not None and m.noise_dbm > -140.0
