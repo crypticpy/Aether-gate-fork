@@ -391,3 +391,41 @@ def test_the_span_sync_ignores_an_adapter_without_the_seam():
     from aether_gate.adapters import SimAdapter
     r = _radio(SimAdapter(model="FLEX-6600"))
     assert r._sync_span() is False
+
+
+def test_the_pan_fft_spans_more_than_one_readstream_block():
+    """A 16384-bin pan must get 16384 real samples, not 4096 interpolated up.
+
+    get_iq used to ignore its length argument and return one 4096-sample block,
+    so every bin count above 4096 was cosmetic: the true resolution bandwidth
+    stayed samp_rate/4096 and iq_to_dbm merely interpolated. The tell was a
+    noise floor that did not move when the advertised bin width changed 8x.
+    """
+    np = pytest.importorskip("numpy")
+    from aether_gate.adapters.soapy import SoapyAdapter
+
+    fs = 125_000.0
+    a = SoapyAdapter(driver="none", samp_rate=fs, center_hz=3_722_000.0)
+    a._np = np
+    for _ in range(4):                      # what the reader delivers in ~131 ms
+        a._pan_ring.append(np.zeros(4096, dtype=np.complex128))
+
+    out = a.get_iq(16384, 3_722_000.0, fs)
+    assert out is not None
+    assert len(out) == 16384
+
+
+def test_a_short_ring_degrades_to_what_exists_rather_than_lying():
+    """Right after a start or a rate change there is less history than asked
+    for. Handing back the short block is correct — the pan loses resolution but
+    the dBm scale stays honest. Padding would invent samples."""
+    np = pytest.importorskip("numpy")
+    from aether_gate.adapters.soapy import SoapyAdapter
+
+    fs = 125_000.0
+    a = SoapyAdapter(driver="none", samp_rate=fs, center_hz=3_722_000.0)
+    a._np = np
+    a._pan_ring.append(np.zeros(4096, dtype=np.complex128))
+
+    out = a.get_iq(16384, 3_722_000.0, fs)
+    assert len(out) == 4096

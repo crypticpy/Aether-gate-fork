@@ -38,6 +38,20 @@ AUDIO_RATE = 24000          # AE remote_audio_rx rate (must match core AUDIO_RAT
 # off, and how many mean the device is gone for good. 20 fast retries is ~20 ms,
 # comfortably longer than any real overflow; 2000 ends a hopeless loop rather
 # than spinning at ~1 kHz forever when the SDR has been unplugged.
+# HOW MANY readStream BLOCKS THE PANADAPTER FFT MAY SPAN.
+#
+# The reader hands back 4096 samples at a time, and get_iq used to return
+# exactly one of them however many bins the pan asked for. That made the
+# advertised bin width a fiction above 4096 bins: the true resolution was
+# always samp_rate/4096 (30.5 Hz at 125 kHz) and iq_to_dbm merely interpolated
+# up to the requested width. Found 2026-08-31 chasing a noise floor that did
+# not move when the bin width supposedly changed 8x.
+#
+# Consecutive blocks come from one uninterrupted stream, so concatenating them
+# is a real longer transform, not a stitch. Eight covers the 16384-bin ceiling
+# with room to spare and costs 256 kB of complex64.
+_PAN_RING_BLOCKS = 8
+
 _ERR_FAST = 20
 # ⚠ DECLARE THE DEVICE LOST ON ELAPSED TIME, NOT ERROR COUNT.
 #
@@ -129,7 +143,9 @@ class SoapyAdapter(RadioAdapter):
         self._sdr = None
         self._stream = None
         self._lock = threading.Lock()
-        self._latest = None                 # most recent complex block (for the panadapter FFT)
+        self._latest = None                 # most recent complex block (meters, demod priming)
+        # Recent blocks in arrival order, so the pan FFT can span more than one.
+        self._pan_ring = collections.deque(maxlen=_PAN_RING_BLOCKS)
         self._run = False
         self._reader = None
         self._retune_to = None              # pending centre change (applied in the reader thread)
@@ -428,6 +444,8 @@ class SoapyAdapter(RadioAdapter):
         self._init_demod()                  # decimation chain is a function of the rate
         self._iq_resid = None               # leftovers are at the OLD rate: they would click
         self._audio_q.clear()               # ditto for anything already queued
+        with self._lock:
+            self._pan_ring.clear()          # concatenating across a rate change is a splice
         try:
             self._start_stream()
         except Exception as e:
@@ -846,7 +864,8 @@ class SoapyAdapter(RadioAdapter):
                     fresh_at = _now         # don't re-fire on every block
                 block = buf[:n].copy()
                 with self._lock:
-                    self._latest = block        # for the panadapter FFT (latest is fine)
+                    self._latest = block        # for the meters (latest is fine)
+                    self._pan_ring.append(block)
                 self._audio_q.append(block)     # for the demod (continuous — every block consumed)
             elif n < 0:
                 # BACK OFF ON A PERSISTENT ERROR, AND GIVE UP ON A DEAD DEVICE.
@@ -1241,10 +1260,28 @@ class SoapyAdapter(RadioAdapter):
                 and self._retune_to is None:
             self._ae_center_hz = center_hz
             self.retune(center_hz)
+        # Serve the FFT the length it asked for, newest samples last, so the
+        # bin width the pan advertises is the bin width it actually has. Short
+        # of that (right after a start or a rate change) hand back what exists
+        # and let iq_to_dbm interpolate — less resolution, never a wrong scale.
         with self._lock:
-            blk = self._latest
-        if blk is None:
+            blocks = list(self._pan_ring)
+        if not blocks:
             return None
+        np_ = self._np
+        want = max(1, int(n))
+        if np_ is None or len(blocks) == 1:
+            blk = blocks[-1]
+        else:
+            take, have = [], 0
+            for b in reversed(blocks):
+                take.append(b)
+                have += len(b)
+                if have >= want:
+                    break
+            blk = np_.concatenate(list(reversed(take)))
+        if len(blk) > want:
+            blk = blk[-want:]
 
         # UNDO THE DC OFFSET FOR THE PANADAPTER. The core FFTs this block and
         # labels the bins with AE's pan centre, so the samples must actually BE
