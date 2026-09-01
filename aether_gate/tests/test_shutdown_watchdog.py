@@ -79,7 +79,12 @@ def _await_listening(port, proc, timeout_s=20.0):
     pytest.fail(f"gate never listened on port {port} within {timeout_s:.0f}s")
 
 
-@pytest.mark.skipif(not hasattr(signal, "SIGTERM"), reason="no SIGTERM here")
+# Windows has the SIGTERM *name* but never delivers the signal: Popen.send_signal
+# maps it to TerminateProcess(), which ends the child without running _graceful,
+# the finally, or the watchdog. hasattr(signal, "SIGTERM") is true there and
+# guards nothing (found by running this on Windows, 2026-09-01).
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="Windows cannot deliver SIGTERM; send_signal is TerminateProcess")
 def test_sigterm_wins_over_a_driver_that_never_returns(tmp_path):
     grace = 2.0
     port = _free_port()

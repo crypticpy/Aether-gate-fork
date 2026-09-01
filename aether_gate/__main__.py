@@ -278,8 +278,11 @@ def main(argv=None):
     # 0x05 disconnect and strand a phantom session, the exact bug fixed for
     # Ctrl-C. Turn SIGTERM into the SAME graceful path as Ctrl-C by raising
     # KeyboardInterrupt into the main thread: it unwinds through the try/finally
-    # below, so close() (→0x05) always runs. Best-effort — signal is a no-op on
-    # platforms lacking SIGTERM (Windows delivers it for our own Popen kills).
+    # below, so close() (→0x05) always runs. Best-effort: on Windows the name
+    # signal.SIGTERM exists but nothing ever delivers it — Popen.send_signal
+    # (SIGTERM) is TerminateProcess(), which kills without running this handler
+    # OR the finally. There, Ctrl-C is the only graceful stop, and the shutdown
+    # watchdog below never gets to run.
     def _graceful(signum, frame):
         raise KeyboardInterrupt
     try:

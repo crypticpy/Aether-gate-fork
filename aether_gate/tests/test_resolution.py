@@ -253,19 +253,38 @@ def test_one_segment_fills_a_datagram_without_overflowing_it():
     assert len(wf_packet(2, 0, [0] * (n + 1), 0.0, 1.0, 0)) > udp_maxdgram()
 
 
-def test_a_full_width_frame_segments_into_datagrams_that_each_fit():
+@pytest.mark.parametrize("maxdgram", [9216, 65507],
+                         ids=["macos-9216", "linux-windows-65507"])
+def test_a_full_width_frame_segments_into_datagrams_that_each_fit(monkeypatch, maxdgram):
     # The whole point of segmenting: the frame ceiling is no longer bounded by
     # the datagram limit, but no individual datagram may exceed it.
+    #
+    # The limit is FORCED, not read off the host, because it is a platform
+    # constant: macOS sends at most 9216 bytes per datagram, Linux and Windows
+    # 65507. Under the first a 16384-bin frame is four segments; under the
+    # second it fits one datagram and the loop runs once. Both are legal, and
+    # the segmenting code has to be exercised everywhere, not only on the
+    # platform it was written on — asserting `total > per` against the host's
+    # own limit held on macOS and failed by construction on the other two.
+    from aether_gate.core import engine
     from aether_gate.core.engine import (bins_per_packet, max_pan_bins,
                                          udp_maxdgram, fft_packet, wf_packet)
+    monkeypatch.setattr(engine, "_UDP_MAXDGRAM", maxdgram)
+    assert udp_maxdgram() == maxdgram
     total, per = max_pan_bins(), bins_per_packet()
-    assert total > per, "segmenting is pointless if a frame fits one datagram"
+    if maxdgram < 16384:
+        assert total > per, "a 9216-byte limit must segment, or macOS stays pinned at 4096 bins"
+    else:
+        assert per >= total, "at 65507 bytes a full frame fits one datagram"
     px = [0] * total
+    segments = 0
     for off in range(0, total, per):
         seg = px[off:off + per]
-        assert len(fft_packet(1, 0, seg, 7, off, total)) <= udp_maxdgram()
+        assert len(fft_packet(1, 0, seg, 7, off, total)) <= maxdgram
         assert len(wf_packet(2, 0, seg, 0.0, 1.0, 3,
-                             first_bin=off, total_bins=total)) <= udp_maxdgram()
+                             first_bin=off, total_bins=total)) <= maxdgram
+        segments += 1
+    assert segments == -(-total // per)         # ceil: 4 on macOS, 1 elsewhere
 
 
 def test_segments_declare_the_frame_width_and_their_own_offset():
