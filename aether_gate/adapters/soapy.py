@@ -77,6 +77,11 @@ _RECOVER_RETRY_MAX_S = 30.0
 _ERR_GIVE_UP = 2000
 from ..core.fft import dbm_offset_for
 
+# Bin powers in a noise-only FFT are exponentially distributed; their median is
+# ln(2) times their mean. read_meters divides by this to turn a robust median
+# into the mean power the noise actually carries.
+_LN2 = math.log(2.0)
+
 SSB_BW_HZ = 2700.0          # SSB audio passband width
 # What the demodulator actually passes, as offsets from the slice frequency.
 # These MUST track the filters built in _init_demod: the SSB path is a complex
@@ -1373,7 +1378,8 @@ class SoapyAdapter(RadioAdapter):
         # so a quiet channel metered STRONGER than a real carrier — measured
         # -47 dBm on noise against -55 dBm on a clean FM signal.
         #
-        # Over the DEMODULATOR'S PASSBAND, not a single bin at the slice
+        # Over the DEMODULATOR'S PASSBAND (minus the noise floor's share of it,
+        # see below), not a single bin at the slice
         # frequency. The previous version mixed the slice to DC and took
         # |mean()| over the block, which is a Goertzel bin: 8192 samples at
         # 250 kS/s is a 33 ms window, so it measured a ~30 Hz sliver centred
@@ -1394,17 +1400,37 @@ class SoapyAdapter(RadioAdapter):
             # Passband fell outside the digitised window — a slice parked beyond
             # the span. Report nothing rather than a number read off the edge.
             return Meters()
-        # Total power in the band. Normalised by the window's power gain so the
-        # reading is a property of the signal, not of the window we chose.
+        # SIGNAL POWER, NOT TOTAL POWER. Reporting the whole passband's power is
+        # the honest measurement and it makes the meter useless: a 3 kHz slice of
+        # band noise IS about -85 dBm, so the needle sat at S8 on dead static and
+        # had nowhere left to go for an actual signal. Every reference instrument
+        # an operator owns — a rig's meter, SDRconnect — is AGC/detector derived
+        # and reads far below the true noise power for the same reason. Measured
+        # against SDRconnect on the same antenna: its readout sits 8-14 dB under
+        # its OWN spectrum integrated across the same filter (2026-08-31).
+        #
+        # So subtract the noise floor's share of the passband and report what is
+        # left. On static that lands at the bottom of the scale; on a signal it
+        # is that signal's strength, which is the number the meter exists to
+        # show. The absolute scale is untouched — this is a different quantity,
+        # not a fudged one.
+        psd = np.abs(spec) ** 2
+        # Median, not mean: signals occupy a handful of the window's bins and
+        # would drag a mean estimate up toward whatever we are trying to measure.
+        # Noise-only bin powers are exponentially distributed, whose median is
+        # ln(2) of the mean — without that factor the floor reads 1.6 dB light
+        # and every weak signal is over-reported by the same amount.
+        noise_per_bin = float(np.median(psd)) / _LN2
+        excess = float(np.sum(psd[sel])) - noise_per_bin * float(np.count_nonzero(sel))
+        if excess <= 0.0:
+            return Meters(s_meter_dbm=-140.0)      # nothing above the floor
+        # Normalised by the window's power gain so the reading is a property of
+        # the signal, not of the window we chose.
         wg = float(np.mean(win * win))
-        p = float(np.sum(np.abs(spec[sel]) ** 2)) / (n * n * wg)
-        rms = float(np.sqrt(p)) + 1e-12
-        # UNCALIBRATED — no dBm reference exists for a front end whose gain we
-        # set ourselves. The offset merely places a typical signal in a
-        # plausible S-unit range; treat it as relative.
+        rms = float(np.sqrt(excess / (n * n * wg))) + 1e-12
         # ONE calibration, shared with the panadapter (core.fft). Backing the
         # RF gain out here is what stops our own front-end setting masquerading
-        # as signal strength; the panadapter now does the same, so the two
-        # scales agree instead of drifting apart as the gain moves.
+        # as signal strength; the panadapter does the same, so the two scales
+        # agree instead of drifting apart as the gain moves.
         dbm = 20.0 * np.log10(rms) + dbm_offset_for(self.gain_db, self.dbm_trim)
         return Meters(s_meter_dbm=max(-140.0, min(0.0, dbm)))

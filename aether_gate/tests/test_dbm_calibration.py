@@ -11,14 +11,16 @@ import numpy as np
 import pytest
 
 from aether_gate.core.fft import iq_to_dbm, dbm_offset_for
-from aether_gate.adapters.soapy import SoapyAdapter, SSB_PASS_HZ
+from aether_gate.adapters.soapy import SoapyAdapter
 
 FS = 250_000.0
 CENTER = 3_875_000.0
 BINS = 4096
 BIN_HZ = FS / BINS
-# The S-meter integrates the demodulator passband; the pan reports one bin.
-BANDWIDTH_RATIO_DB = 10.0 * np.log10(SSB_PASS_HZ / BIN_HZ)
+# Exactly on a bin for BOTH transforms (the pan's 4096 and the meter's 8192), so
+# neither reading is eaten by scalloping loss and they can be compared directly.
+TONE_HZ = -25.0 * BIN_HZ                      # inside the LSB passband
+TONE_AMP = 0.02
 
 
 def _noise(sigma=1.35e-3, n=8192, seed=3):
@@ -26,9 +28,20 @@ def _noise(sigma=1.35e-3, n=8192, seed=3):
     return (rng.normal(0, sigma, n) + 1j * rng.normal(0, sigma, n)).astype(np.complex128)
 
 
+def _tone(amp=TONE_AMP, n=8192, hz=TONE_HZ):
+    return (amp * np.exp(2j * np.pi * hz * np.arange(n) / FS)).astype(np.complex128)
+
+
+def _pan_bins(iq, gain_db, trim=0.0):
+    return iq_to_dbm(iq[:BINS], BINS, -200.0, 20.0, dbm_offset_for(gain_db, trim))
+
+
 def _pan_floor(iq, gain_db, trim=0.0):
-    bins = iq_to_dbm(iq[:BINS], BINS, -200.0, 20.0, dbm_offset_for(gain_db, trim))
-    return float(np.median(bins))
+    return float(np.median(_pan_bins(iq, gain_db, trim)))
+
+
+def _pan_peak(iq, gain_db, trim=0.0):
+    return float(np.max(_pan_bins(iq, gain_db, trim)))
 
 
 def _meter(iq, gain_db, trim=0.0):
@@ -43,8 +56,8 @@ def _meter(iq, gain_db, trim=0.0):
 
 
 def _at_gain(gain_db, trim=0.0):
-    """The same signal at the antenna, seen through `gain_db` of front end."""
-    iq = _noise() * (10 ** ((gain_db - 12.0) / 20.0))
+    """The same antenna signal — noise plus one tone — through `gain_db` of front end."""
+    iq = (_noise() + _tone()) * (10 ** ((gain_db - 12.0) / 20.0))
     return _pan_floor(iq, gain_db, trim), _meter(iq, gain_db, trim)
 
 
@@ -64,16 +77,40 @@ def test_neither_scale_follows_the_rf_gain(gain):
 
 
 @pytest.mark.parametrize("gain", [12.0, 32.0])
-def test_pan_and_meter_agree_on_the_same_noise(gain):
-    """Corrected for measurement bandwidth, the two must report the same thing.
+def test_pan_and_meter_agree_on_the_same_signal(gain):
+    """Both report the tone's power, so they must land on the same number.
 
     They look at identical samples; a disagreement is a calibration split, which
-    is exactly what dbm_offset_for exists to make impossible.
+    is exactly what dbm_offset_for exists to make impossible. No bandwidth term
+    here — the meter subtracts the noise floor's share of its passband, so what
+    is left is the tone, and a coherent-gain-normalised FFT peak is the tone too.
     """
-    pan, meter = _at_gain(gain)
-    assert meter == pytest.approx(pan + BANDWIDTH_RATIO_DB, abs=1.5), (
-        f"pan says {pan:.1f} dBm/bin (= {pan + BANDWIDTH_RATIO_DB:.1f} over "
-        f"{SSB_PASS_HZ:.0f} Hz), meter says {meter:.1f} dBm")
+    iq = (_noise() + _tone()) * (10 ** ((gain - 12.0) / 20.0))
+    peak, meter = _pan_peak(iq, gain), _meter(iq, gain)
+    assert meter == pytest.approx(peak, abs=1.0), (
+        f"pan peak says {peak:.1f} dBm, meter says {meter:.1f} dBm")
+
+
+def test_static_alone_reads_at_the_bottom_of_the_scale():
+    """Noise with no signal in it is what the meter must NOT report.
+
+    The whole reason for subtracting the floor: a 3 kHz slice of band noise
+    genuinely carries about -85 dBm, so reporting total passband power pinned
+    the needle at S8 on dead static and left it nowhere to go for real signal.
+    """
+    assert _meter(_noise(), 12.0) == -140.0
+
+
+def test_the_meter_reports_the_signal_not_the_noise_around_it():
+    """Raising the noise floor under an unchanged signal must not move the needle.
+
+    This is the property the subtraction buys, and the one a naive
+    total-power meter fails: there, 10 dB more noise is 10 dB more meter.
+    """
+    quiet = _meter(_noise() + _tone(), 12.0)
+    loud = _meter(_noise(sigma=1.35e-3 * (10 ** 0.5)) + _tone(), 12.0)
+    assert loud == pytest.approx(quiet, abs=1.0), (
+        f"10 dB more noise moved the meter {loud - quiet:+.1f} dB")
 
 
 def test_trim_moves_both_scales_together():
