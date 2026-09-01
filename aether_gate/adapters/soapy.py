@@ -121,6 +121,8 @@ class SoapyAdapter(RadioAdapter):
         self._gain_to = None                # pending RF gain dB (ditto — see set_gain)
         self._rate_to = None                # pending sample rate (ditto — see set_samp_rate)
         self._rate_req_at = 0.0             # monotonic stamp of the newest rate request
+        self._setting_to = {}               # pending Soapy settings (ditto — see set_device_setting)
+        self._antenna_to = None             # pending antenna port (ditto)
         self._gain_lo = 0.0                 # device gain range, filled in by _open_hw
         self._gain_hi = 50.0
         self._ae_center_hz = None           # last centre AE asked for, offset-free (see get_iq)
@@ -712,6 +714,31 @@ class SoapyAdapter(RadioAdapter):
                 if abs(want - self.samp_rate) > 1.0:
                     self._apply_samp_rate(want)
                 self._rate_to = None            # cleared LAST: it is set_samp_rate's done-signal
+            # Device settings + antenna port, same thread for the same reason.
+            # No debounce: these are discrete toggles, not a drag, and none of
+            # them restarts the stream.
+            if self._antenna_to is not None:
+                want = self._antenna_to
+                self._antenna_to = None
+                try:
+                    self._sdr.setAntenna(self._SOAPY_SDR_RX, 0, want)
+                    got = str(self._sdr.getAntenna(self._SOAPY_SDR_RX, 0))
+                    print(f"[soapy] antenna -> {got} (asked {want})", flush=True)
+                except Exception as e:
+                    print(f"[soapy] SET ANTENNA FAILED to {want}: {e!r}", flush=True)
+            while self._setting_to:
+                key, want = self._setting_to.popitem()
+                try:
+                    self._sdr.writeSetting(key, want)
+                    # Read it back: this driver's setters lie (see _verify_stream).
+                    got = str(self._sdr.readSetting(key))
+                    if got != str(want):
+                        print(f"[soapy] setting {key}: asked {want!r}, device "
+                              f"reports {got!r}", flush=True)
+                    else:
+                        print(f"[soapy] setting {key} -> {got}", flush=True)
+                except Exception as e:
+                    print(f"[soapy] SET {key}={want!r} FAILED: {e!r}", flush=True)
             # ── REOPEN A DROPPED DEVICE INSTEAD OF GOING OFF THE AIR ──────
             # Set by either liveness test below. See _recover_device for why
             # reopening is the only way back once the driver has stopped.
@@ -936,6 +963,103 @@ class SoapyAdapter(RadioAdapter):
         """
         lo, hi, _ = self.gain_range()
         self._gain_to = max(float(lo), min(float(hi), float(gain_db)))
+
+    def device_controls(self):
+        """What THIS device offers beyond the Flex protocol's vocabulary.
+
+        Antenna port, bias-T, the MW/FM/DAB notches, IF mode — an RSPdx has all
+        of these and "display pan set" has no verb for any of them, so they can
+        only ever reach the operator through the gate's own surface.
+
+        Asked of the driver, never assumed: this same file already paid for
+        guessing a device's sample rates instead of calling listSampleRates.
+        Every value is read back from the device, so the panel shows what is
+        actually set rather than what we last sent.
+        """
+        if self._sdr is None:
+            return {}
+        rx = self._SOAPY_SDR_RX
+        out = {}
+        try:
+            ants = [str(a) for a in self._sdr.listAntennas(rx, 0)]
+            if ants:
+                out["antenna"] = {"value": str(self._sdr.getAntenna(rx, 0)),
+                                  "options": ants}
+        except Exception:
+            pass
+        settings = []
+        try:
+            for info in self._sdr.getSettingInfo():
+                key = str(info.key)
+                item = {"key": key, "name": str(info.name) or key,
+                        "type": str(info.type)}
+                opts = [str(o) for o in info.options] if info.options else []
+                if opts:
+                    item["options"] = opts
+                try:
+                    item["value"] = str(self._sdr.readSetting(key))
+                except Exception:
+                    continue          # write-only or unreadable: not a control
+                settings.append(item)
+        except Exception:
+            pass
+        if settings:
+            out["settings"] = settings
+        return out
+
+    def set_antenna(self, name):
+        """Queue an antenna-port change; the reader thread applies it.
+
+        Not blocking and not verified here — the caller re-reads
+        device_controls() to see what the device took, which is the same
+        read-back-don't-trust rule the rest of this adapter runs on.
+        """
+        if self._sdr is None or not name:
+            return False
+        self._antenna_to = str(name)
+        return True
+
+    def set_device_setting(self, key, value):
+        """Queue a Soapy setting write (bias-T, notches, HDR, AGC setpoint...).
+
+        Values go as strings — Soapy's setting ABI is stringly typed, and
+        booleans must be "true"/"false" rather than Python's "True"/"False",
+        which the driver does not parse.
+        """
+        if self._sdr is None or not key:
+            return False
+        if isinstance(value, bool):
+            value = "true" if value else "false"
+        self._setting_to[str(key)] = str(value)
+        return True
+
+    def diagnostics(self):
+        """'What the gate sees from the radio' for the diagnostics panel."""
+        if self._sdr is None:
+            return {"radio": f"soapy:{self.driver}",
+                    "link": {"transport": "soapy", "state": "closed"}}
+        rates = self.supported_rates()
+        d = {
+            "radio": f"soapy:{self.driver}",
+            "link": {"transport": "soapy", "host": self.device_args or self.driver,
+                     "state": "open" if self._stream is not None else "no stream"},
+            "vfos": [{"name": "Tuner", "freq_hz": self.center_hz,
+                      "mode": self._mode, "selected": True}],
+            "scope": {"bins": None, "span_hz": self.samp_rate,
+                      "samp_rate": self.samp_rate,
+                      "rates": [int(round(r)) for r in rates]},
+            "rx_controls": {"rf_gain_db": self.gain_db, "agc": self.agc,
+                            "gain_range_db": [self._gain_lo, self._gain_hi]},
+            "audio": {"decim": self._decim, "post_decim_rate": self._pd_rate},
+        }
+        try:
+            d["link"]["detail"] = str(self._sdr.getHardwareKey())
+        except Exception:
+            pass
+        controls = self.device_controls()
+        if controls:
+            d["device"] = controls
+        return d
 
     def set_mode(self, mode):
         self._mode = (mode or "USB").upper()

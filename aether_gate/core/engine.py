@@ -3375,6 +3375,34 @@ def start_control_server(radio, port):
                 with open(fp, "rb") as f:
                     self.wfile.write(f.read())
                 return
+            # ---- device controls the Flex protocol has no verb for --------
+            # Antenna port, bias-T, the MW/DAB notches, HDR, AGC setpoint. None
+            # of these can travel as "display pan set" wire text, so the gate's
+            # own surface is the only place they can reach the operator.
+            #   GET /device                       -> what this device offers
+            #   GET /device/set?antenna=Antenna B
+            #   GET /device/set?key=biasT_ctrl&value=true
+            if u.path == "/device":
+                a = radio.adapter
+                if not hasattr(a, "device_controls"):
+                    return self._json({"error": "adapter has no device controls"})
+                return self._json(a.device_controls())
+            if u.path == "/device/set":
+                a = radio.adapter
+                q = urllib.parse.parse_qs(u.query)
+                if not hasattr(a, "device_controls"):
+                    return self._json({"error": "adapter has no device controls"})
+                if "antenna" in q and hasattr(a, "set_antenna"):
+                    a.set_antenna(q["antenna"][0])
+                    log(f"[ctl] antenna -> {q['antenna'][0]}")
+                if "key" in q and "value" in q and hasattr(a, "set_device_setting"):
+                    a.set_device_setting(q["key"][0], q["value"][0])
+                    log(f"[ctl] {q['key'][0]} -> {q['value'][0]}")
+                # The reader thread applies these; give it a beat so the
+                # read-back below reflects the write rather than the old value.
+                time.sleep(0.35)
+                return self._json(a.device_controls())
+
             # ---- panadapter resolution (bins and/or device sample rate) ----
             # Its own route, not /set: changing the rate restarts the adapter's
             # stream, so it can block for a second or two and it answers with
