@@ -95,10 +95,12 @@ def build_adapter(name, args):
         return cls(pattern=args.pattern, model=args.model,
                    serial=args.serial, station=station)
     if name == "soapy":
-        return cls(driver=args.soapy_driver, device_args=args.soapy_args,
-                   samp_rate=args.samp_rate, gain_db=args.gain,
-                   model=args.model, serial=args.serial, station=args.station,
-                   direct_samp=args.direct_samp, agc=args.agc)
+        a = cls(driver=args.soapy_driver, device_args=args.soapy_args,
+                samp_rate=args.samp_rate, gain_db=args.gain,
+                model=args.model, serial=args.serial, station=args.station,
+                direct_samp=args.direct_samp, agc=args.agc)
+        a.dbm_trim = args.dbm_trim         # survives a restart; /calibrate?trim= is live-only
+        return a
     if name == "icom9700":
         # give the 9700 a distinct identity unless the user overrode the shared defaults
         row = get_icom(args.icom_model)
@@ -206,6 +208,10 @@ def main(argv=None):
     ap.add_argument("--soapy-args", default="", help="soapy adapter: extra device args, comma kv (e.g. serial=00000001)")
     ap.add_argument("--samp-rate", type=float, default=2_040_000, help="soapy adapter: sample rate (Hz)")
     ap.add_argument("--gain", type=float, default=40.0, help="soapy adapter: RX gain dB (ignored if --agc)")
+    ap.add_argument("--dbm-trim", type=float, default=0.0,
+                    help="dB to add to every level (panadapter AND S-meter). The "
+                         "dBFS->dBm anchor depends on the front end and its antenna, "
+                         "so it can only be set against a reference; see GET /calibrate")
     ap.add_argument("--agc", action="store_true", help="soapy adapter: enable hardware AGC")
     ap.add_argument("--direct-samp", default=None, help="soapy adapter: RTL direct-sampling mode (Q=2 for HF on non-V4)")
     # Icom adapter options
