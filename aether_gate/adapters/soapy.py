@@ -787,6 +787,30 @@ class SoapyAdapter(RadioAdapter):
                               f"reports {got!r}", flush=True)
                     else:
                         print(f"[soapy] setting {key} -> {got}", flush=True)
+                    # A SETTING CAN MOVE THE GAIN, AND THE dBm SCALE MUST FOLLOW.
+                    #
+                    # rfgain_sel is the LNA state: on an RSPdx it is 28 steps of
+                    # front-end attenuation, worth tens of dB. It is written
+                    # through here rather than through set_gain, so self.gain_db
+                    # kept the value the operator last asked for while the actual
+                    # front end moved underneath it -- and dbm_offset_for backs
+                    # gain out of BOTH scales, so every dBm figure the gate
+                    # reported silently shifted by the difference. Swept live on
+                    # an RSPdx-R2 (2026-08-31): rfgain_sel 0 -> 14 moved the
+                    # reported noise floor 26 dB while gain_db stayed 12.0.
+                    #
+                    # Re-read the overall gain after any setting write. It is one
+                    # cheap call on a path that runs only when a control moves,
+                    # and it keeps the axis honest no matter which seam was used.
+                    try:
+                        now = float(self._sdr.getGain(self._SOAPY_SDR_RX, 0))
+                        if abs(now - self.gain_db) > 0.05:
+                            print(f"[soapy] {key} moved overall gain "
+                                  f"{self.gain_db:.1f} -> {now:.1f} dB; dBm scale "
+                                  f"follows", flush=True)
+                            self.gain_db = now
+                    except Exception:
+                        pass                # a driver without a gain readback
                 except Exception as e:
                     print(f"[soapy] SET {key}={want!r} FAILED: {e!r}", flush=True)
             # ── REOPEN A DROPPED DEVICE INSTEAD OF GOING OFF THE AIR ──────
