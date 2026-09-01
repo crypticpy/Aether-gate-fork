@@ -75,6 +75,8 @@ _RECOVER_RETRY_S = 5.0
 # seconds. (A previous spin-forever bug put 185,927 lines in a Pi 4's /tmp.)
 _RECOVER_RETRY_MAX_S = 30.0
 _ERR_GIVE_UP = 2000
+from ..core.fft import dbm_offset_for
+
 SSB_BW_HZ = 2700.0          # SSB audio passband width
 # What the demodulator actually passes, as offsets from the slice frequency.
 # These MUST track the filters built in _init_demod: the SSB path is a complex
@@ -139,6 +141,7 @@ class SoapyAdapter(RadioAdapter):
         # --- demod / audio state (SSB first) ---
         self._slice_hz = center_hz          # where to demodulate (the slice freq; core updates it)
         self._mode = "USB"                  # USB/LSB (others -> default to USB for now)
+        self.dbm_trim = 0.0                 # operator calibration, dB (see core.fft)
         self._audio_q = collections.deque(maxlen=64)  # raw IQ blocks queued for the demodulator
         self._nco_phase = 0.0               # persistent mixer phase (continuity across blocks)
         self._nco_ramp = None               # cached exp(1j*step*k); see _demod_block
@@ -1399,7 +1402,9 @@ class SoapyAdapter(RadioAdapter):
         # UNCALIBRATED — no dBm reference exists for a front end whose gain we
         # set ourselves. The offset merely places a typical signal in a
         # plausible S-unit range; treat it as relative.
-        dbm = 20.0 * np.log10(rms) - 10.0
-        # Do not let our own RF gain masquerade as signal strength.
-        dbm -= float(self.gain_db) - 20.0
+        # ONE calibration, shared with the panadapter (core.fft). Backing the
+        # RF gain out here is what stops our own front-end setting masquerading
+        # as signal strength; the panadapter now does the same, so the two
+        # scales agree instead of drifting apart as the gain moves.
+        dbm = 20.0 * np.log10(rms) + dbm_offset_for(self.gain_db, self.dbm_trim)
         return Meters(s_meter_dbm=max(-140.0, min(0.0, dbm)))

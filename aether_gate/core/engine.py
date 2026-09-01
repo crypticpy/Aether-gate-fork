@@ -2304,8 +2304,13 @@ class Radio:
             iq = a.get_iq(ctx.n, center_hz, span_hz)
             if iq is None:
                 return None
-            from .fft import iq_to_dbm
-            return iq_to_dbm(iq, ctx.n, ctx.min_dbm, ctx.max_dbm)
+            from .fft import iq_to_dbm, dbm_offset_for
+            # Same offset the adapter's S-meter applies, so the pan's dBm axis
+            # and the S-meter cannot disagree — and neither of them moves when
+            # the operator touches the RF gain.
+            return iq_to_dbm(iq, ctx.n, ctx.min_dbm, ctx.max_dbm,
+                             dbm_offset_for(getattr(a, "gain_db", 20.0),
+                                            getattr(a, "dbm_trim", 0.0)))
         return a.get_spectrum(ctx, t)
 
     def stream_loop(self):
@@ -3407,6 +3412,34 @@ def start_control_server(radio, port):
             # Its own route, not /set: changing the rate restarts the adapter's
             # stream, so it can block for a second or two and it answers with
             # the geometry that actually landed rather than a bare "ok".
+            # ---- dBm calibration trim -------------------------------------
+            # GET /calibrate            -> current trim + what it resolves to
+            # GET /calibrate?trim=-12   -> shift both scales 12 dB down
+            #
+            # Its own route because it is the one number an operator can only
+            # set by comparing against a signal of known strength; there is no
+            # way to derive it from inside the gate.
+            if u.path == "/calibrate":
+                a = radio.adapter
+                if a is None or not hasattr(a, "dbm_trim"):
+                    return self._json({"error": "adapter has no dBm calibration"})
+                q = urllib.parse.parse_qs(u.query)
+                if "trim" in q:
+                    try:
+                        a.dbm_trim = float(q["trim"][0])
+                    except (ValueError, TypeError) as e:
+                        return self._json({"error": f"bad value: {e}"})
+                    log(f"[ctl] dBm trim -> {a.dbm_trim:+.1f} dB")
+                from .fft import DBFS_TO_DBM, GAIN_REF_DB, dbm_offset_for
+                gain = float(getattr(a, "gain_db", GAIN_REF_DB))
+                return self._json({
+                    "trim_db": float(a.dbm_trim),
+                    "base_db": DBFS_TO_DBM,
+                    "gain_db": gain,
+                    "gain_ref_db": GAIN_REF_DB,
+                    "total_offset_db": dbm_offset_for(gain, a.dbm_trim),
+                })
+
             if u.path == "/resolution":
                 q = urllib.parse.parse_qs(u.query)
                 try:
