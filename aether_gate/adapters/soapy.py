@@ -76,6 +76,14 @@ _RECOVER_RETRY_S = 5.0
 _RECOVER_RETRY_MAX_S = 30.0
 _ERR_GIVE_UP = 2000
 SSB_BW_HZ = 2700.0          # SSB audio passband width
+# What the demodulator actually passes, as offsets from the slice frequency.
+# These MUST track the filters built in _init_demod: the SSB path is a complex
+# one-sided bandpass (lowpass taps of half-width 1500 Hz shifted to +1500 Hz ->
+# 0..3 kHz above the carrier, conjugated to mirror it below for LSB), and the FM
+# path is a +/-8 kHz channel filter. read_meters measures power over exactly
+# this band so the S-meter reports what the operator is listening to.
+SSB_PASS_HZ = 3000.0
+FM_PASS_HZ = 8000.0
 
 
 def rtl_bufflen(samp_rate, target_s=0.030):
@@ -577,6 +585,22 @@ class SoapyAdapter(RadioAdapter):
         safe fallback for a mode we do not model.
         """
         return (mode or "").upper() in ("FM", "FM-N", "NFM", "DFM")
+
+    def _meter_band_hz(self):
+        """Offsets from the slice frequency that the demodulator passes.
+
+        Deliberately mirrors the branch _init_demod/demod use to pick taps —
+        `startswith("LSB")` for the lower sideband, everything else upper — so
+        the meter measures the band the operator is actually hearing. That means
+        DIGL meters as upper sideband, because the demodulator demodulates it as
+        upper sideband; the two staying wrong together is better than the meter
+        silently disagreeing with the audio.
+        """
+        if self._is_fm_mode(self._mode):
+            return (-FM_PASS_HZ, FM_PASS_HZ)
+        if (self._mode or "").upper().startswith("LSB"):
+            return (-SSB_PASS_HZ, 0.0)
+        return (0.0, SSB_PASS_HZ)
 
     def _demod_fm(self, sig):
         """NBFM quadrature discriminator: angle(x[n] * conj(x[n-1])).
@@ -1346,17 +1370,32 @@ class SoapyAdapter(RadioAdapter):
         # so a quiet channel metered STRONGER than a real carrier — measured
         # -47 dBm on noise against -55 dBm on a clean FM signal.
         #
-        # Goertzel-style: mix the slice to DC, low-pass by averaging over the
-        # block, and take the power there. That is the energy in roughly the
-        # audio bandwidth around the slice, which is what the operator is
-        # listening to.
+        # Over the DEMODULATOR'S PASSBAND, not a single bin at the slice
+        # frequency. The previous version mixed the slice to DC and took
+        # |mean()| over the block, which is a Goertzel bin: 8192 samples at
+        # 250 kS/s is a 33 ms window, so it measured a ~30 Hz sliver centred
+        # exactly on the slice frequency. On SSB that point is the SUPPRESSED
+        # CARRIER — there is no energy there, the voice sits 300-2700 Hz to one
+        # side — so the meter tracked noise in an empty 30 Hz gap and barely
+        # responded to signal. It only ever worked for a carrier sitting dead on
+        # the slice frequency (CW, or an FM centre).
         f_off = self._slice_hz - self.center_hz
+        lo_off, hi_off = self._meter_band_hz()
         n = min(len(blk), 8192)
         x = blk[-n:]
-        k = np.exp(-2j * np.pi * f_off * np.arange(n) / self.samp_rate)
-        # coarse channel power: |mean| picks the DC term after the mix
-        p = abs(np.mean(x * k))
-        rms = float(p) + 1e-12
+        win = np.hanning(n)
+        spec = np.fft.fft(x * win)
+        freqs = np.fft.fftfreq(n, 1.0 / self.samp_rate)
+        sel = (freqs >= f_off + lo_off) & (freqs <= f_off + hi_off)
+        if not sel.any():
+            # Passband fell outside the digitised window — a slice parked beyond
+            # the span. Report nothing rather than a number read off the edge.
+            return Meters()
+        # Total power in the band. Normalised by the window's power gain so the
+        # reading is a property of the signal, not of the window we chose.
+        wg = float(np.mean(win * win))
+        p = float(np.sum(np.abs(spec[sel]) ** 2)) / (n * n * wg)
+        rms = float(np.sqrt(p)) + 1e-12
         # UNCALIBRATED — no dBm reference exists for a front end whose gain we
         # set ourselves. The offset merely places a typical signal in a
         # plausible S-unit range; treat it as relative.
