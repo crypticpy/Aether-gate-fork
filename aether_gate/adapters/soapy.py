@@ -153,6 +153,10 @@ class SoapyAdapter(RadioAdapter):
         self._rate_to = None                # pending sample rate (ditto — see set_samp_rate)
         self._rate_req_at = 0.0             # monotonic stamp of the newest rate request
         self._setting_to = {}               # pending Soapy settings (ditto — see set_device_setting)
+        # LNA state the dBm calibration belongs to, so a change can be called
+        # out. Soapy cannot tell us what a state is worth in dB (see below).
+        self._lna_state = "0"
+        self._lna_cal_state = "0"
         self._antenna_to = None             # pending antenna port (ditto)
         self._gain_lo = 0.0                 # device gain range, filled in by _open_hw
         self._gain_hi = 50.0
@@ -787,30 +791,42 @@ class SoapyAdapter(RadioAdapter):
                               f"reports {got!r}", flush=True)
                     else:
                         print(f"[soapy] setting {key} -> {got}", flush=True)
-                    # A SETTING CAN MOVE THE GAIN, AND THE dBm SCALE MUST FOLLOW.
+                    # A SETTING CAN MOVE THE GAIN, AND THIS DRIVER CANNOT SAY BY
+                    # HOW MUCH.
                     #
-                    # rfgain_sel is the LNA state: on an RSPdx it is 28 steps of
-                    # front-end attenuation, worth tens of dB. It is written
-                    # through here rather than through set_gain, so self.gain_db
-                    # kept the value the operator last asked for while the actual
-                    # front end moved underneath it -- and dbm_offset_for backs
-                    # gain out of BOTH scales, so every dBm figure the gate
-                    # reported silently shifted by the difference. Swept live on
-                    # an RSPdx-R2 (2026-08-31): rfgain_sel 0 -> 14 moved the
-                    # reported noise floor 26 dB while gain_db stayed 12.0.
+                    # rfgain_sel is the LNA state: on an RSPdx, 28 steps of
+                    # front-end attenuation worth tens of dB, written through
+                    # here rather than through set_gain. So self.gain_db keeps
+                    # whatever the operator last asked for while the real front
+                    # end moves underneath it, and since dbm_offset_for backs
+                    # gain out of BOTH scales, every dBm figure shifts with it.
                     #
-                    # Re-read the overall gain after any setting write. It is one
-                    # cheap call on a path that runs only when a control moves,
-                    # and it keeps the axis honest no matter which seam was used.
-                    try:
-                        now = float(self._sdr.getGain(self._SOAPY_SDR_RX, 0))
-                        if abs(now - self.gain_db) > 0.05:
-                            print(f"[soapy] {key} moved overall gain "
-                                  f"{self.gain_db:.1f} -> {now:.1f} dB; dBm scale "
-                                  f"follows", flush=True)
-                            self.gain_db = now
-                    except Exception:
-                        pass                # a driver without a gain readback
+                    # Reading getGain() back after the write -- which is what the
+                    # set_gain path does, and what was tried here first -- makes
+                    # it WORSE. Swept live on an RSPdx-R2 at 3.7 MHz
+                    # (2026-08-31), rfgain_sel 0 -> 10:
+                    #
+                    #   uncompensated  floor slid -86.0 -> -111.6 dBm  (25.6 dB)
+                    #   getGain said   12.0 -> 22.0 dB, i.e. gain went UP
+                    #   compensated    floor slid -86.0 -> -121.6 dBm  (35.4 dB)
+                    #
+                    # More attenuation cannot be more gain, and 10 dB is not
+                    # 25.6 dB either: this driver reports LNA-state gain with the
+                    # wrong sign AND the wrong magnitude, so "correcting" by it
+                    # added its 10 dB error on top of the real slide. The setters
+                    # lie (see _verify_stream) and so does this getter.
+                    #
+                    # Compensating honestly needs the per-band LNA-state dB table
+                    # from the SDRplay API, which Soapy does not expose. Until
+                    # then, say so and leave the number alone: the dBm scale is
+                    # calibrated for the LNA state it was calibrated at.
+                    if str(key) == "rfgain_sel" and str(got) != str(self._lna_state):
+                        print(f"[soapy] rfgain_sel {self._lna_state} -> {got}: the "
+                              f"dBm scale is calibrated for LNA state "
+                              f"{self._lna_cal_state} and does NOT track this. "
+                              f"Re-trim, or compare levels only within one state.",
+                              flush=True)
+                        self._lna_state = str(got)
                 except Exception as e:
                     print(f"[soapy] SET {key}={want!r} FAILED: {e!r}", flush=True)
             # ── REOPEN A DROPPED DEVICE INSTEAD OF GOING OFF THE AIR ──────
