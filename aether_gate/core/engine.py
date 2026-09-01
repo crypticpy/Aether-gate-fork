@@ -2373,7 +2373,8 @@ class Radio:
             # the operator touches the RF gain.
             return iq_to_dbm(iq, ctx.n, ctx.min_dbm, ctx.max_dbm,
                              dbm_offset_for(getattr(a, "gain_db", 20.0),
-                                            getattr(a, "dbm_trim", 0.0)))
+                                            getattr(a, "dbm_trim", 0.0),
+                                            getattr(a, "dbm_base", None)))
         return a.get_spectrum(ctx, t)
 
     def stream_loop(self):
@@ -3514,12 +3515,14 @@ def start_control_server(radio, port):
                     log(f"[ctl] dBm trim -> {a.dbm_trim:+.1f} dB")
                 from .fft import DBFS_TO_DBM, GAIN_REF_DB, dbm_offset_for
                 gain = float(getattr(a, "gain_db", GAIN_REF_DB))
+                base = getattr(a, "dbm_base", DBFS_TO_DBM)
                 return self._json({
                     "trim_db": float(a.dbm_trim),
-                    "base_db": DBFS_TO_DBM,
+                    "base_db": base,
+                    "driver": getattr(a, "driver", None),
                     "gain_db": gain,
                     "gain_ref_db": GAIN_REF_DB,
-                    "total_offset_db": dbm_offset_for(gain, a.dbm_trim),
+                    "total_offset_db": dbm_offset_for(gain, a.dbm_trim, base),
                 })
 
             if u.path == "/resolution":

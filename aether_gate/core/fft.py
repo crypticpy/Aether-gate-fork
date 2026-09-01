@@ -34,8 +34,15 @@ except Exception:                                  # pragma: no cover - exercise
 # the gain out. Measured on identical white noise, the two agreed to 3.8 dB at
 # 12 dB of gain and disagreed by 16.2 dB at 32 dB.
 #
-# MEASURED, not assumed (2026-08-31). The old -30.0 was a guess anchored on
-# ITU-R P.372, and it read ~11 dB hot: static on 80 m pegged the S-meter at S9.
+# WHICH device is the whole question: the anchor is a property of the front
+# end, so it is keyed by SoapySDR driver (DBFS_TO_DBM_BY_DRIVER, below) and the
+# bare constant here is only the fallback for a driver nobody has put a
+# reference receiver against. It is the pre-2026-08-31 guess, anchored on
+# ITU-R P.372, and it stays a guess until a second device family is measured.
+DBFS_TO_DBM = -30.0
+
+# SDRplay: MEASURED, not assumed (2026-08-31). The -30.0 fallback read ~11 dB
+# hot on an RSPdx-R2: static on 80 m pegged the S-meter at S9.
 #
 # Calibrated against SDRconnect on the same RSPdx-R2, antenna and 12 dB gain,
 # at 3.722 MHz with SDRconnect's AGC OFF so both radios saw one front end.
@@ -56,11 +63,30 @@ except Exception:                                  # pragma: no cover - exercise
 # the slop in reading a noise floor off any spectrum display. Per-station
 # adjustment stays with --dbm-trim.
 #
+# Repeated 2026-09-01 on an RSPduo (Tuner 2, a different antenna, the same
+# IFGR 47 / LNA 0): S-meter path +1.75 dB and pan path +1.4 dB against
+# SDRconnect's -117.5 dBm floor, i.e. about -42.5 for that unit. Two SDRplay
+# units agreeing to 1.5 dB is what makes -41.0 a family number rather than
+# one bench's.
+#
 # Do NOT re-derive this from SDRconnect's PWR/SNR readout. That is
 # AGC/detector-derived and sits 8-14 dB below its own integrated spectrum;
 # anchoring on it once produced a -24 dB "correction" that would have put this
 # axis 20 dB into fiction.
-DBFS_TO_DBM = -41.0
+#
+# An entry belongs in this table only with a reference receiver behind it: a
+# value that is right for one front end moves every other device's numbers,
+# including hardware nobody has checked it against. Drivers not listed use
+# DBFS_TO_DBM, and --dbm-base overrides either for a device the operator has
+# measured themselves.
+DBFS_TO_DBM_BY_DRIVER = {
+    "sdrplay": -41.0,      # hw-measured: RSPdx-R2 2026-08-31, RSPduo 2026-09-01
+}
+
+
+def dbfs_to_dbm_for(driver):
+    """The dBFS->dBm anchor for a SoapySDR driver name, or the fallback."""
+    return DBFS_TO_DBM_BY_DRIVER.get(str(driver or "").lower(), DBFS_TO_DBM)
 
 # The front-end gain the constant above is referenced to. Gain is backed out
 # relative to this so the dBm scale reports what is at the ANTENNA rather than
@@ -75,13 +101,15 @@ GAIN_REF_DB = 20.0
 WINDOW_COHERENT_GAIN = 0.5
 
 
-def dbm_offset_for(gain_db, trim_db=0.0):
+def dbm_offset_for(gain_db, trim_db=0.0, base_db=None):
     """Total dB to add to a dBFS figure to get dBm at this front-end gain.
 
     The single seam both the panadapter and the S-meter go through, so the two
-    scales cannot drift apart again.
+    scales cannot drift apart again. `base_db` is the device's anchor (an
+    adapter's dbm_base); None means the unkeyed fallback.
     """
-    return DBFS_TO_DBM + float(trim_db) - (float(gain_db) - GAIN_REF_DB)
+    base = DBFS_TO_DBM if base_db is None else float(base_db)
+    return base + float(trim_db) - (float(gain_db) - GAIN_REF_DB)
 
 
 def iq_to_dbm(iq, n_bins, min_dbm, max_dbm, dbm_offset=0.0):

@@ -100,6 +100,8 @@ def build_adapter(name, args):
                 model=args.model, serial=args.serial, station=args.station,
                 direct_samp=args.direct_samp, agc=args.agc)
         a.dbm_trim = args.dbm_trim         # survives a restart; /calibrate?trim= is live-only
+        if args.dbm_base is not None:
+            a.dbm_base = args.dbm_base     # operator-measured anchor beats the driver default
         return a
     if name == "icom9700":
         # give the 9700 a distinct identity unless the user overrode the shared defaults
@@ -212,6 +214,10 @@ def main(argv=None):
                     help="dB to add to every level (panadapter AND S-meter). The "
                          "dBFS->dBm anchor depends on the front end and its antenna, "
                          "so it can only be set against a reference; see GET /calibrate")
+    ap.add_argument("--dbm-base", type=float, default=None,
+                    help="soapy adapter: the dBFS->dBm anchor for this front end, replacing "
+                         "the per-driver default (core.fft.DBFS_TO_DBM_BY_DRIVER). For a "
+                         "device you have measured against a reference receiver")
     ap.add_argument("--agc", action="store_true", help="soapy adapter: enable hardware AGC")
     ap.add_argument("--direct-samp", default=None, help="soapy adapter: RTL direct-sampling mode (Q=2 for HF on non-V4)")
     # Icom adapter options

@@ -32,19 +32,19 @@ def _tone(amp=TONE_AMP, n=8192, hz=TONE_HZ):
     return (amp * np.exp(2j * np.pi * hz * np.arange(n) / FS)).astype(np.complex128)
 
 
-def _pan_bins(iq, gain_db, trim=0.0):
-    return iq_to_dbm(iq[:BINS], BINS, -200.0, 20.0, dbm_offset_for(gain_db, trim))
+def _pan_bins(iq, gain_db, trim=0.0, base=None):
+    return iq_to_dbm(iq[:BINS], BINS, -200.0, 20.0, dbm_offset_for(gain_db, trim, base))
 
 
-def _pan_floor(iq, gain_db, trim=0.0):
-    return float(np.median(_pan_bins(iq, gain_db, trim)))
+def _pan_floor(iq, gain_db, trim=0.0, base=None):
+    return float(np.median(_pan_bins(iq, gain_db, trim, base)))
 
 
 def _pan_peak(iq, gain_db, trim=0.0):
     return float(np.max(_pan_bins(iq, gain_db, trim)))
 
 
-def _meter_full(iq, gain_db, trim=0.0):
+def _meter_full(iq, gain_db, trim=0.0, base=None):
     """The whole Meters object — signal AND the floor it was measured against."""
     a = SoapyAdapter(driver="none", samp_rate=FS, center_hz=CENTER, gain_db=gain_db)
     a._np = np
@@ -52,18 +52,20 @@ def _meter_full(iq, gain_db, trim=0.0):
     a._mode = "LSB"
     a._slice_hz = CENTER
     a.dbm_trim = trim
+    if base is not None:
+        a.dbm_base = base
     a._latest = iq
     return a.read_meters()
 
 
-def _meter(iq, gain_db, trim=0.0):
-    return _meter_full(iq, gain_db, trim).s_meter_dbm
+def _meter(iq, gain_db, trim=0.0, base=None):
+    return _meter_full(iq, gain_db, trim, base).s_meter_dbm
 
 
-def _at_gain(gain_db, trim=0.0):
+def _at_gain(gain_db, trim=0.0, base=None):
     """The same antenna signal — noise plus one tone — through `gain_db` of front end."""
     iq = (_noise() + _tone()) * (10 ** ((gain_db - 12.0) / 20.0))
-    return _pan_floor(iq, gain_db, trim), _meter(iq, gain_db, trim)
+    return _pan_floor(iq, gain_db, trim, base), _meter(iq, gain_db, trim, base)
 
 
 @pytest.mark.parametrize("gain", [12.0, 22.0, 32.0, 45.0])
@@ -124,6 +126,17 @@ def test_trim_moves_both_scales_together():
     trim_pan, trim_meter = _at_gain(12.0, trim=-12.0)
     assert trim_pan == pytest.approx(base_pan - 12.0, abs=0.2)
     assert trim_meter == pytest.approx(base_meter - 12.0, abs=0.2)
+
+
+def test_a_devices_anchor_moves_both_scales_together():
+    """The anchor is per front end (core.fft.DBFS_TO_DBM_BY_DRIVER), so a
+    different device's number must shift the pan and the meter as one — the
+    same contract trim has, through the same seam."""
+    from aether_gate.core.fft import DBFS_TO_DBM
+    ref_pan, ref_meter = _at_gain(12.0)
+    pan, meter = _at_gain(12.0, base=DBFS_TO_DBM - 11.0)
+    assert pan == pytest.approx(ref_pan - 11.0, abs=0.2)
+    assert meter == pytest.approx(ref_meter - 11.0, abs=0.2)
 
 
 def test_full_scale_carrier_reads_zero_dbfs():

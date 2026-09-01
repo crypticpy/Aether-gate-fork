@@ -89,7 +89,7 @@ _RECOVER_RETRY_S = 5.0
 # seconds. (A previous spin-forever bug put 185,927 lines in a Pi 4's /tmp.)
 _RECOVER_RETRY_MAX_S = 30.0
 _ERR_GIVE_UP = 2000
-from ..core.fft import dbm_offset_for
+from ..core.fft import dbm_offset_for, dbfs_to_dbm_for
 
 # Bin powers in a noise-only FFT are exponentially distributed; their median is
 # ln(2) times their mean. read_meters divides by this to turn a robust median
@@ -167,6 +167,7 @@ class SoapyAdapter(RadioAdapter):
         self._slice_hz = center_hz          # where to demodulate (the slice freq; core updates it)
         self._mode = "USB"                  # USB/LSB (others -> default to USB for now)
         self.dbm_trim = 0.0                 # operator calibration, dB (see core.fft)
+        self.dbm_base = dbfs_to_dbm_for(driver)  # this front end's dBFS->dBm anchor (ditto)
         self._audio_q = collections.deque(maxlen=64)  # raw IQ blocks queued for the demodulator
         self._nco_phase = 0.0               # persistent mixer phase (continuity across blocks)
         self._nco_ramp = None               # cached exp(1j*step*k); see _demod_block
@@ -1504,7 +1505,7 @@ class SoapyAdapter(RadioAdapter):
         excess = float(np.sum(psd[sel])) - noise_per_bin * float(np.count_nonzero(sel))
         noise_dbm = (10.0 * np.log10(max(noise_per_bin * float(np.count_nonzero(sel)),
                                           1e-30) / (n * n * wg))
-                     + dbm_offset_for(self.gain_db, self.dbm_trim))
+                     + dbm_offset_for(self.gain_db, self.dbm_trim, self.dbm_base))
         if excess <= 0.0:
             # Nothing above the floor. Still report the floor: on a quiet band
             # that is the only real measurement there is, and it is the half of
@@ -1517,6 +1518,6 @@ class SoapyAdapter(RadioAdapter):
         # RF gain out here is what stops our own front-end setting masquerading
         # as signal strength; the panadapter does the same, so the two scales
         # agree instead of drifting apart as the gain moves.
-        dbm = 20.0 * np.log10(rms) + dbm_offset_for(self.gain_db, self.dbm_trim)
+        dbm = 20.0 * np.log10(rms) + dbm_offset_for(self.gain_db, self.dbm_trim, self.dbm_base)
         return Meters(s_meter_dbm=max(-140.0, min(0.0, dbm)),
                       noise_dbm=float(noise_dbm))
