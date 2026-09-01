@@ -34,12 +34,33 @@ except Exception:                                  # pragma: no cover - exercise
 # the gain out. Measured on identical white noise, the two agreed to 3.8 dB at
 # 12 dB of gain and disagreed by 16.2 dB at 32 dB.
 #
-# UNCALIBRATED DEFAULT. There is no way to derive the true constant from inside
-# the gate — trim it against a signal of known strength (control panel, or
-# --dbm-offset). The default lands a quiet HF band near where ITU-R P.372 puts a
-# residential noise floor: -174 dBm/Hz + ~60 dB of man-made noise +
-# 10*log10(2.4 kHz) ~= -80 dBm in an SSB passband.
-DBFS_TO_DBM = -30.0
+# MEASURED, not assumed (2026-08-31). The old -30.0 was a guess anchored on
+# ITU-R P.372, and it read ~11 dB hot: static on 80 m pegged the S-meter at S9.
+#
+# Calibrated against SDRconnect on the same RSPdx-R2, antenna and 12 dB gain,
+# at 3.722 MHz with SDRconnect's AGC OFF so both radios saw one front end.
+# Its spectrum floor there is -110 dBm at 10.07 Hz RBW. Two independent paths
+# through this gate were converted to true mean noise power and compared:
+#
+#   panadapter  -104.18 dBm displayed at 7.63 Hz bins. AE's floor readout is a
+#               two-pass trimmed mean, which for exponentially distributed bin
+#               powers sits 7.47 dB under the true mean (simulated), so true
+#               power is -96.71 dBm in an 11.44 Hz ENBW = -97.26 at 10.07 Hz.
+#               -> -12.7 dB
+#   S-meter     -75.0 dBm of noise in a 3007 Hz passband, from a median
+#               estimator whose /ln(2) correction makes it an exact mean.
+#               -110 dBm at 10.07 Hz is -85.25 dBm in 3007 Hz. -> -10.25 dB
+#
+# Two estimators with different biases landing 2.5 dB apart is the check that
+# the model holds; the midpoint is the constant. Good to about +/-2 dB, which is
+# the slop in reading a noise floor off any spectrum display. Per-station
+# adjustment stays with --dbm-trim.
+#
+# Do NOT re-derive this from SDRconnect's PWR/SNR readout. That is
+# AGC/detector-derived and sits 8-14 dB below its own integrated spectrum;
+# anchoring on it once produced a -24 dB "correction" that would have put this
+# axis 20 dB into fiction.
+DBFS_TO_DBM = -41.0
 
 # The front-end gain the constant above is referenced to. Gain is backed out
 # relative to this so the dBm scale reports what is at the ANTENNA rather than
