@@ -56,6 +56,11 @@ Also handles AE's own CWX keyer (cwx send/wpm/qsk_enabled) for authentic CW TX.
 """
 import argparse, http.server, json, math, os, glob, random, select, socket, struct, subprocess, sys, threading, time, urllib.parse, uuid, wave
 
+try:
+    import numpy as _np
+except Exception:                       # pragma: no cover - exercised when numpy absent
+    _np = None                          # the stdlib fallbacks below stay correct, just slower
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURES_DIR = os.path.join(HERE, "fixtures")
 REPORTS_DIR  = os.path.join(HERE, "reports")
@@ -205,26 +210,41 @@ def vita_header(stream_id, pcc, seq, payload_len):
     return struct.pack(">IIIIIII", word0, stream_id, 0x001C2D00, pcc & 0xFFFF, 0, 0, 0)
 
 
-def fft_packet(stream_id, seq, pixels, frame_index):
+def fft_packet(stream_id, seq, pixels, frame_index, start_bin=0, total_bins=None):
+    """One FFT datagram, which may be a SEGMENT of a wider frame.
+
+    AE reassembles by (frame_index, total_bins) and writes each datagram's bins
+    at start_bin — see PanadapterStream.cpp's FrameAssembler. `pixels` is this
+    segment; `total_bins` is the width of the whole frame, defaulting to a
+    single-segment frame so every existing caller is unchanged.
+    """
     n = len(pixels)
-    sub = struct.pack(">HHHHI", 0, n, 2, n, frame_index)
+    total = n if total_bins is None else int(total_bins)
+    sub = struct.pack(">HHHHI", start_bin, n, 2, total, frame_index)
     payload = sub + struct.pack(">%dH" % n, *pixels)
     return vita_header(stream_id, PCC_FFT, seq, len(payload)) + payload
 
 
-def wf_packet(stream_id, seq, intens, low_hz, binbw_hz, timecode, auto_black=20):
+def wf_packet(stream_id, seq, intens, low_hz, binbw_hz, timecode, auto_black=20,
+              first_bin=0, total_bins=None):
     # auto_black = the tile's AutoBlackLevel field (raw uint, same domain as the
     # intensity samples). A real Flex puts the radio-measured noise-floor level
     # here; AE's #3586 auto-black path uses it as the waterfall black/low point.
     # Pass the frame's measured floor (min raw) for faithful emulation.
     w = len(intens)
+    total = w if total_bins is None else int(total_bins)
     # FrameLowFreq/BinBandwidth are FlexLib "VitaFrequency" = Hz * 2^20. AE >= #4412
     # decodes that format UNCONDITIONALLY (VitaTileFrequency.h) — the old magnitude
     # heuristic that let plain Hz through is gone, so plain Hz now lands ~2^20 low
     # and every row maps off-screen (waterfall black while the pan stays correct).
     low_raw = int(round(low_hz * 1048576))
     binbw_raw = int(round(binbw_hz * 1048576))
-    sub = struct.pack(">qqIHHIIHH", low_raw, binbw_raw, 100, w, 1, timecode, auto_black, w, 0)
+    # low_hz is the FRAME's low edge (bin 0), NOT this segment's — AE stores it
+    # once from whichever datagram opens the frame (wfFrame.reset) and derives
+    # the frame's high edge from it, so a per-segment value would skew the axis
+    # whenever segments arrived out of order.
+    sub = struct.pack(">qqIHHIIHH", low_raw, binbw_raw, 100, w, 1, timecode,
+                      auto_black, total, first_bin)
     payload = sub + struct.pack(">%dh" % w, *intens)       # signed int16, AE reads /128.0
     return vita_header(stream_id, PCC_WF, seq, len(payload)) + payload
 
@@ -253,20 +273,38 @@ def udp_maxdgram():
     return _UDP_MAXDGRAM
 
 
-def max_pan_bins():
-    """How many bins one pan/waterfall frame can carry.
+def bins_per_packet():
+    """How many bins fit in ONE datagram.
 
-    A frame is one datagram per bin array, so the bin count is capped by the
-    host's UDP limit, not by anything in the protocol. Measured from the real
-    builders rather than guessed, because guessing is what hurt: 16384 bins
-    made sendto raise EMSGSIZE, the stream loop broke out of its send and the
-    panadapter went off the air until the gate was restarted (2026-08-31).
-    On macOS's 9216-byte limit this comes out at 4576 — so 4096 is the largest
-    usable power of two, and finer resolution has to come from a narrower span.
+    Measured from the real builders rather than guessed, because guessing is
+    what hurt: 16384 bins in a single datagram made sendto raise EMSGSIZE, the
+    stream loop broke out of its send and the panadapter went off the air until
+    the gate was restarted (2026-08-31). On macOS's 9216-byte limit this comes
+    out at 4576.
     """
     overhead = max(len(fft_packet(0, 0, [], 0)),
                    len(wf_packet(0, 0, [], 0.0, 1.0, 0)))
     return max(64, (udp_maxdgram() - overhead) // 2)
+
+
+# A frame's bin count rides in a uint16 in both sub-headers, so 65535 is the
+# protocol ceiling. The practical ceiling is lower: every bin costs two bytes
+# in each of the FFT and waterfall streams on every frame, so 16384 bins at
+# 20 fps is already ~1.3 MB/s. That is the finest setting worth offering, and
+# it is a power of two so it divides the span cleanly.
+PAN_BIN_CEILING = 16384
+
+
+def max_pan_bins():
+    """How many bins one pan/waterfall FRAME can carry.
+
+    No longer the datagram limit: a frame is segmented across as many datagrams
+    as it needs (see bins_per_packet), and AE reassembles them by start_bin —
+    PanadapterStream.cpp has carried FrameAssembler/WaterfallFrame for exactly
+    this since the protocol was written. Capping a frame at one datagram was
+    self-imposed, and it pinned macOS hosts at 4096 bins.
+    """
+    return PAN_BIN_CEILING
 
 
 def meter_packet(stream_id, seq, meter_id, dbm):
@@ -963,6 +1001,25 @@ class Radio:
     def dbm_to_wf_raw(self, dbm):
         frac = max(0.0, min(1.0, (dbm - self.min_dbm) / (self.max_dbm - self.min_dbm)))
         return int(round((WF_FLOOR_VAL + frac * (WF_PEAK_VAL - WF_FLOOR_VAL)) * 128))
+
+    # Whole-frame versions of the two converters above. At 4096 bins and 20 fps
+    # the per-bin Python calls cost ~164k/s; the 16384-bin ceiling would make it
+    # 650k/s and the stream loop has a frame budget to hold. numpy does the same
+    # arithmetic on the whole array — np.rint is half-to-even, matching round().
+    def dbm_to_pixels(self, levels):
+        if _np is None:
+            return [self.dbm_to_pixel(d) for d in levels]
+        a = _np.asarray(levels, dtype=_np.float64)
+        p = (self.max_dbm - a) / (self.max_dbm - self.min_dbm) * (self.y_pixels - 1)
+        return _np.clip(_np.rint(p), 0, self.y_pixels - 1).astype(_np.int64).tolist()
+
+    def dbm_to_wf_raws(self, levels):
+        if _np is None:
+            return [self.dbm_to_wf_raw(d) for d in levels]
+        a = _np.asarray(levels, dtype=_np.float64)
+        frac = _np.clip((a - self.min_dbm) / (self.max_dbm - self.min_dbm), 0.0, 1.0)
+        raw = _np.rint((WF_FLOOR_VAL + frac * (WF_PEAK_VAL - WF_FLOOR_VAL)) * 128)
+        return raw.astype(_np.int64).tolist()
 
     def discovery_loop(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -2439,8 +2496,9 @@ class Radio:
                     self.emit_transmit_status()
                 keyed = ctx.cw_keydown if self.pattern == "cw" else self.tx_on
             if levels is not None and tc != last_tc:               # one pan/wf row per waterfall tick
-                pixels = [self.dbm_to_pixel(d) for d in levels]     # generated once; each stacked panadapter
-                intens = [self.dbm_to_wf_raw(d) for d in levels]    # shows it, centred on ITS slice (low_hz).
+                per = bins_per_packet()                            # datagram limit, not the frame limit
+                pixels = self.dbm_to_pixels(levels)                # generated once; each stacked panadapter
+                intens = self.dbm_to_wf_raws(levels)               # shows it, centred on ITS slice (low_hz).
                 wf_ab = self.dbm_to_wf_raw(self.noise_floor_dbm)    # auto-black = the CONFIGURED noise floor,
                 #   not min(intens): a flat pattern (step/impulse/ramp) has min==max, so min(intens) would
                 #   set the black level AT the signal and AE blanks the whole waterfall row. The true floor
@@ -2473,8 +2531,15 @@ class Radio:
                         live = (pid != sub_pid)                     # non-SUB pan = the selected rx = live
                         px = pixels if live else floor_pix
                         it = intens if live else floor_int
-                        s.sendto(fft_packet(pid, fseq & 0xF, px, fi), dest); fseq += 1
-                        s.sendto(wf_packet(pan["wf_id"], wseq & 0xF, it, low_hz, binbw_hz, tc, auto_black=wf_ab), dest); wseq += 1
+                        # One frame, as many datagrams as it takes. `per` is
+                        # the host's datagram limit; AE stitches by start_bin.
+                        for off in range(0, len(px), per):
+                            s.sendto(fft_packet(pid, fseq & 0xF, px[off:off + per],
+                                                fi, off, len(px)), dest); fseq += 1
+                        for off in range(0, len(it), per):
+                            s.sendto(wf_packet(pan["wf_id"], wseq & 0xF, it[off:off + per],
+                                               low_hz, binbw_hz, tc, auto_black=wf_ab,
+                                               first_bin=off, total_bins=len(it)), dest); wseq += 1
                     # Per-slice S-meter. A live adapter measures a real level
                     # (m.s_meter_dbm); use it so AE's S-meter tracks actual signal.
                     # Only the sim/pattern engine has no adapter meter -> fall back

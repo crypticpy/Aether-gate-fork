@@ -242,13 +242,60 @@ def test_bins_are_clamped_to_what_one_datagram_can_carry():
     assert r.bins == 64
 
 
-def test_the_bin_ceiling_actually_fits_a_datagram():
-    from aether_gate.core.engine import max_pan_bins, udp_maxdgram, fft_packet, wf_packet
-    n = max_pan_bins()
+def test_one_segment_fills_a_datagram_without_overflowing_it():
+    # bins_per_packet is the SEGMENT size, so it must be the largest that still
+    # fits — one bin more has to overflow, or every frame wastes datagram space.
+    from aether_gate.core.engine import (bins_per_packet, udp_maxdgram,
+                                         fft_packet, wf_packet)
+    n = bins_per_packet()
     assert len(fft_packet(1, 0, [0] * n, 0)) <= udp_maxdgram()
     assert len(wf_packet(2, 0, [0] * n, 0.0, 1.0, 0)) <= udp_maxdgram()
-    # and one more bin must NOT fit, or the ceiling is leaving resolution unused
     assert len(wf_packet(2, 0, [0] * (n + 1), 0.0, 1.0, 0)) > udp_maxdgram()
+
+
+def test_a_full_width_frame_segments_into_datagrams_that_each_fit():
+    # The whole point of segmenting: the frame ceiling is no longer bounded by
+    # the datagram limit, but no individual datagram may exceed it.
+    from aether_gate.core.engine import (bins_per_packet, max_pan_bins,
+                                         udp_maxdgram, fft_packet, wf_packet)
+    total, per = max_pan_bins(), bins_per_packet()
+    assert total > per, "segmenting is pointless if a frame fits one datagram"
+    px = [0] * total
+    for off in range(0, total, per):
+        seg = px[off:off + per]
+        assert len(fft_packet(1, 0, seg, 7, off, total)) <= udp_maxdgram()
+        assert len(wf_packet(2, 0, seg, 0.0, 1.0, 3,
+                             first_bin=off, total_bins=total)) <= udp_maxdgram()
+
+
+def test_segments_declare_the_frame_width_and_their_own_offset():
+    # AE stitches on (start_bin, total_bins); if a segment reported its own
+    # length as the frame width, each datagram would reset the assembler and
+    # only the last chunk would ever be drawn.
+    import struct
+    from aether_gate.core.engine import fft_packet, wf_packet
+    VITA_HDR_BYTES = 28   # vita_header() is seven big-endian uint32s
+    pkt = fft_packet(1, 0, [11, 22, 33], 9, start_bin=4096, total_bins=16384)
+    start, num, size, total, frame = struct.unpack(
+        ">HHHHI", pkt[VITA_HDR_BYTES:VITA_HDR_BYTES + 12])
+    assert (start, num, size, total, frame) == (4096, 3, 2, 16384, 9)
+
+    pkt = wf_packet(2, 0, [11, 22, 33], 0.0, 1.0, 5,
+                    first_bin=8192, total_bins=16384)
+    sub = pkt[VITA_HDR_BYTES:VITA_HDR_BYTES + 36]
+    width = struct.unpack(">H", sub[20:22])[0]
+    total = struct.unpack(">H", sub[32:34])[0]
+    first = struct.unpack(">H", sub[34:36])[0]
+    assert (width, total, first) == (3, 16384, 8192)
+
+
+def test_the_vectorised_converters_match_the_scalar_ones():
+    # The stream loop uses the array versions; a divergence would show up as a
+    # one-count brightness/height shift on every bin, invisible until compared.
+    r = _radio()
+    levels = [-140.0, -103.0, -98.6, -73.0, -50.25, 0.0, 7.0, 40.0]
+    assert r.dbm_to_pixels(levels) == [r.dbm_to_pixel(d) for d in levels]
+    assert r.dbm_to_wf_raws(levels) == [r.dbm_to_wf_raw(d) for d in levels]
 
 
 def test_a_dead_stream_loop_clears_the_flag_so_it_can_restart():
