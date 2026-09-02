@@ -52,6 +52,20 @@ AUDIO_RATE = 24000          # AE remote_audio_rx rate (must match core AUDIO_RAT
 # with room to spare and costs 256 kB of complex64.
 _PAN_RING_BLOCKS = 8
 
+# ⚠ THE DEMODULATOR MUST NOT BE ALLOWED TO FALL BEHIND THE ANTENNA.
+#
+# _audio_q hands IQ blocks from the reader thread to the demodulator, which
+# consumes them at exactly playback pace and never faster. So every block that
+# queues up while the reader is stalled — an antenna switch, a rate change, a
+# USB hiccup — stays queued for good: the audio simply runs that much late,
+# permanently, and each further stall adds to it. The cap used to be 64 blocks
+# of 4096 samples, a figure that is 131 ms at an RTL's 2.04 MS/s and 2.1 s at
+# the 125 kS/s an SDRplay runs for fine bins. Measured 2026-09-01 on an RSPduo:
+# audio trailing the panadapter by half a second, the panadapter itself prompt
+# (it always takes the newest block). Bounded in TIME, so the rate cannot
+# change what it means; anything older is dropped and logged.
+_AUDIO_BACKLOG_S = 0.15
+
 _ERR_FAST = 20
 # ⚠ DECLARE THE DEVICE LOST ON ELAPSED TIME, NOT ERROR COUNT.
 #
@@ -168,7 +182,9 @@ class SoapyAdapter(RadioAdapter):
         self._mode = "USB"                  # USB/LSB (others -> default to USB for now)
         self.dbm_trim = 0.0                 # operator calibration, dB (see core.fft)
         self.dbm_base = dbfs_to_dbm_for(driver)  # this front end's dBFS->dBm anchor (ditto)
-        self._audio_q = collections.deque(maxlen=64)  # raw IQ blocks queued for the demodulator
+        self._audio_q = collections.deque()  # raw IQ blocks for the demodulator; see _queue_audio
+        self._audio_dropped = 0             # blocks discarded to keep the demod current
+        self._audio_drop_logged = 0.0       # monotonic stamp of the last drop log line
         self._nco_phase = 0.0               # persistent mixer phase (continuity across blocks)
         self._nco_ramp = None               # cached exp(1j*step*k); see _demod_block
         self._nco_ramp_n = 0                # block length the cached ramp was built for
@@ -907,7 +923,7 @@ class SoapyAdapter(RadioAdapter):
                 with self._lock:
                     self._latest = block        # for the meters (latest is fine)
                     self._pan_ring.append(block)
-                self._audio_q.append(block)     # for the demod (continuous — every block consumed)
+                self._queue_audio(block)        # for the demod (continuous — every block consumed)
             elif n < 0:
                 # BACK OFF ON A PERSISTENT ERROR, AND GIVE UP ON A DEAD DEVICE.
                 #
@@ -1348,6 +1364,32 @@ class SoapyAdapter(RadioAdapter):
                                       % (2.0 * np.pi))
         return blk * np.exp(1j * ph)
 
+    def _queue_audio(self, block):
+        """Hand one IQ block to the demodulator, keeping the queue no deeper
+        than _AUDIO_BACKLOG_S of signal (see the note at the constant)."""
+        n = max(1, len(block))
+        keep = max(2, -(-int(_AUDIO_BACKLOG_S * self.samp_rate) // n))   # ceil, blocks
+        dropped = 0
+        with self._lock:
+            self._audio_q.append(block)
+            while len(self._audio_q) > keep:
+                self._audio_q.popleft()
+                dropped += 1
+        if dropped:
+            self._audio_dropped += dropped
+            now = time.monotonic()
+            if now - self._audio_drop_logged > 5.0:
+                self._audio_drop_logged = now
+                print(f"[soapy] audio had fallen {1000.0 * dropped * n / self.samp_rate:.0f} ms "
+                      f"behind the antenna — dropped {dropped} IQ block(s) to catch up "
+                      f"({self._audio_dropped} total)", flush=True)
+
+    def audio_backlog_ms(self):
+        """How far behind the antenna the demodulator's input currently is."""
+        with self._lock:
+            queued = sum(len(b) for b in self._audio_q)
+        return 1000.0 * queued / self.samp_rate if self.samp_rate else 0.0
+
     # --- the AUDIO source (SSB demod; numpy only) -----------------------
     def get_audio(self, n_samples, slice_hz=None, mode=None):
         """Return n_samples of 24 kHz mono audio (float, ~[-1,1]) demodulated from
@@ -1362,9 +1404,12 @@ class SoapyAdapter(RadioAdapter):
 
         # rate-R audio needed in the buffer to interpolate n_samples on the 24 k grid
         need_r = int(np.ceil(self._rs_phase + n_samples * self._rs_ratio)) + 2
-        while len(self._ar_buf) < need_r and self._audio_q:
-            self._ar_buf = np.concatenate(
-                [self._ar_buf, self._demod_block(self._audio_q.popleft())])
+        while len(self._ar_buf) < need_r:
+            with self._lock:
+                blk = self._audio_q.popleft() if self._audio_q else None
+            if blk is None:
+                break
+            self._ar_buf = np.concatenate([self._ar_buf, self._demod_block(blk)])
         if len(self._ar_buf) < need_r:
             return None                      # not enough IQ yet (stream still filling)
 

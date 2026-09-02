@@ -3357,6 +3357,8 @@ def start_control_server(radio, port):
                                if radio.last_noise_dbm is not None
                                and radio.last_vfo_dbm > -140.0 else None),
                     "res": radio.resolution(),
+                    "audio_backlog_ms": (round(radio.adapter.audio_backlog_ms(), 1)
+                                         if hasattr(radio.adapter, "audio_backlog_ms") else None),
                 })
             # ---- radio diagnostics: 'what the gate sees from the radio' ----
             if u.path == "/diagnostics":
