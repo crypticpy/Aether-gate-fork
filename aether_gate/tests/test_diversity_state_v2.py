@@ -181,6 +181,36 @@ def test_hear_is_the_audio_and_pan_is_the_panadapter():
         st.set(source="c")
 
 
+def test_memory_entries_carry_a_voice_print_learned_while_the_talker_is_live():
+    rng = np.random.default_rng(13)
+    st = _aligned_state(mode="USB")
+    st.set(mode="track", subband=False)
+    rate = 25_000.0
+    pa = rng.normal(size=2000) + 1j * rng.normal(size=2000)
+    pb = rng.normal(size=2000) + 1j * rng.normal(size=2000)
+    st.observe(0, pa[:1024], pb[:1024])
+    # nobody remembered: entries are empty, nothing is fed to a print
+    assert st.status()["memory"] == []
+    # a remembered, live talker: 3 s of overs through combine_passband while
+    # the tracker says talking, then silence closes the over
+    s_vec = np.array([1.0, 0.7 * np.exp(1j * 0.4)])
+    st.memory.store(s_vec / np.linalg.norm(s_vec), 0.7 + 0j, time.monotonic())
+    t = st.trackers[0]
+    t.talking, t.steady = True, False
+    for _ in range(40):                                   # 40 x 2000 = 3.2 s
+        st.combine_passband(0, pa, pb, 0j, 0j, rate)
+    t.talking = False
+    st.combine_passband(0, pa, pb, 0j, 0j, rate)
+    mem = st.status()["memory"]
+    assert len(mem) == 1 and "voice" in mem[0]
+    v = mem[0]["voice"]
+    assert v is not None and v["overs"] == 1 and 3.0 <= v["over_s"] <= 3.4
+    assert set(v) == {"centroid_hz", "low_hz", "high_hz", "tilt_db", "syllabic_hz", "over_s", "overs"}
+    # clearing the memory clears the prints too
+    st.memory_clear()
+    assert st.prints[0].prints == {}
+
+
 def test_hear_a_b_stereo_hand_the_loops_through_and_the_tracker_keeps_learning():
     from aether_gate.core.diversity import combine_ramp
     rng = np.random.default_rng(12)

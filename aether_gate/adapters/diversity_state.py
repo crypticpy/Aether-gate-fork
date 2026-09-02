@@ -59,6 +59,11 @@ def _npf():
     return noiseprofile
 
 
+def _vp():
+    from ..core import voiceprint
+    return voiceprint
+
+
 def _bc():
     from ..core import beacons
     return beacons
@@ -117,6 +122,7 @@ class _DiversityState:
         # per-bin refinement of the tracker's weight in the demod passband
         self.subband_on = True
         self.subbands = {}                  # sid -> SubbandCombiner
+        self.prints = {}                    # sid -> VoicePrint (per talker voice/rig prints)
         self.profile = None                 # what kind of noise this is (core.noiseprofile)
         self.beacons = None                 # the NCDXF beacons on the pair (core.beacons)
         # spatial map: rebuilt whenever the hardware centre or rate moves,
@@ -351,6 +357,8 @@ class _DiversityState:
 
     def memory_clear(self):
         self.memory.clear()
+        for vp in self.prints.values():
+            vp.forget()
 
     def memory_name(self, talker_id, name):
         if not self.memory.name(talker_id, name):
@@ -433,7 +441,7 @@ class _DiversityState:
                            else {"bins": 0, "extra_db": 0.0})},
             "sources": self._sources(),
             "noise_profile": self.profile.status() if self.profile is not None else None,
-            "memory": self.memory.status(time.monotonic()),
+            "memory": self._memory_status(sid),
             "talker": self.memory.talker(time.monotonic()),
             "loops": self.balance.status(time.monotonic()),
             "focus": self.memory.focus_status(time.monotonic(),
@@ -442,6 +450,27 @@ class _DiversityState:
                         "path": cap["path"] if cap is not None else self.last_capture},
             "slice_id": sid,
         }
+
+    def _memory_status(self, sid):
+        """The memory's entries with each talker's voice/rig print attached."""
+        mem = self.memory.status(time.monotonic())
+        vp = self.prints.get(sid)
+        if vp is not None:
+            vp.forget(keep_ids={e["id"] for e in mem})
+        for e in mem:
+            e["voice"] = vp.summary(e["id"]) if vp is not None else None
+        return mem
+
+    def _print_feed(self, sid, y, pa, rate_hz):
+        """Teach the slice's VoicePrint from what was just combined (loop A
+        when the monitor is on)."""
+        vp = self.prints.get(sid)
+        if vp is None or vp.rate_hz != float(rate_hz):
+            vp = self.prints[sid] = _vp().VoicePrint(rate_hz)
+        t = self.trackers.get(sid)
+        talking = t is not None and bool(t.talking) and not bool(t.steady)
+        active = self.memory.active if talking else None
+        vp.feed(y if getattr(y, "ndim", 1) == 1 else pa, talking, active)
 
     def _monitor(self, pa, pb):
         if self.hear == "a":
@@ -452,6 +481,11 @@ class _DiversityState:
         return self.a._np.stack([pa[:n], pb[:n]], axis=1)
 
     def combine_passband(self, sid, pa, pb, m0, m1, rate_hz):
+        y = self._combine(sid, pa, pb, m0, m1, rate_hz)
+        self._print_feed(sid, y, pa, rate_hz)
+        return y
+
+    def _combine(self, sid, pa, pb, m0, m1, rate_hz):
         """The demod passband pair of slice sid -> one combined block.
 
         In null/track with the sub-band refinement on, every bin gets its own
