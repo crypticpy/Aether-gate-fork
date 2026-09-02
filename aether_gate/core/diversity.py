@@ -290,6 +290,17 @@ MEMORY_MERGE = 0.3
 # carrier's or a noise burst's is not.
 SPEECH_MIN_MOD = 0.3
 MOD_WINDOW_S = 1.0
+# STEADY IN-BAND ENERGY IS NOISE. A carrier, a tone or a digital signal
+# parked in the passband keeps the voice detector on for as long as it
+# lasts, so the in-band noise estimate never sees it and the beam is fitted
+# to it (seen live: a tone broke into a QSO and the tracker had nowhere to
+# put it). Once an over has run this long with no speech-like modulation
+# it is folded into the in-band noise instead, and the beam nulls it;
+# speech keying up on top of it is then a fresh over against that noise.
+# The modulation index is taken on the power ABOVE the loaded noise floor,
+# so once the carrier is in the floor, speech over it is seen as speech,
+# and a held vowel has to stay flat this long before it counts as steady.
+STEADY_MIN_S = 1.5
 # ...and only overs with this much voiced time behind them: a memory of
 # eight slots fills with syllable-long fits of one talker otherwise. An
 # over is memorised once it gets here (whatever weight it has settled on)
@@ -432,6 +443,8 @@ class Tracker:
         self.updates = 0
         self.talking = False
         self.talk_mod = None
+        self.steady = False                 # the over is a carrier, not speech
+        self._low_mod_s = 0.0               # voiced time with no speech-like modulation
         self.t = float(t0)                  # tracker time: t0 + seconds of signal seen
                                             # (t0 = a shared clock, so several
                                             # trackers can stamp one TalkerMemory)
@@ -484,8 +497,28 @@ class Tracker:
             self._talk_s += dt
             self._quiet_s = 0.0
             ps = np.array([p for _t, p in self._hist])
-            self.talk_mod = float(ps.std() / ps.mean()) if len(ps) >= 4 and ps.mean() > 0 else None
-            if self._talk_s >= TALK_HOLD_S:
+            if len(ps) >= 4 and ps.mean() > 0:
+                p_floor = float(np.real(np.trace(self._loaded_noise()))) / 2.0
+                excess = float(ps.mean()) - p_floor
+                self.talk_mod = float(ps.std() / excess) if excess > 0.25 * p_floor else 0.0
+            else:
+                self.talk_mod = None
+            low = self.talk_mod is not None and self.talk_mod < SPEECH_MIN_MOD
+            self._low_mod_s = self._low_mod_s + dt if low else 0.0
+            steady = self._low_mod_s >= STEADY_MIN_S
+            if steady:
+                if not self.steady:         # see STEADY_MIN_S
+                    self.Rs = None
+                    self._rs_half = [None, None]
+                    self._rs_n = 0
+                    self._over_fits = 0
+                self.steady = True
+                al = self._alpha(n, self.noise_tc_s)
+                self.Rn_in = R_in if self.Rn_in is None else (1 - al) * self.Rn_in + al * R_in
+                self._rn_in_t = self.t
+            else:
+                self.steady = False
+            if self._talk_s >= TALK_HOLD_S and not steady:
                 if not self._onset_done:
                     # A new over: its covariance starts fresh (the previous
                     # talker's is not evidence about this one) and is a
@@ -514,8 +547,10 @@ class Tracker:
                 self._rs_half[h] = R_in if old is None else (1 - al_h) * old + al_h * R_in
         else:
             self._quiet_s += dt
+            self.steady = False
             if self._quiet_s >= (TALK_HANG_S if self._onset_done else TALK_ONSET_HANG_S):
                 self._talk_s = 0.0
+                self._low_mod_s = 0.0
                 self._onset_done = False
                 self.talk_mod = None
             if p_in <= NOISE_MAX_RATIO * p_ref:
@@ -525,7 +560,8 @@ class Tracker:
         self._since_fit += dt
         if mode in ("null", "track") and self._since_fit >= self.refresh_s:
             self._since_fit = 0.0
-            self.refit(mode)
+            # a steady carrier is nulled like any other coherent noise
+            self.refit("null" if (mode == "track" and self.steady) else mode)
             if mode == "track" and not self._memorised:
                 self._memorise()
 

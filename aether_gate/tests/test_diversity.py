@@ -12,7 +12,7 @@ import pytest
 
 from aether_gate.core.diversity import (
     ALIGN_MIN_PEAK, REFIT_MIN_GAIN_DB, TALK_HOLD_S, WEIGHT_MAX_ABS, Aligner,
-    TalkerMemory, Tracker, blank_impulses, combine, combine_ramp, find_lag,
+    TalkerMemory, Tracker, _snr_of, blank_impulses, combine, combine_ramp, find_lag,
     fit_max_snr, fit_null, weight_from_polar, weight_to_polar,
 )
 
@@ -391,3 +391,49 @@ def test_fade_guard_switches_to_the_surviving_antenna_within_half_a_second():
             break
     assert tr.updates > n0 and steps * block / RATE <= 0.5, (steps, tr.m)
     assert tr.m == 0j, tr.m                                 # A alone
+
+
+# --- steady carrier in the passband --------------------------------------------
+
+def _scene_tone(rng, block, tone_on, talker, white, t):
+    """Like _scene, with a steady tone at bearing (1.0, 1.0) in the passband
+    that the guard band never sees."""
+    q_in, q_g = _noise(rng, block, 1.0), _noise(rng, block, 1.0)
+    srcs_in = [(q_in, 2.0, 0.9)]
+    if tone_on:
+        srcs_in.append((3.0 * _noise(rng, block), 1.0, 1.0))
+    if talker is not None:
+        g = 1.2 * (1.0 + 0.8 * np.cos(2 * np.pi * 4.0 * t))
+        srcs_in.append((g * _noise(rng, block), talker[0], talker[1]))
+    a, b = _two_channel(rng, block, srcs_in, white)
+    ga, gb = _two_channel(rng, block, [(q_g, 2.0, 0.9)], white)
+    return _cov(a, b), _cov(ga, gb)
+
+
+def test_steady_carrier_becomes_noise_is_nulled_and_a_talker_over_it_is_tracked():
+    rng = np.random.default_rng(21)
+    tr = Tracker(RATE)
+    block = 1024
+    t = 0.0
+    while t < 1.0:                                       # quiet: guard noise learned
+        R_in, R_g = _scene_tone(rng, block, False, None, 0.5, t)
+        tr.update(R_in, R_g, block, "track"); t += block / RATE
+    while t < 4.0:                                       # the tone parks in the passband
+        R_in, R_g = _scene_tone(rng, block, True, None, 0.5, t)
+        tr.update(R_in, R_g, block, "track"); t += block / RATE
+    assert tr.talking and tr.steady and tr.rn_source == "inband"
+    assert tr.Rs is None and not tr.memory
+    tone = _cov(*_two_channel(rng, 8192, [(3.0 * _noise(rng, 8192), 1.0, 1.0)], 0.0))
+    eye = np.eye(2)                                      # _snr_of wants signal-plus-noise
+    null_db = 10 * np.log10(_snr_of(0j, tone + eye, eye) / max(_snr_of(tr.m, tone + eye, eye), 1e-30))
+    assert null_db > 10.0, (null_db, tr.m)               # the tone is nulled vs antenna A
+    m_null = tr.m
+    while t < 8.0:                                       # a talker keys up over the tone
+        R_in, R_g = _scene_tone(rng, block, True, (-0.7, 1.1), 0.5, t)
+        tr.update(R_in, R_g, block, "track"); t += block / RATE
+    assert not tr.steady and tr.Rs is not None
+    talk = _cov(*_two_channel(rng, 8192, [(1.2 * _noise(rng, 8192), -0.7, 1.1)], 0.0))
+    noise = _cov(*_two_channel(rng, 8192, [(3.0 * _noise(rng, 8192), 1.0, 1.0),
+                                           (_noise(rng, 8192), 2.0, 0.9)], 0.5))
+    snr_out = _snr_of(tr.m, talk + noise, noise); snr_a = _snr_of(0j, talk + noise, noise)
+    assert 10 * np.log10(snr_out / snr_a) > 6.0, (tr.m, m_null)

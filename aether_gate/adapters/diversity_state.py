@@ -69,7 +69,8 @@ class _DiversityState:
         self.mode = "off"
         self.pan = "combined"
         self.manual = {}                    # slice_id -> complex weight m
-        self.trackers = {}                  # slice_id -> Tracker (rebuilt on a rate change)
+        self.trackers = {}
+        self.passband = {}                  # sid -> PassbandPhase                  # slice_id -> Tracker (rebuilt on a rate change)
         self.last_m = {}                    # slice_id -> weight the last block ended on
         self.memory = _dv().TalkerMemory()  # shared by every slice's tracker
         self.active_slice = 0
@@ -242,6 +243,12 @@ class _DiversityState:
             idx_in, idx_g = self._bands(n, rate, getattr(self.a, "_mode", "USB"))
             rc = _sp().region_covariance
             t.update(rc(X, idx_in), rc(X, idx_g, trim=True), n, self.mode)
+            pb = self.passband.get(sid)
+            if pb is None:
+                from ..core.passband import PassbandPhase
+                pb = self.passband[sid] = PassbandPhase(rate)
+            f = np.fft.fftfreq(n, 1.0 / rate)
+            pb.update(X[0][idx_in], X[1][idx_in], f[idx_in], n, t.talking)
         m1 = self.weight_for(sid)
         m0 = self.last_m.get(sid, m1)
         self.last_m[sid] = m1
@@ -323,6 +330,8 @@ class _DiversityState:
             "talk_mod": (round(t.talk_mod, 2) if t is not None and t.talk_mod is not None
                          else None),
             "rn_source": t.rn_source if t is not None else None,
+            "steady_qrm": bool(t.steady) if t is not None else False,
+            "passband": (self.passband[sid].status() if sid in self.passband else None),
             # how directional the noise is (0 = isotropic, nothing to null)
             "noise_coherence": (round(_dv()._coherence(t.Rn), 2)
                                 if t is not None and t.Rn is not None else None),
