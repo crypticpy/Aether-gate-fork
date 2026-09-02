@@ -104,6 +104,7 @@ _RECOVER_RETRY_S = 5.0
 _RECOVER_RETRY_MAX_S = 30.0
 _ERR_GIVE_UP = 2000
 from ..core.fft import dbm_offset_for, dbfs_to_dbm_for
+from ..core.filter import SliceFilter, blank_impulses
 
 # Bin powers in a noise-only FFT are exponentially distributed; their median is
 # ln(2) times their mean. read_meters divides by this to turn a robust median
@@ -160,14 +161,10 @@ class _DemodChain:
     (found in review, F9).
     """
 
-    __slots__ = ("stage_firs", "stage_firs_b", "ssb_usb", "ssb_lsb",
-                 "ssb_state", "ssb_state_b", "fm_taps", "fm_state", "fm_state_b")
+    __slots__ = ("stage_firs", "stage_firs_b", "fm_taps", "fm_state", "fm_state_b")
 
-    def __init__(self, stage_firs, stage_firs_b, ssb_usb, ssb_lsb,
-                 ssb_state, ssb_state_b, fm_taps, fm_state, fm_state_b):
+    def __init__(self, stage_firs, stage_firs_b, fm_taps, fm_state, fm_state_b):
         self.stage_firs, self.stage_firs_b = stage_firs, stage_firs_b
-        self.ssb_usb, self.ssb_lsb = ssb_usb, ssb_lsb
-        self.ssb_state, self.ssb_state_b = ssb_state, ssb_state_b
         self.fm_taps = fm_taps
         self.fm_state, self.fm_state_b = fm_state, fm_state_b
 
@@ -191,10 +188,6 @@ class SoapyAdapter(RadioAdapter):
     # _DemodChain / _chain_field above).
     _stage_firs = _chain_field("stage_firs")
     _stage_firs_b = _chain_field("stage_firs_b")
-    _ssb_usb = _chain_field("ssb_usb")
-    _ssb_lsb = _chain_field("ssb_lsb")
-    _ssb_state = _chain_field("ssb_state")
-    _ssb_state_b = _chain_field("ssb_state_b")
     _fm_taps = _chain_field("fm_taps")
     _fm_state = _chain_field("fm_state")
     _fm_state_b = _chain_field("fm_state_b")
@@ -254,8 +247,6 @@ class SoapyAdapter(RadioAdapter):
         # see _DemodChain. The properties above expose its fields under their
         # old per-field names for the rest of this file and for tests.
         self._chain = _DemodChain(stage_firs=[], stage_firs_b=[],
-                                   ssb_usb=None, ssb_lsb=None,
-                                   ssb_state=None, ssb_state_b=None,
                                    fm_taps=None, fm_state=None, fm_state_b=None)
         self._nco_phase = 0.0               # persistent mixer phase (continuity across blocks)
         self._nco_ramp = None               # cached exp(1j*step*k); see _demod_block
@@ -268,6 +259,7 @@ class SoapyAdapter(RadioAdapter):
         self._agc_level = 0.05              # AGC running estimate of audio level
         self._agc_target = 0.25             # desired RMS-ish output level
         self._agc_gain = None               # last applied gain (per-sample ramp continuity)
+        self._filt = None                   # SliceFilter: passband/notches/AGC/NB (core/filter.py)
 
     # --- lifecycle -------------------------------------------------------
     def open(self):
@@ -630,22 +622,17 @@ class SoapyAdapter(RadioAdapter):
         self._rs_ratio = self._pd_rate / AUDIO_RATE        # input samples per output sample (>= 1)
         self._rs_phase = 0.0                               # fractional read position carry-over
         self._ar_buf = np.zeros(0, dtype=np.float64)       # demodulated audio at _pd_rate
-        # SSB sideband selection: a complex one-sided bandpass (lowpass taps
-        # shifted to +1500 Hz -> passband ~0..3 kHz above the carrier for USB;
-        # conjugate taps mirror it below for LSB). The previous 'demod' took
-        # real(z) — and real(conj(z)) == real(z), so USB and LSB were byte-
-        # identical and both sidebands folded together. Found by ear against a
-        # sig gen (2026-08-01): "strangely in usb and lsb ... no difference".
-        ssb_ntaps = 63
-        k = np.arange(ssb_ntaps) - (ssb_ntaps - 1) / 2.0
-        f_half = 1500.0 / self._pd_rate                    # half-width, normalised
-        lp = np.sinc(2 * f_half * k) * np.hamming(ssb_ntaps)
-        lp = lp / lp.sum()
-        ssb_usb = (lp * np.exp(2j * np.pi * (1500.0 / self._pd_rate) * k)).astype(np.complex128)
-        ssb_lsb = np.conj(ssb_usb)
-        ssb_state = np.zeros(ssb_ntaps - 1, dtype=np.complex128)
-        ssb_state_b = np.zeros(ssb_ntaps - 1, dtype=np.complex128)
-
+        # The passband filter proper lives in core/filter.py: one designed
+        # complex FIR carrying the operator's edges, shape, notches, contour,
+        # APF and auto-EQ. Its settings and AGC survive a rate change; only
+        # the taps and overlap state are rebuilt for the new _pd_rate.
+        prev = self._filt
+        self._filt = SliceFilter(self._pd_rate, spec=prev.spec if prev is not None else None,
+                                 print_source=self._active_print)
+        if prev is not None:
+            self._filt.agc = prev.agc
+        # The SSB passband is the operator's filter (self._filt, built above);
+        # the fixed one-sided taps that used to live here are gone with it.
         # --- NBFM: a REAL discriminator, not the SSB path ------------------
         # Everything that was not LSB used to fall through to the USB taps, so
         # asking for FM got an SSB product detector. That sounds plausible to
@@ -672,8 +659,6 @@ class SoapyAdapter(RadioAdapter):
         # statements could straddle a concurrent _init_demod() call and end up
         # demodulating against two different decimations (F9).
         self._chain = _DemodChain(stage_firs=stage_firs, stage_firs_b=stage_firs_b,
-                                   ssb_usb=ssb_usb, ssb_lsb=ssb_lsb,
-                                   ssb_state=ssb_state, ssb_state_b=ssb_state_b,
                                    fm_taps=fm_taps, fm_state=fm_state, fm_state_b=fm_state_b)
         # Discriminator continuity: the last sample of the previous block, so
         # angle(x[n] * conj(x[n-1])) is unbroken across block boundaries. A
@@ -697,6 +682,17 @@ class SoapyAdapter(RadioAdapter):
         """
         np = self._np
         chain = self._chain     # ONE read: A and B see the same generation (F9)
+        filt = self._filt
+        if filt is not None and filt.spec.nb_on:
+            # blank at the full rate, before any filter smears an impulse
+            # across milliseconds (the same reason WDSP's blanker sits first)
+            if isinstance(block, tuple):
+                a, fa = blank_impulses(block[0], filt.spec.nb_db)
+                b, fb = blank_impulses(block[1], filt.spec.nb_db)
+                block, frac = (a, b), max(fa, fb)
+            else:
+                block, frac = blank_impulses(block, filt.spec.nb_db)
+            filt.blanked_pct = 0.9 * filt.blanked_pct + 10.0 * frac
         if isinstance(block, tuple):
             a, b = block
             rot = self._nco_rotation(len(a))
@@ -797,16 +793,9 @@ class SoapyAdapter(RadioAdapter):
             else:
                 chain.fm_state_b = tail
             return z
-        taps = chain.ssb_lsb if self._mode.startswith("LSB") else chain.ssb_usb
-        state = chain.ssb_state if ch == 0 else chain.ssb_state_b
-        x = np.concatenate([state, sig])
-        y = np.convolve(x, taps, mode="valid")
-        tail = x[len(x) - (len(taps) - 1):]
-        if ch == 0:
-            chain.ssb_state = tail
-        else:
-            chain.ssb_state_b = tail
-        return y
+        # the operator's passband (core/filter.py): edges, shape, notches,
+        # contour, APF, auto width and auto EQ, one complex FIR per channel
+        return self._filt.apply(sig, ch, lsb=self._mode.startswith("LSB"))
 
     @staticmethod
     def _is_fm_mode(mode):
@@ -831,6 +820,9 @@ class SoapyAdapter(RadioAdapter):
         """
         if self._is_fm_mode(self._mode):
             return (-FM_PASS_HZ, FM_PASS_HZ)
+        if self._filt is not None:
+            self._filt.lsb = (self._mode or "").upper().startswith("LSB")
+            return self._filt.edges()
         if (self._mode or "").upper().startswith("LSB"):
             return (-SSB_PASS_HZ, 0.0)
         return (0.0, SSB_PASS_HZ)
@@ -1452,6 +1444,65 @@ class SoapyAdapter(RadioAdapter):
         return d
 
     # --- diversity (dual tuner) -------------------------------------------
+    # ----- the receive filter (core/filter.py) ------------------------------
+    def _active_print(self):
+        """The voice/rig print of whoever is talking, for the auto filter."""
+        d = self._div
+        if d is None:
+            return None
+        vp = d.prints.get(d.active_slice)
+        active = d.memory.active
+        return vp.summary(active) if vp is not None and active is not None else None
+
+    def filter_status(self):
+        if self._filt is None:
+            return {"available": False}
+        st = self._filt.status()
+        st["available"] = True
+        st["mode"] = self._mode
+        st["roofing"]["analogue_hz"] = self._analogue_if_hz()
+        st["response"] = self._filt.response_db()
+        return st
+
+    def _analogue_if_hz(self):
+        """The RSP's analogue IF filter, which SoapySDRPlay3 picks from the
+        sample rate (Settings.cpp getBwEnumForRate): the closest thing this
+        hardware has to a roofing filter, and 200 kHz is its narrowest."""
+        r = float(self.samp_rate)
+        for limit, bw in ((300e3, 200e3), (600e3, 300e3), (1536e3, 600e3), (5e6, 1536e3),
+                          (6e6, 5e6), (7e6, 6e6), (8e6, 7e6)):
+            if r < limit:
+                return bw
+        return 8e6
+
+    def filter_set(self, **kw):
+        if self._filt is None:
+            return {"available": False}
+        self._filt.set(**kw)
+        return self.filter_status()
+
+    def filter_notch(self, add_hz=None, width_hz=80.0, clear=False, clear_hz=None):
+        if self._filt is None:
+            return {"available": False}
+        if clear:
+            self._filt.notch_clear(clear_hz)
+        if add_hz is not None:
+            self._filt.notch_add(add_hz, width_hz)
+        return self.filter_status()
+
+    def set_filter_edges_hz(self, low_hz, high_hz):
+        """AE's slice filter edges (signed Hz from the carrier): twin PBT."""
+        if self._filt is not None:
+            self._filt.set(low=low_hz, high=high_hz)
+
+    def set_filter_width_hz(self, hz):
+        """Width only (the IC-7300 contract): keep the centre, change the width."""
+        if self._filt is None:
+            return
+        lo, hi = self._filt.audio_edges()
+        c = (lo + hi) / 2.0
+        self._filt.set(low=max(0.0, c - hz / 2.0), high=c + hz / 2.0)
+
     def diversity_status(self, slice_id=None):
         if self._div is None:
             return {"available": False}
@@ -1801,17 +1852,16 @@ class SoapyAdapter(RadioAdapter):
             return audio.tolist()
 
         audio = audio * self._audio_gain
-        # simple AGC: track signal level, scale toward target (fast attack, slow release).
-        # Apply the gain as a per-sample RAMP from the previous chunk's gain — a
-        # stepped per-chunk gain modulates a steady carrier at the chunk rate
-        # (20 ms chunks = 50 Hz flutter, heard on a sig gen 2026-08-01).
-        rms = float(np.sqrt(np.mean(audio * audio)) + 1e-9)
         # DIAGNOSTIC: AETHER_GATE_NO_AGC=1 freezes the AGC at a fixed gain so a
         # steady carrier can be judged without the level tracker modulating it.
         if _os.environ.get("AETHER_GATE_NO_AGC") == "1":
-            audio = audio * (self._agc_target / max(self._agc_level, 1e-4))
+            audio = audio * (self._filt.agc.target / max(self._filt.agc.level, 1e-4))
             np.clip(audio, -1.0, 1.0, out=audio)
             return audio.tolist()
+        # The AGC (core/filter.py Agc): attack / decay / hang in milliseconds,
+        # gain ramped across the chunk so a level step never clicks (a stepped
+        # per-chunk gain modulated a steady carrier at 50 Hz, heard 2026-08-01).
+        return self._filt.agc.process(audio).tolist()
         a = 0.3 if rms > self._agc_level else 0.02
         self._agc_level = (1 - a) * self._agc_level + a * rms
         g_new = self._agc_target / max(self._agc_level, 1e-4)

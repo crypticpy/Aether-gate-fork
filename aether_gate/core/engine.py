@@ -314,6 +314,28 @@ def meter_packet(stream_id, seq, meter_id, dbm):
     return vita_header(stream_id, PCC_METER, seq, len(payload)) + payload
 
 
+_FILTER_FLAGS = ("anf", "contour", "apf", "auto", "auto_eq", "nb")
+_FILTER_WORDS = ("shape", "agc")
+
+
+def _filter_kwargs(q):
+    """Query string -> filter_set kwargs: flags as bools (1/0/on/off/true/
+    false), shape/agc as words, everything else a float. Unknown keys are the
+    adapter's to reject."""
+    out = {}
+    for k, vs in q.items():
+        v = vs[0]
+        if k in _FILTER_FLAGS:
+            if v.lower() not in ("1", "0", "on", "off", "true", "false"):
+                raise ValueError(f"{k}={v!r}")
+            out[k] = v.lower() in ("1", "on", "true")
+        elif k in _FILTER_WORDS:
+            out[k] = v.lower()
+        else:
+            out[k] = float(v)
+    return out
+
+
 def audio_frames(chunk, reduced_bw=False):
     """An adapter's audio chunk -> the packet's sample list. A chunk is floats
     (one channel, sent to both ears) or (left, right) pairs (the diversity
@@ -1695,7 +1717,10 @@ class Radio:
                     # so use the absolute passband width and leave shift alone.
                     lows = [k for k in ("filter_low", "low") if k in kvs]
                     highs = [k for k in ("filter_high", "high") if k in kvs]
-                    if lows and highs and hasattr(self.adapter, "set_filter_width_hz"):
+                    if lows and highs and hasattr(self.adapter, "set_filter_edges_hz"):
+                        # an adapter with its own DSP takes both edges: twin PBT
+                        self.adapter.set_filter_edges_hz(float(kvs[lows[0]]), float(kvs[highs[0]]))
+                    elif lows and highs and hasattr(self.adapter, "set_filter_width_hz"):
                         width = abs(float(kvs[highs[0]]) - float(kvs[lows[0]]))
                         if width > 0:
                             self.adapter.set_filter_width_hz(width)
@@ -3863,6 +3888,33 @@ def start_control_server(radio, port):
             # additions (map/capture/memory) may not exist on every diversity-capable
             # adapter yet, so those are gated on getattr(...) and answer a plain
             # {"error": "not supported"} rather than a traceback when absent.
+            # GET /filter                 -> the receive filter as it is (edges,
+            #                                shape, notches, ANF, contour, APF,
+            #                                auto, auto_eq, NB, AGC, response)
+            # GET /filter/set?low=&high=&shape=soft|sharp&anf=&contour=&contour_hz=&
+            #     contour_db=&contour_width=&apf=&apf_hz=&apf_width=&auto=&auto_eq=&
+            #     nb=&nb_db=&agc=fast|med|slow|long|off&attack_ms=&decay_ms=&hang_ms=
+            # GET /filter/notch?add=<hz>&width=<hz> | ?clear=1 | ?clear=<hz>
+            if u.path in ("/filter", "/filter/set", "/filter/notch"):
+                a = radio.adapter
+                if getattr(a, "filter_status", None) is None:
+                    return self._json({"available": False})
+                q = urllib.parse.parse_qs(u.query)
+                try:
+                    if u.path == "/filter":
+                        return self._json(a.filter_status())
+                    if u.path == "/filter/notch":
+                        if "clear" in q:
+                            v = q["clear"][0]
+                            clear_hz = None if v in ("1", "all", "") else float(v)
+                            return self._json(a.filter_notch(clear=True, clear_hz=clear_hz))
+                        return self._json(a.filter_notch(
+                            add_hz=float(q["add"][0]), width_hz=float(q.get("width", ["140"])[0])))
+                    kwargs = _filter_kwargs(q)
+                    log(f"[ctl] filter/set -> {kwargs}")
+                    return self._json(a.filter_set(**kwargs))
+                except (KeyError, ValueError, TypeError) as e:
+                    return self._json({"error": f"bad value: {e}"})
             if u.path == "/diversity":
                 a = radio.adapter
                 if not getattr(a, "diversity_available", False):

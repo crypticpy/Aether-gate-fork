@@ -175,10 +175,9 @@ def _ref_demod_block(a, block):
         sig = y[offs::M]
     if a._is_fm_mode(a._mode):
         return a._demod_fm(sig)
-    taps = a._ssb_lsb if a._mode.startswith("LSB") else a._ssb_usb
-    x = np.concatenate([a._ssb_state, sig])
-    y = np.convolve(x, taps, mode="valid")
-    a._ssb_state = x[len(x) - (len(taps) - 1):]
+    # the SSB passband is the operator's filter (core/filter.py) on both
+    # forms; this reference adapter owns its own copy, so no state is shared
+    y = a._filt.apply(sig, 0, lsb=a._mode.startswith("LSB"))
     return 2.0 * np.real(y)
 
 
