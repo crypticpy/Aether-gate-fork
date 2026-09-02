@@ -375,7 +375,7 @@ class Tracker:
     """
 
     def __init__(self, rate_hz, refresh_s=0.25, noise_tc_s=2.0, signal_tc_s=0.3,
-                 memory=None):
+                 memory=None, t0=0.0):
         self.rate_hz = float(rate_hz)
         self.refresh_s = float(refresh_s)
         self.noise_tc_s = float(noise_tc_s)
@@ -388,7 +388,9 @@ class Tracker:
         self.updates = 0
         self.talking = False
         self.talk_mod = None
-        self.t = 0.0                        # tracker time, seconds of signal seen
+        self.t = float(t0)                  # tracker time: t0 + seconds of signal seen
+                                            # (t0 = a shared clock, so several
+                                            # trackers can stamp one TalkerMemory)
         self._rn_in_t = -1e9
         self._since_fit = 0.0
         self._talk_s = 0.0

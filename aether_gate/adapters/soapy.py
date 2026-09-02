@@ -126,166 +126,9 @@ def _dv():
     from ..core import diversity
     return diversity
 
-
-class _DiversityState:
-    """The adapter's side of core/diversity for a dual-tuner RSPduo.
-
-    Lives only while two channels flow on one stream. Three threads touch it:
-    the READER (ingest: alignment measurement, the aligned pair for the audio
-    queue, the combined block for the panadapter and meters), the AUDIO
-    thread (observe: the per-slice tracker sees the demod passband and hands
-    back the weight to combine with), and the CONTROL port (set/status).
-    Every shared value is a Python scalar or a dict entry swapped whole, so
-    no lock is needed for a reader to see a consistent weight.
-
-    Weights are PER SLICE: the beam is arithmetic on the same two streams,
-    so the slice on a net can be steered at whoever is talking while a
-    second slice keeps its own weight. The panadapter and S-meter follow the
-    slice the audio is on (active_slice).
-    """
-
-    CAL_SECONDS = 0.5          # of raw IQ cross-correlated to find the lag
-    CAL_SAMPLES_MAX = 1 << 17  # 131072 — caps the FFT at 2.04 MS/s to ~64 ms of
-                                # reader-thread stall instead of the 103 ms a
-                                # full 0.5 s (2^21-point FFT) costs, which was
-                                # long enough to overflow the driver and trigger
-                                # another realign under its own stall
-    MODES = ("off", "manual", "null", "track")
-    SOURCES = ("combined", "a", "b")
-
-    def __init__(self, adapter):
-        self.a = adapter
-        self.aligner = _dv().Aligner()
-        self.mode = "off"
-        self.source = "combined"
-        self.manual = {}                    # slice_id -> complex weight m
-        self.trackers = {}                  # slice_id -> Tracker (rebuilt on a rate change)
-        self.active_slice = 0
-        self._cal_a, self._cal_b, self._cal_n = [], [], 0
-        # Guards _cal_a/_cal_b/_cal_n: request_realign() can land from the
-        # HTTP thread (diversity_realign) while ingest() is mid-accumulate on
-        # the reader thread, and an empty list handed to np.concatenate raises.
-        self._cal_lock = threading.Lock()
-        self._realign = None                # why a measurement is owed, or None
-        self.last_align = {"lag": 0, "peak": 0.0, "ok": False, "why": None}
-
-    # --- reader thread -------------------------------------------------
-    def request_realign(self, why):
-        with self._cal_lock:
-            self._cal_a, self._cal_b, self._cal_n = [], [], 0
-        self._realign = str(why)
-
-    def _configured_weight(self, sid):
-        """What the operator has dialled in for slice sid, regardless of
-        whether the aligner currently trusts the two channels enough to
-        combine them. Used by status() so the UI shows what is set even
-        while weight_for() is holding at 0j."""
-        if self.mode == "off":
-            return 0j
-        if self.mode == "manual":
-            return self.manual.get(sid, 1 + 0j)
-        t = self.trackers.get(sid)
-        return t.m if t is not None else 0j
-
-    def weight_for(self, sid):
-        """The complex weight ACTUALLY used to combine A and B for slice sid.
-
-        0j (channel A alone) whenever the aligner is not aligned, in every
-        mode — including manual m=1. Combining two streams the aligner has
-        not credibly locked adds a decorrelated copy of the same signal,
-        which costs ~3 dB SNR rather than gaining anything (found in review,
-        F10).
-        """
-        if not self.aligner.aligned:
-            return 0j
-        return self._configured_weight(sid)
-
-    def ingest(self, a, b):
-        """One raw block pair -> (block for the pan/meters, pair for the demod)."""
-        np = self.a._np
-        if self._realign is not None:
-            n_cal = min(int(self.CAL_SECONDS * self.a.samp_rate), self.CAL_SAMPLES_MAX)
-            snapshot = None
-            with self._cal_lock:
-                self._cal_a.append(a); self._cal_b.append(b); self._cal_n += len(a)
-                if self._cal_n >= n_cal:
-                    snapshot = (list(self._cal_a), list(self._cal_b), self._realign)
-                    self._cal_a, self._cal_b, self._cal_n = [], [], 0
-                    self._realign = None
-            if snapshot is not None:
-                cal_a, cal_b, why = snapshot
-                A = np.concatenate(cal_a); B = np.concatenate(cal_b)
-                lag, peak, ok = self.aligner.calibrate(A, B, min(8192, len(A) // 4))
-                self.last_align = {"lag": int(lag), "peak": float(peak), "ok": bool(ok), "why": why}
-                print(f"[diversity] alignment ({why}): lag {lag:+d} samples, correlation "
-                      f"peak {peak:.1f}x the floor — "
-                      f"{'locked' if ok else 'NOT credible; holding lag 0'}", flush=True)
-        a, b = self.aligner.apply(a, b)
-        if self.source == "a":
-            pan = a
-        elif self.source == "b":
-            pan = b
-        else:
-            pan = _dv().combine(a, b, self.weight_for(self.active_slice))
-        return pan, (a, b)
-
-    # --- audio thread ----------------------------------------------------
-    def observe(self, sid, pa, pb):
-        """The demod passband of both channels for slice sid; returns its weight."""
-        t = self.trackers.get(sid)
-        if t is None:
-            t = self.trackers[sid] = _dv().Tracker(self.a._pd_rate)
-        t.update(pa, pb, self.mode)         # every mode: the SNR readout needs it
-        return self.weight_for(sid)
-
-    # --- control port ----------------------------------------------------
-    def status(self, sid=None):
-        sid = self.active_slice if sid is None else int(sid)
-        m = self.weight_for(sid)                     # what is ACTUALLY combined
-        # phase/ratio report the operator's CONFIGURED weight, not weight_for's
-        # 0j-while-unaligned — the slider must not appear to snap to zero just
-        # because the aligner has not locked yet.
-        ph, ra = _dv().weight_to_polar(self._configured_weight(sid))
-        t = self.trackers.get(sid)
-        return {
-            "available": True, "channels": 2,
-            "mode": self.mode, "source": self.source,
-            "phase_deg": round(ph, 1), "ratio_db": round(ra, 1),
-            "weight": [round(m.real, 4), round(m.imag, 4)],
-            "lag_samples": int(self.aligner.lag), "aligned": bool(self.aligner.aligned),
-            "corr_peak": round(float(self.aligner.peak), 1),
-            "realigning": self._realign is not None,
-            "snr_db": t.snr_db() if t is not None else {"a": None, "b": None, "out": None},
-            "talking": bool(t.talking) if t is not None else False,
-            "updates": int(t.updates) if t is not None else 0,
-            "slice_id": sid,
-        }
-
-    def set(self, mode=None, phase_deg=None, ratio_db=None, source=None, sid=None):
-        sid = self.active_slice if sid is None else int(sid)
-        if mode is not None:
-            mode = str(mode).lower()
-            if mode not in self.MODES:
-                raise ValueError(f"mode must be one of {self.MODES}")
-            if mode == "manual" and self.mode in ("null", "track"):
-                # start the sliders where the automatic fit left off
-                t = self.trackers.get(sid)
-                if t is not None and t.m != 0:
-                    self.manual[sid] = t.m
-            self.mode = mode
-        if phase_deg is not None or ratio_db is not None:
-            ph, ra = _dv().weight_to_polar(self.manual.get(sid, 1 + 0j))
-            if phase_deg is not None:
-                ph = float(phase_deg)
-            if ratio_db is not None:
-                ra = float(ratio_db)
-            self.manual[sid] = _dv().weight_from_polar(ph, ra)
-        if source is not None:
-            source = str(source).lower()
-            if source not in self.SOURCES:
-                raise ValueError(f"source must be one of {self.SOURCES}")
-            self.source = source
-        return self.status(sid)
+# The adapter's dual-tuner state lives in its own module; re-exported here
+# because tests and the engine reach it as soapy._DiversityState.
+from .diversity_state import _DiversityState  # noqa: E402,F401
 
 
 def rtl_bufflen(samp_rate, target_s=0.030):
@@ -848,19 +691,24 @@ class SoapyAdapter(RadioAdapter):
 
         A TUPLE is a dual-tuner pair (a, b): both channels go through the same
         mixer rotation and their own decimation state, the slice's tracker
-        sees both passbands, and the weighted sum is detected. The SSB and FM
+        sees the mixed pair, and the weighted sum is detected. The SSB and FM
         channel filters are linear, so combining after them equals combining
-        before — and the tracker gets exactly the band the operator hears.
+        before.
         """
         np = self._np
         chain = self._chain     # ONE read: A and B see the same generation (F9)
         if isinstance(block, tuple):
             a, b = block
             rot = self._nco_rotation(len(a))
-            pa = self._passband(a.astype(np.complex128) * rot, chain, 0)
-            pb = self._passband(b.astype(np.complex128) * rot, chain, 1)
-            m = self._div.observe(slice_id, pa, pb)
-            y = _dv().combine(pa, pb, m)
+            xa = a.astype(np.complex128) * rot
+            xb = b.astype(np.complex128) * rot
+            # the tracker sees the full-rate mixed pair (in-band AND the guard
+            # bands either side of the passband); the weight it hands back is
+            # ramped across the block so a steering change never clicks
+            m0, m1 = self._div.observe(slice_id, xa, xb)
+            pa = self._passband(xa, chain, 0)
+            pb = self._passband(xb, chain, 1)
+            y = _dv().combine_ramp(pa, pb, m0, m1)
         else:
             rot = self._nco_rotation(len(block))
             y = self._passband(block.astype(np.complex128) * rot, chain, 0)
@@ -1608,16 +1456,31 @@ class SoapyAdapter(RadioAdapter):
         return self._div.status(slice_id)
 
     def set_diversity(self, mode=None, phase_deg=None, ratio_db=None, source=None,
-                      slice_id=None):
+                      slice_id=None, nb=None, nb_db=None, pan=None, null_source=None):
         if self._div is None:
             return {"available": False}
-        return self._div.set(mode, phase_deg, ratio_db, source, slice_id)
+        return self._div.set(mode, phase_deg, ratio_db, source, slice_id,
+                             nb=nb, nb_db=nb_db, pan=pan, null_source=null_source)
 
     def diversity_realign(self):
         if self._div is None:
             return {"available": False}
         self._div.request_realign("operator request")
         return self._div.status()
+
+    def diversity_map(self):
+        if self._div is None:
+            return {"available": False}
+        return self._div.map_json()
+
+    def diversity_capture(self, seconds):
+        if self._div is None:
+            raise RuntimeError("no dual-tuner stream")
+        return self._div.capture(seconds)
+
+    def diversity_memory_clear(self):
+        if self._div is not None:
+            self._div.memory_clear()
 
     def set_mode(self, mode):
         self._mode = (mode or "USB").upper()
