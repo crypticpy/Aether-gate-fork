@@ -145,6 +145,11 @@ class _DiversityState:
     """
 
     CAL_SECONDS = 0.5          # of raw IQ cross-correlated to find the lag
+    CAL_SAMPLES_MAX = 1 << 17  # 131072 — caps the FFT at 2.04 MS/s to ~64 ms of
+                                # reader-thread stall instead of the 103 ms a
+                                # full 0.5 s (2^21-point FFT) costs, which was
+                                # long enough to overflow the driver and trigger
+                                # another realign under its own stall
     MODES = ("off", "manual", "null", "track")
     SOURCES = ("combined", "a", "b")
 
@@ -157,15 +162,24 @@ class _DiversityState:
         self.trackers = {}                  # slice_id -> Tracker (rebuilt on a rate change)
         self.active_slice = 0
         self._cal_a, self._cal_b, self._cal_n = [], [], 0
+        # Guards _cal_a/_cal_b/_cal_n: request_realign() can land from the
+        # HTTP thread (diversity_realign) while ingest() is mid-accumulate on
+        # the reader thread, and an empty list handed to np.concatenate raises.
+        self._cal_lock = threading.Lock()
         self._realign = None                # why a measurement is owed, or None
         self.last_align = {"lag": 0, "peak": 0.0, "ok": False, "why": None}
 
     # --- reader thread -------------------------------------------------
     def request_realign(self, why):
-        self._cal_a, self._cal_b, self._cal_n = [], [], 0
+        with self._cal_lock:
+            self._cal_a, self._cal_b, self._cal_n = [], [], 0
         self._realign = str(why)
 
-    def weight_for(self, sid):
+    def _configured_weight(self, sid):
+        """What the operator has dialled in for slice sid, regardless of
+        whether the aligner currently trusts the two channels enough to
+        combine them. Used by status() so the UI shows what is set even
+        while weight_for() is holding at 0j."""
         if self.mode == "off":
             return 0j
         if self.mode == "manual":
@@ -173,16 +187,34 @@ class _DiversityState:
         t = self.trackers.get(sid)
         return t.m if t is not None else 0j
 
+    def weight_for(self, sid):
+        """The complex weight ACTUALLY used to combine A and B for slice sid.
+
+        0j (channel A alone) whenever the aligner is not aligned, in every
+        mode — including manual m=1. Combining two streams the aligner has
+        not credibly locked adds a decorrelated copy of the same signal,
+        which costs ~3 dB SNR rather than gaining anything (found in review,
+        F10).
+        """
+        if not self.aligner.aligned:
+            return 0j
+        return self._configured_weight(sid)
+
     def ingest(self, a, b):
         """One raw block pair -> (block for the pan/meters, pair for the demod)."""
         np = self.a._np
         if self._realign is not None:
-            self._cal_a.append(a); self._cal_b.append(b); self._cal_n += len(a)
-            if self._cal_n >= int(self.CAL_SECONDS * self.a.samp_rate):
-                A = np.concatenate(self._cal_a); B = np.concatenate(self._cal_b)
-                why = self._realign
-                self._cal_a, self._cal_b, self._cal_n = [], [], 0
-                self._realign = None
+            n_cal = min(int(self.CAL_SECONDS * self.a.samp_rate), self.CAL_SAMPLES_MAX)
+            snapshot = None
+            with self._cal_lock:
+                self._cal_a.append(a); self._cal_b.append(b); self._cal_n += len(a)
+                if self._cal_n >= n_cal:
+                    snapshot = (list(self._cal_a), list(self._cal_b), self._realign)
+                    self._cal_a, self._cal_b, self._cal_n = [], [], 0
+                    self._realign = None
+            if snapshot is not None:
+                cal_a, cal_b, why = snapshot
+                A = np.concatenate(cal_a); B = np.concatenate(cal_b)
                 lag, peak, ok = self.aligner.calibrate(A, B, min(8192, len(A) // 4))
                 self.last_align = {"lag": int(lag), "peak": float(peak), "ok": bool(ok), "why": why}
                 print(f"[diversity] alignment ({why}): lag {lag:+d} samples, correlation "
@@ -209,8 +241,11 @@ class _DiversityState:
     # --- control port ----------------------------------------------------
     def status(self, sid=None):
         sid = self.active_slice if sid is None else int(sid)
-        m = self.weight_for(sid)
-        ph, ra = _dv().weight_to_polar(m)
+        m = self.weight_for(sid)                     # what is ACTUALLY combined
+        # phase/ratio report the operator's CONFIGURED weight, not weight_for's
+        # 0j-while-unaligned — the slider must not appear to snap to zero just
+        # because the aligner has not locked yet.
+        ph, ra = _dv().weight_to_polar(self._configured_weight(sid))
         t = self.trackers.get(sid)
         return {
             "available": True, "channels": 2,
@@ -267,10 +302,59 @@ def rtl_bufflen(samp_rate, target_s=0.030):
     return max(16384, (bl // 16384) * 16384)
 
 
+class _DemodChain:
+    """One consistent generation of the staged-decimation + SSB/FM demod
+    state for BOTH channels of the audio chain.
+
+    _init_demod builds a whole new one in local variables and publishes it
+    with a single attribute assignment (self._chain = _DemodChain(...));
+    _demod_block reads self._chain exactly once at the top of the call and
+    uses that same object for channel A and channel B. Publishing the nine
+    fields as separate self._stage_firs / self._stage_firs_b / ... statements
+    let a sample-rate change (on the reader thread) land between two of them:
+    channel A would demodulate against the new decimation while channel B was
+    still reading the old one, and combine() raised on the shape mismatch
+    (found in review, F9).
+    """
+
+    __slots__ = ("stage_firs", "stage_firs_b", "ssb_usb", "ssb_lsb",
+                 "ssb_state", "ssb_state_b", "fm_taps", "fm_state", "fm_state_b")
+
+    def __init__(self, stage_firs, stage_firs_b, ssb_usb, ssb_lsb,
+                 ssb_state, ssb_state_b, fm_taps, fm_state, fm_state_b):
+        self.stage_firs, self.stage_firs_b = stage_firs, stage_firs_b
+        self.ssb_usb, self.ssb_lsb = ssb_usb, ssb_lsb
+        self.ssb_state, self.ssb_state_b = ssb_state, ssb_state_b
+        self.fm_taps = fm_taps
+        self.fm_state, self.fm_state_b = fm_state, fm_state_b
+
+
+def _chain_field(name):
+    """A property exposing one _DemodChain field under its old per-adapter
+    attribute name (self._stage_firs, self._fm_state, ...), so the rest of
+    this file — and the tests that poke those names directly — keep working
+    unchanged. _demod_block/_passband do NOT go through these: they capture
+    self._chain once and read its fields straight off that object instead."""
+    return property(lambda self: getattr(self._chain, name),
+                     lambda self, v: setattr(self._chain, name, v))
+
+
 class SoapyAdapter(RadioAdapter):
     """Live IQ from a SoapySDR device. The core runs the FFT (provides='iq')."""
 
     provides = "iq"
+
+    # Demod-chain fields, exposed as properties backed by self._chain (see
+    # _DemodChain / _chain_field above).
+    _stage_firs = _chain_field("stage_firs")
+    _stage_firs_b = _chain_field("stage_firs_b")
+    _ssb_usb = _chain_field("ssb_usb")
+    _ssb_lsb = _chain_field("ssb_lsb")
+    _ssb_state = _chain_field("ssb_state")
+    _ssb_state_b = _chain_field("ssb_state_b")
+    _fm_taps = _chain_field("fm_taps")
+    _fm_state = _chain_field("fm_state")
+    _fm_state_b = _chain_field("fm_state_b")
 
     def __init__(self, driver="rtlsdr", device_args="", samp_rate=2_040_000,
                  gain_db=40.0, center_hz=14_100_000.0, model="FLEX-6700",
@@ -322,16 +406,20 @@ class SoapyAdapter(RadioAdapter):
         self._b_tmp = None                  # scratch for channel B reads
         self.diversity_available = False    # True once two channels flow (see _open_hw)
         self._div = None                    # _DiversityState, dual-tuner only
-        self._stage_firs_b = []             # channel B's own copy of the decimation state
-        self._ssb_state_b = None
-        self._fm_state_b = None
+        # Staged-decimation + SSB/FM state for both channels, one object so a
+        # rate change can never hand A and B different generations mid-call;
+        # see _DemodChain. The properties above expose its fields under their
+        # old per-field names for the rest of this file and for tests.
+        self._chain = _DemodChain(stage_firs=[], stage_firs_b=[],
+                                   ssb_usb=None, ssb_lsb=None,
+                                   ssb_state=None, ssb_state_b=None,
+                                   fm_taps=None, fm_state=None, fm_state_b=None)
         self._nco_phase = 0.0               # persistent mixer phase (continuity across blocks)
         self._nco_ramp = None               # cached exp(1j*step*k); see _demod_block
         self._nco_ramp_n = 0                # block length the cached ramp was built for
         self._nco_ramp_step = None          # phase step the cached ramp was built for
         self._decim = None                  # samp_rate / AUDIO_RATE (integer-ish); set in open()
         self._stages = []                   # decimation factors per stage
-        self._stage_firs = []               # [taps, overlap_state, M, stride_offs] per stage
         self._iq_resid = None               # leftover IQ samples between audio calls
         self._audio_gain = 60.0             # post-demod fixed gain (SSB baseband is small)
         self._agc_level = 0.05              # AGC running estimate of audio level
@@ -553,6 +641,12 @@ class SoapyAdapter(RadioAdapter):
     def _verify_stream(self, timeout_s=2.0):
         """Prove the stream is alive by actually reading IQ out of it.
 
+        Dual tuner: EVERY stream in self._streams must produce a block, not
+        just channel A's. Checking only self._stream let a dead channel B
+        pass verification — the recovery path would declare the gate "back
+        on the air" while B stayed silent (F5). Single tuner is unchanged:
+        self._streams holds exactly the one stream, same as before.
+
         ⚠ A FAILED activateStream() IS NOT AN EXCEPTION ON THIS DRIVER.
         Measured live 2026-08-31: with the API service restarted underneath a
         running gate, SoapySDRPlay3 logged
@@ -567,16 +661,17 @@ class SoapyAdapter(RadioAdapter):
         """
         np = self._np
         buf = np.empty(4096, dtype=np.complex64)
+        pending = list(self._streams or ([self._stream] if self._stream is not None else []))
         deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
+        while pending and time.monotonic() < deadline:
             try:
-                sr = self._sdr.readStream(self._stream, [buf], 4096, timeoutUs=200000)
+                sr = self._sdr.readStream(pending[0], [buf], 4096, timeoutUs=200000)
             except Exception:
                 return False
             n = sr.ret if hasattr(sr, "ret") else (sr[0] if isinstance(sr, tuple) else 0)
             if n > 0:
-                return True
-        return False
+                pending.pop(0)
+        return not pending
 
     def _recover_device(self):
         """Tear the stream down and start it again, WITHOUT touching the device.
@@ -674,7 +769,7 @@ class SoapyAdapter(RadioAdapter):
         np = self._np
         self._decim = max(1, int(self.samp_rate // AUDIO_RATE))
         self._stages = self._factor_decim(self._decim)                  # e.g. 85 -> [5, 17]
-        self._stage_firs = []          # per stage: [taps, overlap state, M, stride offset]
+        stage_firs = []                 # per stage: [taps, overlap state, M, stride offset]
         for M in self._stages:
             # short anti-alias FIR for this stage: cutoff at the post-decimation Nyquist
             ntaps = 4 * M + 1
@@ -682,10 +777,10 @@ class SoapyAdapter(RadioAdapter):
             idx = np.arange(ntaps) - (ntaps - 1) / 2.0
             h = (np.sinc(2 * cutoff * idx) * np.hamming(ntaps))
             h = (h / h.sum()).astype(np.float64)
-            self._stage_firs.append([h, np.zeros(ntaps - 1, dtype=np.complex128), M, 0])
+            stage_firs.append([h, np.zeros(ntaps - 1, dtype=np.complex128), M, 0])
         # Channel B (dual tuner) runs the same taps with its own overlap state.
-        self._stage_firs_b = [[h, np.zeros(len(h) - 1, dtype=np.complex128), M, 0]
-                              for h, _s, M, _o in self._stage_firs]
+        stage_firs_b = [[h, np.zeros(len(h) - 1, dtype=np.complex128), M, 0]
+                        for h, _s, M, _o in stage_firs]
         self._pd_rate = self.samp_rate / self._decim       # post-decimation rate, >= AUDIO_RATE
         if self._div is not None:
             self._div.trackers = {}                        # they were built for the old rate
@@ -703,10 +798,10 @@ class SoapyAdapter(RadioAdapter):
         f_half = 1500.0 / self._pd_rate                    # half-width, normalised
         lp = np.sinc(2 * f_half * k) * np.hamming(ssb_ntaps)
         lp = lp / lp.sum()
-        self._ssb_usb = (lp * np.exp(2j * np.pi * (1500.0 / self._pd_rate) * k)).astype(np.complex128)
-        self._ssb_lsb = np.conj(self._ssb_usb)
-        self._ssb_state = np.zeros(ssb_ntaps - 1, dtype=np.complex128)
-        self._ssb_state_b = np.zeros(ssb_ntaps - 1, dtype=np.complex128)
+        ssb_usb = (lp * np.exp(2j * np.pi * (1500.0 / self._pd_rate) * k)).astype(np.complex128)
+        ssb_lsb = np.conj(ssb_usb)
+        ssb_state = np.zeros(ssb_ntaps - 1, dtype=np.complex128)
+        ssb_state_b = np.zeros(ssb_ntaps - 1, dtype=np.complex128)
 
         # --- NBFM: a REAL discriminator, not the SSB path ------------------
         # Everything that was not LSB used to fall through to the USB taps, so
@@ -726,9 +821,17 @@ class SoapyAdapter(RadioAdapter):
         kf = np.arange(fm_ntaps) - (fm_ntaps - 1) / 2.0
         fm_half = min(8000.0 / self._pd_rate, 0.45)        # normalised half-width
         fh = np.sinc(2 * fm_half * kf) * np.hamming(fm_ntaps)
-        self._fm_taps = (fh / fh.sum()).astype(np.float64)
-        self._fm_state = np.zeros(fm_ntaps - 1, dtype=np.complex128)
-        self._fm_state_b = np.zeros(fm_ntaps - 1, dtype=np.complex128)
+        fm_taps = (fh / fh.sum()).astype(np.float64)
+        fm_state = np.zeros(fm_ntaps - 1, dtype=np.complex128)
+        fm_state_b = np.zeros(fm_ntaps - 1, dtype=np.complex128)
+        # Publish the whole new generation in ONE attribute assignment — see
+        # _DemodChain: two channels reading nine separate self._x/_x_b
+        # statements could straddle a concurrent _init_demod() call and end up
+        # demodulating against two different decimations (F9).
+        self._chain = _DemodChain(stage_firs=stage_firs, stage_firs_b=stage_firs_b,
+                                   ssb_usb=ssb_usb, ssb_lsb=ssb_lsb,
+                                   ssb_state=ssb_state, ssb_state_b=ssb_state_b,
+                                   fm_taps=fm_taps, fm_state=fm_state, fm_state_b=fm_state_b)
         # Discriminator continuity: the last sample of the previous block, so
         # angle(x[n] * conj(x[n-1])) is unbroken across block boundaries. A
         # reset here would inject a phase glitch every block — an audible tick
@@ -750,16 +853,17 @@ class SoapyAdapter(RadioAdapter):
         before — and the tracker gets exactly the band the operator hears.
         """
         np = self._np
+        chain = self._chain     # ONE read: A and B see the same generation (F9)
         if isinstance(block, tuple):
             a, b = block
             rot = self._nco_rotation(len(a))
-            pa = self._passband(a.astype(np.complex128) * rot, 0)
-            pb = self._passband(b.astype(np.complex128) * rot, 1)
+            pa = self._passband(a.astype(np.complex128) * rot, chain, 0)
+            pb = self._passband(b.astype(np.complex128) * rot, chain, 1)
             m = self._div.observe(slice_id, pa, pb)
             y = _dv().combine(pa, pb, m)
         else:
             rot = self._nco_rotation(len(block))
-            y = self._passband(block.astype(np.complex128) * rot, 0)
+            y = self._passband(block.astype(np.complex128) * rot, chain, 0)
         if self._is_fm_mode(self._mode):
             return self._discriminate(y)
         return 2.0 * np.real(y)                            # x2: real() halves the one-sided energy
@@ -794,16 +898,17 @@ class SoapyAdapter(RadioAdapter):
         self._nco_phase = (self._nco_phase + step * n_iq) % (2.0 * np.pi)
         return rot
 
-    def _passband(self, sig, ch=0):
+    def _passband(self, sig, chain, ch=0):
         """Mixed IQ of one channel -> its demod passband at _pd_rate.
 
-        Staged decimation with per-channel overlap state, then the SSB
-        one-sided filter (or the FM channel filter). Stride offsets carried
-        per stage keep the [::M] comb aligned across arbitrary block
-        boundaries.
+        `chain` is the _DemodChain _demod_block captured for this call (both
+        channels of one call always share the same one — see F9). Staged
+        decimation with per-channel overlap state, then the SSB one-sided
+        filter (or the FM channel filter). Stride offsets carried per stage
+        keep the [::M] comb aligned across arbitrary block boundaries.
         """
         np = self._np
-        for fir in (self._stage_firs if ch == 0 else self._stage_firs_b):
+        for fir in (chain.stage_firs if ch == 0 else chain.stage_firs_b):
             taps, state, M, offs = fir
             x = np.concatenate([state, sig])
             # DECIMATE IN PLACE: compute ONLY the outputs that survive [::M].
@@ -833,24 +938,24 @@ class SoapyAdapter(RadioAdapter):
             sig = sig_next
         if self._is_fm_mode(self._mode):
             # channel filter first (see _init_demod: FM is non-linear)
-            state = self._fm_state if ch == 0 else self._fm_state_b
+            state = chain.fm_state if ch == 0 else chain.fm_state_b
             x = np.concatenate([state, sig])
-            z = np.convolve(x, self._fm_taps, mode="valid")
-            tail = x[len(x) - (len(self._fm_taps) - 1):]
+            z = np.convolve(x, chain.fm_taps, mode="valid")
+            tail = x[len(x) - (len(chain.fm_taps) - 1):]
             if ch == 0:
-                self._fm_state = tail
+                chain.fm_state = tail
             else:
-                self._fm_state_b = tail
+                chain.fm_state_b = tail
             return z
-        taps = self._ssb_lsb if self._mode.startswith("LSB") else self._ssb_usb
-        state = self._ssb_state if ch == 0 else self._ssb_state_b
+        taps = chain.ssb_lsb if self._mode.startswith("LSB") else chain.ssb_usb
+        state = chain.ssb_state if ch == 0 else chain.ssb_state_b
         x = np.concatenate([state, sig])
         y = np.convolve(x, taps, mode="valid")
         tail = x[len(x) - (len(taps) - 1):]
         if ch == 0:
-            self._ssb_state = tail
+            chain.ssb_state = tail
         else:
-            self._ssb_state_b = tail
+            chain.ssb_state_b = tail
         return y
 
     @staticmethod
@@ -986,282 +1091,318 @@ class SoapyAdapter(RadioAdapter):
         fresh_at = _time.monotonic()        # when the samples last actually CHANGED
         _t_read = 0.0
         _plast = _time.monotonic()
+        _last_exc_msg = None                # fingerprint of the last per-iteration exception
+        _last_exc_log_t = 0.0                # monotonic stamp it was last logged (see F4 below)
+
+        def _note_read_error():
+            """The accounting a failed readStream() gets: back off, tell the
+            core early, give up on a device that is really gone. Shared with
+            the channel-B path below (_read_exact_b returning None) so a dead
+            B is treated exactly like a dead A instead of going silent while
+            /status still reports healthy (F5)."""
+            nonlocal consec_err, err_since, need_recover
+            consec_err += 1
+            if err_since == 0.0:
+                err_since = _time.monotonic()
+            if consec_err <= _ERR_FAST:
+                time.sleep(0.001)       # transient: retry immediately
+            else:
+                # Escalate 10 ms -> 1 s so a long outage costs almost
+                # nothing, while a brief one still recovers quickly.
+                time.sleep(min(0.01 * (2 ** min(consec_err - _ERR_FAST, 7)), 1.0))
+                if consec_err == _ERR_FAST + 1 or consec_err % 200 == 0:
+                    print(f"[soapy] read error x{consec_err} — backing off "
+                          f"(device unplugged or reset?)", flush=True)
+            if err_since and _time.monotonic() - err_since >= _RECOVER_AFTER_S:
+                need_recover = True
+            if (not self.device_lost and err_since
+                    and _time.monotonic() - err_since >= _DEVICE_LOST_AFTER_S):
+                self.device_lost = True
+                self.device_lost_reason = (
+                    "the SDR stopped responding (unplugged, or reset by the host)")
+            if consec_err >= _ERR_GIVE_UP:
+                # Stop rather than spin forever. The gate stays up and AE
+                # sees the stream end, which is honest; a restart (or a
+                # reconnect from the setup page) re-opens the device.
+                print(f"[soapy] giving up after {consec_err} consecutive read "
+                      f"errors — the device is gone. Restart the gate once it "
+                      f"is plugged back in.", flush=True)
+                self.device_lost = True
+                self.device_lost_reason = (
+                    f"the SDR stopped responding after {consec_err} read errors "
+                    f"(unplugged, or reset by the host)")
+                self._run = False
+
         while self._run:
-            # apply any pending retune on this thread (avoid racing readStream)
-            if self._retune_to is not None:
-                want = float(self._retune_to)
-                try:
-                    for ch in self._channels:      # together, or the pair is not coherent
-                        self._sdr.setFrequency(self._SOAPY_SDR_RX, ch, want)
-                    # READ IT BACK. A silent 'except: pass' here left the tuner
-                    # wherever it was while every layer above believed the retune
-                    # had happened — the panadapter, the slice and AE all showed
-                    # the new frequency and the receiver was still on the old one.
-                    # Same lesson as setSampleRate: never trust a setter on this
-                    # driver, and never swallow its failure.
+            try:
+                # apply any pending retune on this thread (avoid racing readStream)
+                if self._retune_to is not None:
+                    want = float(self._retune_to)
                     try:
-                        got = float(self._sdr.getFrequency(self._SOAPY_SDR_RX, 0))
-                    except Exception:
-                        got = want
-                    self.center_hz = got
-                    if abs(got - want) > 1000.0:
-                        print(f"[soapy] RETUNE MISMATCH: asked {want/1e6:.6f} MHz, "
-                              f"tuner reports {got/1e6:.6f} MHz", flush=True)
-                    else:
-                        print(f"[soapy] tuned to {got/1e6:.6f} MHz", flush=True)
-                except Exception as e:
-                    print(f"[soapy] RETUNE FAILED to {want/1e6:.6f} MHz: {e!r} "
-                          f"(still on {self.center_hz/1e6:.6f} MHz)", flush=True)
-                self._retune_to = None
-            # apply any pending gain change on this thread, for the same reason
-            if self._gain_to is not None:
-                want = float(self._gain_to)
-                self._gain_to = None
-                try:
-                    for ch in self._channels:
-                        self._sdr.setGain(self._SOAPY_SDR_RX, ch, want)
-                    # Read it back — this driver's setters lie (see _verify_stream).
-                    got = float(self._sdr.getGain(self._SOAPY_SDR_RX, 0))
-                    self.gain_db = got          # keeps read_meters' gain term honest
-                    if self.agc:
-                        print(f"[soapy] gain -> {got:.1f} dB, but AGC IS ON so the "
-                              f"hardware will override it", flush=True)
-                    else:
-                        print(f"[soapy] gain -> {got:.1f} dB (asked {want:.1f})",
-                              flush=True)
-                except Exception as e:
-                    print(f"[soapy] SET GAIN FAILED at {want:.1f} dB: {e!r} "
-                          f"(still {self.gain_db:.1f} dB)", flush=True)
-            # apply any pending sample-rate change on this thread, for the same
-            # reason — and because it has to bracket setupStream/activateStream.
-            if (self._rate_to is not None
-                    and _time.monotonic() - self._rate_req_at >= RATE_DEBOUNCE_S):
-                want = float(self._rate_to)
-                if abs(want - self.samp_rate) > 1.0:
-                    self._apply_samp_rate(want)
-                self._rate_to = None            # cleared LAST: it is set_samp_rate's done-signal
-            # Device settings + antenna port, same thread for the same reason.
-            # No debounce: these are discrete toggles, not a drag, and none of
-            # them restarts the stream.
-            if self._antenna_to is not None:
-                want = self._antenna_to
-                self._antenna_to = None
-                try:
-                    # Each channel owns its own ports (dual tuner: Tuner 1 on
-                    # channel 0, Tuner 2 on channel 1); apply where it is offered.
-                    took = []
-                    for ch in self._channels:
-                        offered = [str(x) for x in self._sdr.listAntennas(self._SOAPY_SDR_RX, ch)]
-                        if want in offered or len(self._channels) == 1:
-                            self._sdr.setAntenna(self._SOAPY_SDR_RX, ch, want)
-                            took.append(f"ch{ch}={self._sdr.getAntenna(self._SOAPY_SDR_RX, ch)}")
-                    if took:
-                        print(f"[soapy] antenna -> {' '.join(took)} (asked {want})", flush=True)
-                    else:
-                        print(f"[soapy] no channel offers antenna {want!r}", flush=True)
-                except Exception as e:
-                    print(f"[soapy] SET ANTENNA FAILED to {want}: {e!r}", flush=True)
-            while self._setting_to:
-                key, want = self._setting_to.popitem()
-                try:
-                    self._sdr.writeSetting(key, want)
-                    # Read it back: this driver's setters lie (see _verify_stream).
-                    got = str(self._sdr.readSetting(key))
-                    if got != str(want):
-                        print(f"[soapy] setting {key}: asked {want!r}, device "
-                              f"reports {got!r}", flush=True)
-                    else:
-                        print(f"[soapy] setting {key} -> {got}", flush=True)
-                    # A SETTING CAN MOVE THE GAIN, AND THIS DRIVER CANNOT SAY BY
-                    # HOW MUCH.
-                    #
-                    # rfgain_sel is the LNA state: on an RSPdx, 28 steps of
-                    # front-end attenuation worth tens of dB, written through
-                    # here rather than through set_gain. So self.gain_db keeps
-                    # whatever the operator last asked for while the real front
-                    # end moves underneath it, and since dbm_offset_for backs
-                    # gain out of BOTH scales, every dBm figure shifts with it.
-                    #
-                    # Reading getGain() back after the write -- which is what the
-                    # set_gain path does, and what was tried here first -- makes
-                    # it WORSE. Swept live on an RSPdx-R2 at 3.7 MHz
-                    # (2026-08-31), rfgain_sel 0 -> 10:
-                    #
-                    #   uncompensated  floor slid -86.0 -> -111.6 dBm  (25.6 dB)
-                    #   getGain said   12.0 -> 22.0 dB, i.e. gain went UP
-                    #   compensated    floor slid -86.0 -> -121.6 dBm  (35.4 dB)
-                    #
-                    # More attenuation cannot be more gain, and 10 dB is not
-                    # 25.6 dB either: this driver reports LNA-state gain with the
-                    # wrong sign AND the wrong magnitude, so "correcting" by it
-                    # added its 10 dB error on top of the real slide. The setters
-                    # lie (see _verify_stream) and so does this getter.
-                    #
-                    # Compensating honestly needs the per-band LNA-state dB table
-                    # from the SDRplay API, which Soapy does not expose. Until
-                    # then, say so and leave the number alone: the dBm scale is
-                    # calibrated for the LNA state it was calibrated at.
-                    if str(key) == "rfgain_sel" and str(got) != str(self._lna_state):
-                        print(f"[soapy] rfgain_sel {self._lna_state} -> {got}: the "
-                              f"dBm scale is calibrated for LNA state "
-                              f"{self._lna_cal_state} and does NOT track this. "
-                              f"Re-trim, or compare levels only within one state.",
-                              flush=True)
-                        self._lna_state = str(got)
-                except Exception as e:
-                    print(f"[soapy] SET {key}={want!r} FAILED: {e!r}", flush=True)
-            # ── REOPEN A DROPPED DEVICE INSTEAD OF GOING OFF THE AIR ──────
-            # Set by either liveness test below. See _recover_device for why
-            # reopening is the only way back once the driver has stopped.
-            if need_recover:
-                need_recover = False
-                # Back off once attempts start failing: a radio that is really
-                # unplugged should cost one log line every half minute, not one
-                # every five seconds, and it costs nothing to keep trying — so
-                # plugging it back in is enough on its own, with no restart.
-                _wait = min(_RECOVER_RETRY_S * max(1, recover_fail),
-                            _RECOVER_RETRY_MAX_S)
-                if _time.monotonic() - last_recover >= _wait:
-                    last_recover = _time.monotonic()
-                    recover_n += 1
-                    if recover_fail == 0 or recover_n % 10 == 0:
-                        print(f"[soapy] stream is dead — restarting it "
-                              f"(attempt {recover_n})", flush=True)
-                    try:
-                        ok = self._recover_device()
+                        for ch in self._channels:      # together, or the pair is not coherent
+                            self._sdr.setFrequency(self._SOAPY_SDR_RX, ch, want)
+                        # READ IT BACK. A silent 'except: pass' here left the tuner
+                        # wherever it was while every layer above believed the retune
+                        # had happened — the panadapter, the slice and AE all showed
+                        # the new frequency and the receiver was still on the old one.
+                        # Same lesson as setSampleRate: never trust a setter on this
+                        # driver, and never swallow its failure.
+                        try:
+                            got = float(self._sdr.getFrequency(self._SOAPY_SDR_RX, 0))
+                        except Exception:
+                            got = want
+                        self.center_hz = got
+                        if abs(got - want) > 1000.0:
+                            print(f"[soapy] RETUNE MISMATCH: asked {want/1e6:.6f} MHz, "
+                                  f"tuner reports {got/1e6:.6f} MHz", flush=True)
+                        else:
+                            print(f"[soapy] tuned to {got/1e6:.6f} MHz", flush=True)
                     except Exception as e:
-                        ok = False
-                        print(f"[soapy] stream restart raised: {e!r}", flush=True)
-                    if ok:
-                        print(f"[soapy] stream restarted after {recover_n} "
-                              f"attempt(s) — back on the air (verified by a live "
-                              f"block, not by activateStream's word)", flush=True)
-                        consec_err = recover_fail = 0
-                        err_since = 0.0
-                        last_sig = None
-                        fresh_at = _time.monotonic()
-                        self.device_lost = False
-                        self.device_lost_reason = ""
-                        continue
-                    if not self.device_lost:
-                        print("[soapy] the restarted stream produced no samples — "
-                              "the radio is not there. Still retrying.", flush=True)
-                    recover_fail += 1
-                    self.device_lost = True
-                    self.device_lost_reason = (
-                        "the SDR stopped responding and its stream could not be "
-                        "restarted")
-            _t0 = _time.perf_counter() if _prof else 0.0
-            sr = self._sdr.readStream(self._stream, [buf], CHUNK, timeoutUs=200000)
-            n = sr.ret if hasattr(sr, "ret") else (sr[0] if isinstance(sr, tuple) else 0)
-            if _prof:
-                _t_read += _time.perf_counter() - _t0
-                if n > 0: _n_data += 1
-                elif n == 0: _n_none += 1
-                else: _n_err += 1
-            if n > 0:
-                consec_err = 0              # a good read clears the backoff
-                err_since = 0.0
-                # LIVENESS BY CONTENT, NOT BY RETURN CODE. Two samples are
-                # enough to tell one block of live IQ from another and cost
-                # nothing per block; comparing the whole buffer would not be
-                # affordable at ~500 blocks/s. Identical consecutive blocks mean
-                # the hardware has stopped feeding us even though the driver
-                # says otherwise.
-                _sig = float(abs(buf[0])) + float(abs(buf[n // 2]))
-                _now = _time.monotonic()
-                if _sig != last_sig:
-                    last_sig = _sig
-                    fresh_at = _now
-                elif (not self.device_lost) and (_now - fresh_at) >= _STALE_AFTER_S:
-                    # Same fault as a hard read error, just wearing a success
-                    # code — so it gets the same treatment: try to reopen before
-                    # telling AE the radio is gone.
-                    need_recover = True
-                    print(f"[soapy] IQ has not changed for {_now - fresh_at:.1f}s "
-                          f"while readStream still reports success — restarting "
-                          f"the stream",
+                        print(f"[soapy] RETUNE FAILED to {want/1e6:.6f} MHz: {e!r} "
+                              f"(still on {self.center_hz/1e6:.6f} MHz)", flush=True)
+                    self._retune_to = None
+                # apply any pending gain change on this thread, for the same reason
+                if self._gain_to is not None:
+                    want = float(self._gain_to)
+                    self._gain_to = None
+                    try:
+                        for ch in self._channels:
+                            self._sdr.setGain(self._SOAPY_SDR_RX, ch, want)
+                        # Read it back — this driver's setters lie (see _verify_stream).
+                        got = float(self._sdr.getGain(self._SOAPY_SDR_RX, 0))
+                        self.gain_db = got          # keeps read_meters' gain term honest
+                        if self.agc:
+                            print(f"[soapy] gain -> {got:.1f} dB, but AGC IS ON so the "
+                                  f"hardware will override it", flush=True)
+                        else:
+                            print(f"[soapy] gain -> {got:.1f} dB (asked {want:.1f})",
+                                  flush=True)
+                    except Exception as e:
+                        print(f"[soapy] SET GAIN FAILED at {want:.1f} dB: {e!r} "
+                              f"(still {self.gain_db:.1f} dB)", flush=True)
+                # apply any pending sample-rate change on this thread, for the same
+                # reason — and because it has to bracket setupStream/activateStream.
+                if (self._rate_to is not None
+                        and _time.monotonic() - self._rate_req_at >= RATE_DEBOUNCE_S):
+                    want = float(self._rate_to)
+                    if abs(want - self.samp_rate) > 1.0:
+                        self._apply_samp_rate(want)
+                    self._rate_to = None            # cleared LAST: it is set_samp_rate's done-signal
+                # Device settings + antenna port, same thread for the same reason.
+                # No debounce: these are discrete toggles, not a drag, and none of
+                # them restarts the stream.
+                if self._antenna_to is not None:
+                    want = self._antenna_to
+                    self._antenna_to = None
+                    try:
+                        if len(self._channels) == 1:
+                            # Single tuner: set it unconditionally, exactly as before
+                            # a driver that doesn't offer listAntennas (e.g. rtlsdr)
+                            # must not lose an antenna change that used to work.
+                            self._sdr.setAntenna(self._SOAPY_SDR_RX, 0, want)
+                            print(f"[soapy] antenna -> "
+                                  f"{self._sdr.getAntenna(self._SOAPY_SDR_RX, 0)} "
+                                  f"(asked {want})", flush=True)
+                        else:
+                            # Dual tuner: each channel owns its own ports (Tuner 1
+                            # on channel 0, Tuner 2 on channel 1); apply where offered.
+                            took = []
+                            for ch in self._channels:
+                                offered = [str(x) for x in self._sdr.listAntennas(self._SOAPY_SDR_RX, ch)]
+                                if want in offered:
+                                    self._sdr.setAntenna(self._SOAPY_SDR_RX, ch, want)
+                                    took.append(f"ch{ch}={self._sdr.getAntenna(self._SOAPY_SDR_RX, ch)}")
+                            if took:
+                                print(f"[soapy] antenna -> {' '.join(took)} (asked {want})", flush=True)
+                            else:
+                                print(f"[soapy] no channel offers antenna {want!r}", flush=True)
+                    except Exception as e:
+                        print(f"[soapy] SET ANTENNA FAILED to {want}: {e!r}", flush=True)
+                while self._setting_to:
+                    key, want = self._setting_to.popitem()
+                    try:
+                        self._sdr.writeSetting(key, want)
+                        # Read it back: this driver's setters lie (see _verify_stream).
+                        got = str(self._sdr.readSetting(key))
+                        if got != str(want):
+                            print(f"[soapy] setting {key}: asked {want!r}, device "
+                                  f"reports {got!r}", flush=True)
+                        else:
+                            print(f"[soapy] setting {key} -> {got}", flush=True)
+                        # A SETTING CAN MOVE THE GAIN, AND THIS DRIVER CANNOT SAY BY
+                        # HOW MUCH.
+                        #
+                        # rfgain_sel is the LNA state: on an RSPdx, 28 steps of
+                        # front-end attenuation worth tens of dB, written through
+                        # here rather than through set_gain. So self.gain_db keeps
+                        # whatever the operator last asked for while the real front
+                        # end moves underneath it, and since dbm_offset_for backs
+                        # gain out of BOTH scales, every dBm figure shifts with it.
+                        #
+                        # Reading getGain() back after the write -- which is what the
+                        # set_gain path does, and what was tried here first -- makes
+                        # it WORSE. Swept live on an RSPdx-R2 at 3.7 MHz
+                        # (2026-08-31), rfgain_sel 0 -> 10:
+                        #
+                        #   uncompensated  floor slid -86.0 -> -111.6 dBm  (25.6 dB)
+                        #   getGain said   12.0 -> 22.0 dB, i.e. gain went UP
+                        #   compensated    floor slid -86.0 -> -121.6 dBm  (35.4 dB)
+                        #
+                        # More attenuation cannot be more gain, and 10 dB is not
+                        # 25.6 dB either: this driver reports LNA-state gain with the
+                        # wrong sign AND the wrong magnitude, so "correcting" by it
+                        # added its 10 dB error on top of the real slide. The setters
+                        # lie (see _verify_stream) and so does this getter.
+                        #
+                        # Compensating honestly needs the per-band LNA-state dB table
+                        # from the SDRplay API, which Soapy does not expose. Until
+                        # then, say so and leave the number alone: the dBm scale is
+                        # calibrated for the LNA state it was calibrated at.
+                        if str(key) == "rfgain_sel" and str(got) != str(self._lna_state):
+                            print(f"[soapy] rfgain_sel {self._lna_state} -> {got}: the "
+                                  f"dBm scale is calibrated for LNA state "
+                                  f"{self._lna_cal_state} and does NOT track this. "
+                                  f"Re-trim, or compare levels only within one state.",
+                                  flush=True)
+                            self._lna_state = str(got)
+                    except Exception as e:
+                        print(f"[soapy] SET {key}={want!r} FAILED: {e!r}", flush=True)
+                # ── REOPEN A DROPPED DEVICE INSTEAD OF GOING OFF THE AIR ──────
+                # Set by either liveness test below. See _recover_device for why
+                # reopening is the only way back once the driver has stopped.
+                if need_recover:
+                    need_recover = False
+                    # Back off once attempts start failing: a radio that is really
+                    # unplugged should cost one log line every half minute, not one
+                    # every five seconds, and it costs nothing to keep trying — so
+                    # plugging it back in is enough on its own, with no restart.
+                    _wait = min(_RECOVER_RETRY_S * max(1, recover_fail),
+                                _RECOVER_RETRY_MAX_S)
+                    if _time.monotonic() - last_recover >= _wait:
+                        last_recover = _time.monotonic()
+                        recover_n += 1
+                        if recover_fail == 0 or recover_n % 10 == 0:
+                            print(f"[soapy] stream is dead — restarting it "
+                                  f"(attempt {recover_n})", flush=True)
+                        try:
+                            ok = self._recover_device()
+                        except Exception as e:
+                            ok = False
+                            print(f"[soapy] stream restart raised: {e!r}", flush=True)
+                        if ok:
+                            print(f"[soapy] stream restarted after {recover_n} "
+                                  f"attempt(s) — back on the air (verified by a live "
+                                  f"block, not by activateStream's word)", flush=True)
+                            consec_err = recover_fail = 0
+                            err_since = 0.0
+                            last_sig = None
+                            fresh_at = _time.monotonic()
+                            self.device_lost = False
+                            self.device_lost_reason = ""
+                            continue
+                        if not self.device_lost:
+                            print("[soapy] the restarted stream produced no samples — "
+                                  "the radio is not there. Still retrying.", flush=True)
+                        recover_fail += 1
+                        self.device_lost = True
+                        self.device_lost_reason = (
+                            "the SDR stopped responding and its stream could not be "
+                            "restarted")
+                _t0 = _time.perf_counter() if _prof else 0.0
+                sr = self._sdr.readStream(self._stream, [buf], CHUNK, timeoutUs=200000)
+                n = sr.ret if hasattr(sr, "ret") else (sr[0] if isinstance(sr, tuple) else 0)
+                if _prof:
+                    _t_read += _time.perf_counter() - _t0
+                    if n > 0: _n_data += 1
+                    elif n == 0: _n_none += 1
+                    else: _n_err += 1
+                if n > 0:
+                    consec_err = 0              # a good read clears the backoff
+                    err_since = 0.0
+                    # LIVENESS BY CONTENT, NOT BY RETURN CODE. Two samples are
+                    # enough to tell one block of live IQ from another and cost
+                    # nothing per block; comparing the whole buffer would not be
+                    # affordable at ~500 blocks/s. Identical consecutive blocks mean
+                    # the hardware has stopped feeding us even though the driver
+                    # says otherwise.
+                    _sig = float(abs(buf[0])) + float(abs(buf[n // 2]))
+                    _now = _time.monotonic()
+                    if _sig != last_sig:
+                        last_sig = _sig
+                        fresh_at = _now
+                    elif (not self.device_lost) and (_now - fresh_at) >= _STALE_AFTER_S:
+                        # Same fault as a hard read error, just wearing a success
+                        # code — so it gets the same treatment: try to reopen before
+                        # telling AE the radio is gone.
+                        need_recover = True
+                        print(f"[soapy] IQ has not changed for {_now - fresh_at:.1f}s "
+                              f"while readStream still reports success — restarting "
+                              f"the stream",
+                              flush=True)
+                        fresh_at = _now         # don't re-fire on every block
+                    block = buf[:n].copy()
+                    audio = block
+                    if self._div is not None:
+                        # dual tuner: the same count from B, then align; the pan
+                        # sees the combined block and the demod the aligned pair
+                        b = self._read_exact_b(n)
+                        if b is None:
+                            # B lost samples that A did not: the pair is no longer
+                            # a pair. Re-measure, AND count it as a read error like
+                            # a failed A read — otherwise a dead channel B is total
+                            # silence with /status still reporting healthy, and the
+                            # realign is re-requested every iteration without ever
+                            # tripping device_lost (F5).
+                            self._div.request_realign("channel B read failed")
+                            _note_read_error()
+                            continue
+                        block, audio = self._div.ingest(block, b)
+                    with self._lock:
+                        self._latest = block        # for the meters (latest is fine)
+                        self._pan_ring.append(block)
+                    self._queue_audio(audio)        # for the demod (continuous — every block consumed)
+                elif n < 0:
+                    if self._div is not None and n == -4:   # SOAPY_SDR_OVERFLOW: A's ring was flushed
+                        self._div.request_realign("overflow on channel A")
+                    # BACK OFF ON A PERSISTENT ERROR, AND GIVE UP ON A DEAD DEVICE
+                    # (_note_read_error): a 1 ms retry is right for a transient
+                    # overflow/timeout, which is what this branch was written for.
+                    # It is badly wrong when the device has GONE - unplugged, or
+                    # reset by the host - because that never recovers, and the loop
+                    # then spins at ~1 kHz forever printing the driver's error each
+                    # time. Measured twice on 2026-08-11: 42,291 lines filled a
+                    # Pi 5's 2 GB /tmp, and an RSP swap left 185,927 on a Pi 4.
+                    # Meanwhile AE keeps painting the last frame it received, so
+                    # the operator sees a FROZEN display rather than an error.
+                    _note_read_error()
+                    continue
+                if _prof:
+                    _tn = _time.monotonic()
+                    if _tn - _plast >= 5.0:
+                        _el = _tn - _plast
+                        _tot = _n_data + _n_none + _n_err
+                        print(f"[prof-read] {_n_data/_el:6.1f} blocks/s "
+                              f"(data={_n_data} ret0={_n_none} err={_n_err}) "
+                              f"| readStream {_t_read/max(1,_tot)*1000:6.2f} ms avg "
+                              f"| samples {_n_data*CHUNK/_el:9.0f}/s (rate {self.samp_rate:.0f})",
+                              flush=True)
+                        _n_data = _n_none = _n_err = 0
+                        _t_read = 0.0
+                        _plast = _tn
+            except Exception as e:
+                # Anything unexpected from the block above (e.g. a numpy raise out of
+                # _div.ingest/observe) must not kill this thread silently -- device_lost
+                # would stay False while the radio goes quiet forever (F4). Log the
+                # distinct failure at most once per 5 s (a tight raise loop must not
+                # refill the log the way the read-error branch above already guards
+                # against) and keep the reader running.
+                _msg = f"{type(e).__name__}: {e}"
+                _now_exc = _time.monotonic()
+                if _msg != _last_exc_msg or (_now_exc - _last_exc_log_t) >= 5.0:
+                    print(f"[soapy] read loop iteration raised: {_msg} -- continuing",
                           flush=True)
-                    fresh_at = _now         # don't re-fire on every block
-                block = buf[:n].copy()
-                audio = block
-                if self._div is not None:
-                    # dual tuner: the same count from B, then align; the pan
-                    # sees the combined block and the demod the aligned pair
-                    b = self._read_exact_b(n)
-                    if b is None:
-                        # B lost samples that A did not: the pair is no longer
-                        # a pair. Drop this block of A too and re-measure.
-                        self._div.request_realign("channel B read failed")
-                        continue
-                    block, audio = self._div.ingest(block, b)
-                with self._lock:
-                    self._latest = block        # for the meters (latest is fine)
-                    self._pan_ring.append(block)
-                self._queue_audio(audio)        # for the demod (continuous — every block consumed)
-            elif n < 0:
-                if self._div is not None and n == -4:   # SOAPY_SDR_OVERFLOW: A's ring was flushed
-                    self._div.request_realign("overflow on channel A")
-                # BACK OFF ON A PERSISTENT ERROR, AND GIVE UP ON A DEAD DEVICE.
-                #
-                # A 1 ms retry is right for a transient overflow/timeout, which
-                # is what this branch was written for. It is badly wrong when
-                # the device has GONE - unplugged, or reset by the host - because
-                # that never recovers, and the loop then spins at ~1 kHz forever
-                # printing the driver's error each time. Measured twice on
-                # 2026-08-11: 42,291 lines filled a Pi 5's 2 GB /tmp, and an
-                # RSP swap left 185,927 on a Pi 4. Meanwhile AE keeps painting
-                # the last frame it received, so the operator sees a FROZEN
-                # display rather than an error.
-                consec_err += 1
-                if err_since == 0.0:
-                    err_since = _time.monotonic()
-                if consec_err <= _ERR_FAST:
-                    time.sleep(0.001)       # transient: retry immediately
-                else:
-                    # Escalate 10 ms -> 1 s so a long outage costs almost
-                    # nothing, while a brief one still recovers quickly.
-                    time.sleep(min(0.01 * (2 ** min(consec_err - _ERR_FAST, 7)), 1.0))
-                    if consec_err == _ERR_FAST + 1 or consec_err % 200 == 0:
-                        print(f"[soapy] read error x{consec_err} — backing off "
-                              f"(device unplugged or reset?)", flush=True)
-                    # Tell the core EARLY. Waiting for the give-up would leave
-                    # AE staring at a frozen waterfall for half an hour; a few
-                    # seconds of solid failure is already enough to say the
-                    # radio is not there.
-                if err_since and _time.monotonic() - err_since >= _RECOVER_AFTER_S:
-                    need_recover = True
-                if (not self.device_lost and err_since
-                        and _time.monotonic() - err_since >= _DEVICE_LOST_AFTER_S):
-                    self.device_lost = True
-                    self.device_lost_reason = (
-                        "the SDR stopped responding (unplugged, or reset by the host)")
-                if consec_err >= _ERR_GIVE_UP:
-                    # Stop rather than spin forever. The gate stays up and AE
-                    # sees the stream end, which is honest; a restart (or a
-                    # reconnect from the setup page) re-opens the device.
-                    print(f"[soapy] giving up after {consec_err} consecutive read "
-                          f"errors — the device is gone. Restart the gate once it "
-                          f"is plugged back in.", flush=True)
-                    self.device_lost = True
-                    self.device_lost_reason = (
-                        f"the SDR stopped responding after {consec_err} read errors "
-                        f"(unplugged, or reset by the host)")
-                    self._run = False
-                continue
-            if _prof:
-                _tn = _time.monotonic()
-                if _tn - _plast >= 5.0:
-                    _el = _tn - _plast
-                    _tot = _n_data + _n_none + _n_err
-                    print(f"[prof-read] {_n_data/_el:6.1f} blocks/s "
-                          f"(data={_n_data} ret0={_n_none} err={_n_err}) "
-                          f"| readStream {_t_read/max(1,_tot)*1000:6.2f} ms avg "
-                          f"| samples {_n_data*CHUNK/_el:9.0f}/s (rate {self.samp_rate:.0f})",
-                          flush=True)
-                    _n_data = _n_none = _n_err = 0
-                    _t_read = 0.0
-                    _plast = _tn
+                    _last_exc_msg = _msg
+                    _last_exc_log_t = _now_exc
 
     @staticmethod
     def _factor_decim(D):
