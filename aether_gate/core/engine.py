@@ -3442,7 +3442,8 @@ function paintDivScopeText(s){{
   var nb=s.nb||{{}},cap=s.capture||{{}};
   var talk=s.talking?'<span style="color:#3c6">●</span>':'<span style="color:#555">○</span>';
   var line1='mode:'+pad(s.mode,6)+' '+talk+' talk_mod:'+(s.talk_mod!=null?s.talk_mod.toFixed(2):'—')
-    +' rn:'+pad(s.rn_source||'—',7)+' upd:'+(s.updates!=null?s.updates:0);
+    +' rn:'+pad(s.rn_source||'—',7)+' coh:'+(s.noise_coherence!=null?s.noise_coherence.toFixed(2):'—')
+    +' upd:'+(s.updates!=null?s.updates:0);
   var line2='aligned:'+(s.aligned?'yes':'no ')+' lag:'+(s.lag_samples!=null?s.lag_samples:'—')
     +' peak:'+(s.corr_peak!=null?s.corr_peak.toFixed(2):'—')
     +' nb:'+(nb.blanked_pct!=null?nb.blanked_pct.toFixed(1)+'%':'—')
