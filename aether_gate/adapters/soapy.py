@@ -1104,6 +1104,18 @@ class SoapyAdapter(RadioAdapter):
                 opts = [str(o) for o in info.options] if info.options else []
                 if opts:
                     item["options"] = opts
+                # The driver's own bounds for a numeric setting. Without them
+                # a panel has to guess a range, and a guess clamps in both
+                # directions: a write outside it is capped and a read-back
+                # outside it is displayed wrong. Only sent when the driver
+                # actually bounded it (Soapy's default range is 0..0).
+                try:
+                    r = info.range
+                    lo, hi, st = float(r.minimum()), float(r.maximum()), float(r.step())
+                    if hi > lo:
+                        item["range"] = {"min": lo, "max": hi, "step": st}
+                except Exception:
+                    pass
                 try:
                     item["value"] = str(self._sdr.readSetting(key))
                 except Exception:
