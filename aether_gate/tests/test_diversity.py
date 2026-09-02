@@ -12,8 +12,8 @@ import pytest
 
 from aether_gate.core.diversity import (
     ALIGN_MIN_PEAK, REFIT_MIN_GAIN_DB, TALK_HOLD_S, WEIGHT_MAX_ABS, Aligner,
-    Tracker, combine, find_lag, fit_max_snr, fit_null, weight_from_polar,
-    weight_to_polar,
+    TalkerMemory, Tracker, blank_impulses, combine, combine_ramp, find_lag,
+    fit_max_snr, fit_null, weight_from_polar, weight_to_polar,
 )
 
 RATE = 25_000.0
@@ -146,6 +146,28 @@ def test_fit_max_snr_beats_either_antenna_alone():
 
 # --- the tracker ------------------------------------------------------------
 
+def _cov(a, b):
+    X = np.vstack([a, b])
+    return (X @ X.conj().T) / X.shape[1]
+
+
+def _scene(rng, block, talker, white, qrm=(2.0, 0.9), talk_gain=1.2, t=None):
+    """(R_in, R_guard) for one block. The guard band sees the same noise
+    field (the QRM source at its bearing plus the isotropic floor) as the
+    passband, with its own independent waveform, and never the talker.
+    With t given the talker carries a 4 Hz syllabic envelope, as speech does."""
+    if t is not None:
+        talk_gain = talk_gain * (1.0 + 0.8 * np.cos(2 * np.pi * 4.0 * t))
+    q_in = _noise(rng, block, 1.0)
+    q_g = _noise(rng, block, 1.0)
+    srcs_in = [(q_in, qrm[0], qrm[1])]
+    if talker is not None:
+        srcs_in.append((talk_gain * _noise(rng, block), talker[0], talker[1]))
+    a, b = _two_channel(rng, block, srcs_in, white)
+    ga, gb = _two_channel(rng, block, [(q_g, qrm[0], qrm[1])], white)
+    return _cov(a, b), _cov(ga, gb)
+
+
 def _run(tracker, rng, seconds, talker, mode, block=1024, white=0.5):
     """Stream `seconds` of alternating quiet (0.6 s) and talking (1.0 s) blocks.
     talker = (angle, gain_b) of the wanted signal; a fixed noise source sits
@@ -155,12 +177,8 @@ def _run(tracker, rng, seconds, talker, mode, block=1024, white=0.5):
     while t < seconds:
         phase = t % 1.6
         talking = phase >= 0.6
-        qrm = _noise(rng, block, 1.0)
-        srcs = [(qrm, 2.0, 0.9)]
-        if talking:
-            srcs.append((1.2 * _noise(rng, block), talker[0], talker[1]))
-        a, b = _two_channel(rng, block, srcs, white)
-        tracker.update(a, b, mode)
+        R_in, R_g = _scene(rng, block, talker if talking else None, white, t=t)
+        tracker.update(R_in, R_g, block, mode)
         t += block / RATE
 
 
@@ -171,6 +189,7 @@ def test_tracker_learns_a_null_between_overs_and_a_beam_on_the_talker():
     assert tr.updates >= 1
     snr = tr.snr_db()
     assert snr["out"] > max(snr["a"], snr["b"]) + 6.0, snr
+    assert tr.rn_source in ("inband", "guard")
 
 
 def test_tracker_follows_a_new_talker_within_a_second():
@@ -196,9 +215,25 @@ def test_tracker_does_not_chatter_on_a_steady_scene():
     assert tr.updates - n <= 2, (n, tr.updates)
 
 
+def test_guard_band_gives_a_null_before_anyone_pauses():
+    """Someone is talking from the first block: no pause ever happens, yet the
+    guard band alone lets the null land on the noise source."""
+    rng = np.random.default_rng(16)
+    tr = Tracker(RATE)
+    block = 1024
+    for _ in range(int(1.0 * RATE / block)):
+        R_in, R_g = _scene(rng, block, (-0.7, 1.1), 0.05)
+        tr.update(R_in, R_g, block, "null")
+    assert tr.rn_source == "guard"
+    assert tr.updates >= 1
+    p_a = float(np.real(tr.Rn[0, 0]))
+    from aether_gate.core.diversity import _out_noise
+    assert 10 * np.log10(p_a / _out_noise(tr.m, tr.Rn)) > 10.0
+
+
 def test_refit_declines_without_enough_gain():
     tr = Tracker(RATE)
-    tr.Rn = np.eye(2, dtype=complex)                  # white, equal: nothing to null
+    tr.Rn_guard = np.eye(2, dtype=complex)            # white, equal: nothing to null
     assert tr.refit("null") is False
     assert tr.m == 0j and tr.updates == 0
     assert REFIT_MIN_GAIN_DB > 0
@@ -209,7 +244,7 @@ def test_null_refuses_to_select_the_quieter_antenna():
     quieter) the smallest eigenvector is 'B alone', which must not be adopted."""
     for pb in (0.5, 0.1, 1e-4):
         tr = Tracker(RATE)
-        tr.Rn = np.diag([1.0, pb]).astype(complex)
+        tr.Rn_guard = np.diag([1.0, pb]).astype(complex)
         assert tr.refit("null") is False, pb
         assert tr.m == 0j
 
@@ -221,10 +256,9 @@ def test_null_declines_when_it_would_cost_signal():
     sig = 0.5 * _noise(rng, n)
     a_n, b_n = _two_channel(rng, n, [(qrm, 1.1, 0.8)], white=0.05)
     a_s, b_s = _two_channel(rng, n, [(sig, 1.1, 0.8)], white=0.0)   # same bearing as the QRM
-    Xn = np.vstack([a_n, b_n]); X = np.vstack([a_n + a_s, b_n + b_s])
     tr = Tracker(RATE)
-    tr.Rn = (Xn @ Xn.conj().T) / n
-    tr.Rs = (X @ X.conj().T) / n
+    tr.Rn_guard = _cov(a_n, b_n)
+    tr.Rs = _cov(a_n + a_s, b_n + b_s)
     assert tr.refit("null") is False       # the null would land on the talker too
     tr.Rs = None
     assert tr.refit("null") is True        # with no signal knowledge it is a valid null
@@ -234,17 +268,16 @@ def test_weak_signal_below_the_vad_is_not_learned_as_noise():
     rng = np.random.default_rng(13)
     tr = Tracker(RATE)
     block = 1024
-    for _ in range(60):                                    # settle floor and Rn on noise
-        a, b = _two_channel(rng, block, [], white=1.0)
-        tr.update(a, b, "off")
-    Rn_before = tr.Rn.copy()
-    for _ in range(60):                                    # +1 dB coherent signal, one bearing
-        a, b = _two_channel(rng, block, [(np.sqrt(0.26) * _noise(rng, block), 0.9, 1.0)], white=1.0)
-        tr.update(a, b, "off")
+    for _ in range(60):                                    # settle on noise
+        R_in, R_g = _scene(rng, block, None, 1.0, qrm=(2.0, 0.0))
+        tr.update(R_in, R_g, block, "off")
+    for _ in range(160):                                   # +1.2 dB coherent signal, one bearing, > RN_INBAND_FRESH_S
+        R_in, R_g = _scene(rng, block, (0.9, 1.0), 1.0, qrm=(2.0, 0.0), talk_gain=np.sqrt(0.5))
+        tr.update(R_in, R_g, block, "off")
         assert not tr.talking
-    # Rn kept its (uncorrelated) shape: the signal's spatial signature was not booked.
+    # the in-band noise estimate went stale rather than learning the signal
+    assert tr.rn_source == "guard"
     assert abs(tr.Rn[0, 1]) < 0.05 * abs(tr.Rn[0, 0]), tr.Rn
-    assert np.allclose(np.diag(tr.Rn), np.diag(Rn_before), rtol=0.15)
 
 
 def test_a_short_burst_does_not_train_the_signal_covariance():
@@ -253,12 +286,82 @@ def test_a_short_burst_does_not_train_the_signal_covariance():
     block = 256                                            # ~10 ms, shorter than TALK_HOLD_S
     assert block / RATE < TALK_HOLD_S
     for _ in range(200):
-        a, b = _two_channel(rng, block, [], white=1.0)
-        tr.update(a, b, "track")
-    for _ in range(5):                                     # crash, quiet, crash, quiet ...
-        a, b = _two_channel(rng, block, [(30.0 * _noise(rng, block), 2.5, 1.0)], white=1.0)
-        tr.update(a, b, "track")
+        R_in, R_g = _scene(rng, block, None, 1.0)
+        tr.update(R_in, R_g, block, "track")
+    for _ in range(5):                                     # a crash every 200 ms
+        R_in, R_g = _scene(rng, block, (2.5, 1.0), 1.0, talk_gain=30.0)
+        tr.update(R_in, R_g, block, "track")
         assert tr.talking
-        a, b = _two_channel(rng, block, [], white=1.0)
-        tr.update(a, b, "track")
+        for _q in range(20):
+            R_in, R_g = _scene(rng, block, None, 1.0)
+            tr.update(R_in, R_g, block, "track")
     assert tr.Rs is None and tr.updates == 0
+
+
+# --- talker memory ------------------------------------------------------------
+
+def test_memory_steers_a_known_talker_in_one_block():
+    rng = np.random.default_rng(17)
+    mem = TalkerMemory()
+    tr = Tracker(RATE, memory=mem)
+    _run(tr, rng, 4.0, (-0.7, 1.1), "track")            # learn talker 1
+    m1 = tr.m
+    _run(tr, rng, 3.2, (0.5, 1.0), "track")             # learn talker 2
+    assert len(mem.entries) >= 2, mem.status(tr.t)
+    # talker 1 keys up again: the weight must jump back within TALK_HOLD_S + 2 blocks
+    block = 1024
+    for _ in range(5):                                     # a pause > TALK_HANG_S
+        R_in, R_g = _scene(rng, block, None, 0.5)
+        tr.update(R_in, R_g, block, "track")
+    n0 = tr.updates
+    for k in range(4):
+        R_in, R_g = _scene(rng, block, (-0.7, 1.1), 0.5)
+        tr.update(R_in, R_g, block, "track")
+    assert tr.updates > n0
+    assert abs(tr.m - m1) < 0.35 * max(1.0, abs(m1)), (tr.m, m1)
+    st = mem.status(tr.t)
+    assert all(set(e) == {"phase_deg", "ratio_db", "age_s", "hits"} for e in st)
+    mem.clear()
+    assert mem.entries == []
+
+
+def test_memory_matches_on_bearing_not_exact_vector():
+    mem = TalkerMemory()
+    s = np.array([1.0, 0.6 * np.exp(1j * 0.4)]); s = s / np.linalg.norm(s)
+    mem.store(s, 0.3 + 0.2j, now=0.0)
+    near = s * np.exp(1j * 1.0)                             # same bearing, common phase
+    assert mem.recall(near, now=1.0) == 0.3 + 0.2j
+    far = np.array([1.0, 0.6 * np.exp(1j * 2.5)]); far = far / np.linalg.norm(far)
+    assert mem.recall(far, now=1.0) is None
+    for k in range(20):
+        v = np.array([1.0, np.exp(1j * 0.3 * k)]) / np.sqrt(2)
+        mem.store(v, complex(k), now=float(k))
+    assert len(mem.entries) <= 8
+
+
+# --- ramps and the blanker -----------------------------------------------------
+
+def test_combine_ramp_ends_where_combine_is_and_has_no_step():
+    rng = np.random.default_rng(18)
+    n = 4096
+    a = _noise(rng, n); b = _noise(rng, n)
+    y = combine_ramp(a, b, 0j, 1.0 + 0j)
+    assert np.allclose(y[-1], combine(a, b, 1.0 + 0j)[-1], atol=1e-3 * abs(y[-1]) + 1e-9)
+    assert np.allclose(y[0], a[0], atol=1e-3 * abs(a[0]) + 1e-9)
+    assert np.allclose(combine_ramp(a, b, 0.5j, 0.5j), combine(a, b, 0.5j))
+
+
+def test_blanker_removes_an_impulse_from_both_channels_and_leaves_speech():
+    rng = np.random.default_rng(19)
+    n = 8192
+    a = _noise(rng, n); b = _noise(rng, n)
+    a[4000] += 60.0; b[4000] += 60.0 * np.exp(1j * 0.7)     # a 36 dB crash on both
+    oa, ob, frac = blank_impulses(a, b, 12.0)
+    assert oa[4000] == 0 and ob[4000] == 0 and oa[3998] == 0 and ob[4002] == 0
+    assert 0 < frac < 0.002
+    assert np.array_equal(oa[:3990], a[:3990])
+    # an AM carrier at 100 % modulation peaks 6 dB over its mean: untouched
+    t = np.arange(n) / RATE
+    c = (1 + np.cos(2 * np.pi * 400 * t)) * np.exp(2j * np.pi * 1000 * t)
+    ca, cb, frac = blank_impulses(c + 0.01 * a, c + 0.01 * b, 12.0)
+    assert frac == 0.0

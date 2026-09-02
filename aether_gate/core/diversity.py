@@ -30,14 +30,18 @@ Three pieces, each hardware-free and unit-tested on synthetic data:
                       same level whatever m is, which keeps the S-meter
                       and the audio AGC from jumping as the weight moves.
 
-  Tracker             Keeps a 2x2 noise covariance (updated between overs)
-                      and a 2x2 signal covariance (updated while someone is
-                      talking) of the demodulator's passband, and refits m
-                      every refresh interval: the smallest eigenvector of
-                      the noise covariance for "null", the generalised
-                      eigenvector that maximises SNR for "track". Both are
-                      closed form on a 2x2, so a refit costs microseconds
-                      and can follow a new talker within a syllable.
+  Tracker             Keeps a 2x2 noise covariance (from the empty bins just
+                      outside the filter, and from the passband between
+                      overs) and a 2x2 signal covariance (while someone is
+                      talking), and refits m every refresh interval: the
+                      smallest eigenvector of the noise covariance for
+                      "null", the generalised eigenvector that maximises SNR
+                      for "track". Both are closed form on a 2x2, so a refit
+                      costs microseconds and can follow a new talker within
+                      a syllable; a TalkerMemory makes a known talker
+                      instant.
+
+  blank_impulses      A two-channel noise blanker for the raw stream.
 """
 import math
 
@@ -89,6 +93,9 @@ NOISE_MAX_RATIO = 1.15              # ~ +0.6 dB
 # A static crash is many dB above the floor for a few milliseconds; booking
 # it would steer the beam at the lightning instead of the operator.
 TALK_HOLD_S = 0.05
+# ...and a dip shorter than this (the trough between two syllables) does not
+# end an over: the hold is not restarted, and the talker is not "new" again.
+TALK_HANG_S = 0.15
 
 
 def find_lag(a, b, max_lag):
@@ -236,67 +243,237 @@ def _to_multiplier(w):
     return m
 
 
+# The in-band noise covariance learned between overs is preferred over the
+# guard-band one (it alone sees co-channel QRM) while it is this fresh.
+RN_INBAND_FRESH_S = 5.0
+
+# A talker's spatial signature is recognised again when the squared cosine
+# between its steering vector and the remembered one is at least this.
+MEMORY_MATCH = 0.9
+MEMORY_MAX = 8
+
+# Only speech-like overs are remembered: the block-power modulation index
+# (std/mean over the last second) of speech is well above this, a steady
+# carrier's or a noise burst's is not.
+SPEECH_MIN_MOD = 0.3
+MOD_WINDOW_S = 1.0
+
+
+def combine_ramp(a, b, m0, m1):
+    """combine() with the weight gliding linearly from m0 to m1 over the block,
+    so a steering change never lands as a step (a click) in the audio."""
+    n = min(len(a), len(b))
+    if n == 0:
+        return a[:0]
+    if m0 == m1:
+        return combine(a[:n], b[:n], m1)
+    m = m0 + (m1 - m0) * (np.arange(n) / n)
+    return (a[:n] + m * b[:n]) / np.sqrt(1.0 + np.abs(m) ** 2)
+
+
+def blank_impulses(a, b, threshold_db, widen=2):
+    """A two-channel noise blanker on the raw aligned stream.
+
+    An impulse (lightning, powerline, an ignition) arrives on both antennas,
+    so it is detected on the SUM of their powers and blanked on both, which
+    keeps the pair coherent. The threshold is relative to the block's median
+    power, which a strong broadcast carrier raises only a few dB.
+    Returns (a, b, fraction_blanked); the inputs are not modified.
+    """
+    n = min(len(a), len(b))
+    if n == 0:
+        return a, b, 0.0
+    e = np.abs(a[:n]) ** 2 + np.abs(b[:n]) ** 2
+    med = float(np.median(e))
+    if med <= 0.0:
+        return a, b, 0.0
+    hit = e > med * (10.0 ** (float(threshold_db) / 10.0))
+    if not hit.any():
+        return a, b, 0.0
+    if widen > 0:
+        idx = np.flatnonzero(hit)
+        for d in range(-widen, widen + 1):
+            j = idx + d
+            hit[j[(j >= 0) & (j < n)]] = True
+    a = np.array(a[:n], copy=True); b = np.array(b[:n], copy=True)
+    a[hit] = 0; b[hit] = 0
+    return a, b, float(hit.mean())
+
+
+def steering_of(R):
+    """Unit principal eigenvector of a (signal) covariance: where it comes from."""
+    vals, vecs = np.linalg.eigh(R)
+    v = vecs[:, int(np.argmax(vals))]
+    ph = np.exp(-1j * np.angle(v[0])) if abs(v[0]) > 0 else 1.0
+    return v * ph                                    # first element real, positive
+
+
+class TalkerMemory:
+    """Spatial signatures of recent talkers and the weight that suited each.
+
+    When someone keys up, one block is enough to tell whether they are a
+    known voice (a known bearing, really); if so the weight jumps straight
+    to what worked last time instead of being re-learned over a refit cycle.
+    """
+
+    def __init__(self, max_n=MEMORY_MAX, match=MEMORY_MATCH):
+        self.max_n = int(max_n)
+        self.match = float(match)
+        self.entries = []                    # dicts: s, m, hits, last_seen
+
+    def recall(self, s, now):
+        best, best_c = None, 0.0
+        for e in self.entries:
+            c = abs(np.vdot(e["s"], s)) ** 2
+            if c > best_c:
+                best, best_c = e, c
+        if best is not None and best_c >= self.match:
+            best["hits"] += 1
+            best["last_seen"] = now
+            return best["m"]
+        return None
+
+    def store(self, s, m, now):
+        for e in self.entries:
+            if abs(np.vdot(e["s"], s)) ** 2 >= self.match:
+                e["s"], e["m"], e["last_seen"] = s, m, now
+                return
+        self.entries.append({"s": s, "m": m, "hits": 0, "last_seen": now})
+        if len(self.entries) > self.max_n:
+            self.entries.sort(key=lambda e: e["last_seen"])
+            del self.entries[0]
+
+    def clear(self):
+        self.entries = []
+
+    def status(self, now):
+        out = []
+        for e in sorted(self.entries, key=lambda e: -e["last_seen"]):
+            ph, ra = weight_to_polar(e["m"])
+            out.append({"phase_deg": round(ph, 1), "ratio_db": round(ra, 1),
+                        "age_s": round(max(0.0, now - e["last_seen"]), 1), "hits": int(e["hits"])})
+        return out
+
+
 class Tracker:
     """Estimates the passband covariances and refits the weight on a clock.
 
-    Feed it the two channels of the demodulator's passband, block by block,
-    at rate_hz. It decides for itself whether a block is "talking" (power
-    above the tracked floor) and books it into the signal covariance, or
-    quiet and books it into the noise covariance. Every refresh_s it refits
-    the weight for the requested mode, and adopts the new weight only if it
-    predicts at least REFIT_MIN_GAIN_DB of improvement over the current one.
+    Feed it, block by block, two 2x2 covariances of the slice's spectrum:
+    R_in over the bins the operator hears, and R_guard over the empty bins
+    just outside the filter. The guard band is noise by construction, so
+    the noise covariance is known from the first block without waiting for
+    a pause and can never contain the wanted signal; a local noise source
+    has the same spatial signature a few kHz away as in the passband. The
+    in-band covariance learned between overs is preferred while fresh,
+    because it alone sees co-channel QRM. "Talking" is in-band power over
+    guard power, which makes the VAD independent of the band's level.
+
+    Every refresh_s the weight is refitted for the requested mode and
+    adopted only if it predicts at least REFIT_MIN_GAIN_DB of improvement.
+    With a TalkerMemory attached, a recognised talker's weight is applied
+    in the block they key up in.
     """
 
     def __init__(self, rate_hz, refresh_s=0.25, noise_tc_s=2.0, signal_tc_s=0.3,
-                 floor_rise_s=8.0):
+                 memory=None):
         self.rate_hz = float(rate_hz)
         self.refresh_s = float(refresh_s)
         self.noise_tc_s = float(noise_tc_s)
         self.signal_tc_s = float(signal_tc_s)
-        self.floor_rise_s = float(floor_rise_s)
-        self.Rn = None
+        self.memory = memory
+        self.Rn_guard = None
+        self.Rn_in = None
         self.Rs = None
-        self.floor = None
         self.m = 0j
         self.updates = 0
         self.talking = False
+        self.talk_mod = None
+        self.t = 0.0                        # tracker time, seconds of signal seen
+        self._rn_in_t = -1e9
         self._since_fit = 0.0
         self._talk_s = 0.0
+        self._quiet_s = 0.0
+        self._onset_done = False
+        self._rs_n = 0
+        self._hist = []                     # (t, p_in) over the last MOD_WINDOW_S
 
     def _alpha(self, n, tc_s):
         """EMA coefficient for a block of n samples against a time constant."""
         return 1.0 - math.exp(-n / (self.rate_hz * tc_s)) if tc_s > 0 else 1.0
 
-    def update(self, a, b, mode):
-        n = min(len(a), len(b))
-        if n == 0:
+    @property
+    def rn_source(self):
+        if self.Rn_in is not None and self.t - self._rn_in_t <= RN_INBAND_FRESH_S:
+            return "inband"
+        return "guard" if self.Rn_guard is not None else None
+
+    @property
+    def Rn(self):
+        return self.Rn_in if self.rn_source == "inband" else self.Rn_guard
+
+    def update(self, R_in, R_guard, n, mode):
+        """One block: in-band and guard-band covariances, n samples of signal."""
+        if n <= 0 or R_in is None:
             return
-        X = np.vstack([np.asarray(a[:n], dtype=np.complex128),
-                       np.asarray(b[:n], dtype=np.complex128)])
-        R = (X @ X.conj().T) / n
-        p = float(np.real(np.trace(R))) / 2.0
-        if self.floor is None:
-            self.floor = p
-        elif p < self.floor:
-            self.floor += 0.3 * (p - self.floor)          # fast down
-        else:
-            self.floor += self._alpha(n, self.floor_rise_s) * (p - self.floor)
-        self.talking = p > VAD_RATIO * self.floor
+        R_in = np.asarray(R_in, dtype=np.complex128)
+        dt = n / self.rate_hz
+        self.t += dt
+        if R_guard is not None:
+            al = self._alpha(n, self.noise_tc_s)
+            R_guard = np.asarray(R_guard, dtype=np.complex128)
+            self.Rn_guard = R_guard if self.Rn_guard is None else (1 - al) * self.Rn_guard + al * R_guard
+        if self.Rn_guard is None:
+            return
+        p_in = float(np.real(np.trace(R_in))) / 2.0
+        p_ref = float(np.real(np.trace(self.Rn_guard))) / 2.0
+        self._hist.append((self.t, p_in))
+        while self._hist and self._hist[0][0] < self.t - MOD_WINDOW_S:
+            self._hist.pop(0)
+        self.talking = p_in > VAD_RATIO * p_ref
         if self.talking:
-            self._talk_s += n / self.rate_hz
+            self._talk_s += dt
+            self._quiet_s = 0.0
+            ps = np.array([p for _t, p in self._hist])
+            self.talk_mod = float(ps.std() / ps.mean()) if len(ps) >= 4 and ps.mean() > 0 else None
             if self._talk_s >= TALK_HOLD_S:
-                al = self._alpha(n, self.signal_tc_s)
-                self.Rs = R if self.Rs is None else (1 - al) * self.Rs + al * R
+                if not self._onset_done:
+                    # A new over: its covariance starts fresh (the previous
+                    # talker's is not evidence about this one) and is a
+                    # running mean until a time constant's worth has been
+                    # seen, so the beam can settle within a few syllables.
+                    self._onset_done = True
+                    self._rs_n = 0
+                    self.Rs = None
+                    self._recall(R_in, mode)
+                self._rs_n += 1
+                al = max(self._alpha(n, self.signal_tc_s), 1.0 / self._rs_n)
+                self.Rs = R_in if self.Rs is None else (1 - al) * self.Rs + al * R_in
         else:
-            self._talk_s = 0.0
-            ref = float(np.real(np.trace(self.Rn))) / 2.0 if self.Rn is not None else p
-            if p <= NOISE_MAX_RATIO * ref:
+            self._quiet_s += dt
+            if self._quiet_s >= TALK_HANG_S:
+                self._talk_s = 0.0
+                self._onset_done = False
+                self.talk_mod = None
+            if p_in <= NOISE_MAX_RATIO * p_ref:
                 al = self._alpha(n, self.noise_tc_s)
-                self.Rn = R if self.Rn is None else (1 - al) * self.Rn + al * R
-        self._since_fit += n / self.rate_hz
+                self.Rn_in = R_in if self.Rn_in is None else (1 - al) * self.Rn_in + al * R_in
+                self._rn_in_t = self.t
+        self._since_fit += dt
         if mode in ("null", "track") and self._since_fit >= self.refresh_s:
             self._since_fit = 0.0
             self.refit(mode)
+
+    def _recall(self, R_in, mode):
+        if self.memory is None or mode != "track":
+            return
+        Rn = self._loaded_noise()
+        S = R_in - Rn
+        if float(np.real(np.trace(S))) <= 0:
+            return
+        m = self.memory.recall(steering_of(S), self.t)
+        if m is not None and m != self.m:
+            self.m = m
+            self.updates += 1
 
     def _loaded_noise(self):
         Rn = self.Rn
@@ -329,6 +506,11 @@ class Tracker:
         if gain_db >= REFIT_MIN_GAIN_DB:
             self.m = cand
             self.updates += 1
+            if mode == "track" and self.memory is not None and self.talking \
+                    and self.talk_mod is not None and self.talk_mod >= SPEECH_MIN_MOD:
+                S = self.Rs - Rn
+                if float(np.real(np.trace(S))) > 0:
+                    self.memory.store(steering_of(S), cand, self.t)
             return True
         return False
 
