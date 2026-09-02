@@ -273,9 +273,17 @@ def _to_multiplier(w):
 RN_INBAND_FRESH_S = 5.0
 
 # A talker's spatial signature is recognised again when the squared cosine
-# between its steering vector and the remembered one is at least this.
-MEMORY_MATCH = 0.9
+# between its steering vector and the remembered one is at least this:
+# 0.75 is a 60 degree phase tolerance for equal-level antennas. Live on a
+# two-station QSO the fitted phase of one station scatters by 30-50
+# degrees between overs (signal coherence 0.7-0.9, phase drifting ~20
+# degrees in ten seconds), and 0.9 (36 degrees) filled all eight slots
+# with one station. Stations in a QSO sit 100+ degrees apart.
+MEMORY_MATCH = 0.75
 MEMORY_MAX = 8
+# On a match the remembered signature moves towards the new one by this
+# fraction, so a slowly drifting bearing is followed rather than re-added.
+MEMORY_MERGE = 0.3
 
 # Only speech-like overs are remembered: the block-power modulation index
 # (std/mean over the last second) of speech is well above this, a steady
@@ -365,8 +373,14 @@ class TalkerMemory:
 
     def store(self, s, m, now):
         for e in self.entries:
-            if abs(np.vdot(e["s"], s)) ** 2 >= self.match:
-                e["s"], e["m"], e["last_seen"] = s, m, now
+            c = np.vdot(e["s"], s)
+            if abs(c) ** 2 >= self.match:
+                # align the new vector's global phase to the stored one
+                # before blending, so the blend cannot cancel
+                s_al = s * (np.conj(c) / max(abs(c), 1e-12))
+                v = (1.0 - MEMORY_MERGE) * e["s"] + MEMORY_MERGE * s_al
+                e["s"] = v / max(np.linalg.norm(v), 1e-12)
+                e["m"], e["last_seen"] = m, now
                 return
         self.entries.append({"s": s, "m": m, "hits": 0, "last_seen": now})
         if len(self.entries) > self.max_n:
