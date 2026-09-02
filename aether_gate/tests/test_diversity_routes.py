@@ -67,11 +67,12 @@ class FakeDiversityAdapter:
         return dict(self._status)
 
     def set_diversity(self, mode=None, phase_deg=None, ratio_db=None, source=None, slice_id=None,
-                       nb=None, nb_db=None, pan=None, null_source=None, focus=None):
+                       nb=None, nb_db=None, pan=None, null_source=None, focus=None,
+                       subband=None):
         self.calls.append(("set", {"mode": mode, "phase_deg": phase_deg,
                                     "ratio_db": ratio_db, "source": source, "slice_id": slice_id,
                                     "nb": nb, "nb_db": nb_db, "pan": pan, "null_source": null_source,
-                                    "focus": focus}))
+                                    "focus": focus, "subband": subband}))
         if focus not in (None, "") and focus != 7:
             raise ValueError(f"unknown talker id {focus}")
         if mode is not None:
@@ -223,13 +224,13 @@ def test_set_forwards_every_given_param():
     a = FakeDiversityAdapter()
     _, port = _start(a)
     out = _get(port, "/diversity/set?mode=track&phase=45.5&ratio=-3.5&source=b&slice=1"
-                     "&nb=on&nb_db=18.5&pan=nulled&null_source=2")
+                     "&nb=on&nb_db=18.5&pan=nulled&null_source=2&subband=off")
     method, kwargs = a.calls[-1]
     assert method == "set"
     assert kwargs == {"mode": "track", "phase_deg": 45.5, "ratio_db": -3.5,
                        "source": "b", "slice_id": 1,
                        "nb": True, "nb_db": 18.5, "pan": "nulled", "null_source": 2,
-                       "focus": None}
+                       "focus": None, "subband": False}
     assert out["mode"] == "track" and out["source"] == "b"
 
 
@@ -240,7 +241,8 @@ def test_set_with_only_one_param_leaves_the_rest_unset():
     _, kwargs = a.calls[-1]
     assert kwargs == {"mode": None, "phase_deg": None, "ratio_db": 5.0,
                        "source": None, "slice_id": None,
-                       "nb": None, "nb_db": None, "pan": None, "null_source": None, "focus": None}
+                       "nb": None, "nb_db": None, "pan": None, "null_source": None, "focus": None,
+                       "subband": None}
 
 
 # ---- v2 /diversity/set params: nb, nb_db, pan, null_source ------------------
@@ -623,3 +625,11 @@ def test_spatial_and_finder_answer_not_supported_on_a_v1_adapter():
     _, port = _start(FakeDiversityAdapterNoV2())
     assert _get(port, "/diversity/spatial") == {"error": "not supported"}
     assert _get(port, "/diversity/finder") == {"error": "not supported"}
+
+
+def test_bad_subband_value_is_an_error():
+    a = FakeDiversityAdapter()
+    _, port = _start(a)
+    out = _get(port, "/diversity/set?subband=maybe")
+    assert "error" in out
+    assert not [c for c in a.calls if c[0] == "set"]

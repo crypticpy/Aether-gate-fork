@@ -708,7 +708,7 @@ class SoapyAdapter(RadioAdapter):
             m0, m1 = self._div.observe(slice_id, xa, xb)
             pa = self._passband(xa, chain, 0)
             pb = self._passband(xb, chain, 1)
-            y = _dv().combine_ramp(pa, pb, m0, m1)
+            y = self._div.combine_passband(slice_id, pa, pb, m0, m1, self._pd_rate)
         else:
             rot = self._nco_rotation(len(block))
             y = self._passband(block.astype(np.complex128) * rot, chain, 0)
@@ -1457,12 +1457,12 @@ class SoapyAdapter(RadioAdapter):
 
     def set_diversity(self, mode=None, phase_deg=None, ratio_db=None, source=None,
                       slice_id=None, nb=None, nb_db=None, pan=None, null_source=None,
-                      focus=None):
+                      focus=None, subband=None):
         if self._div is None:
             return {"available": False}
         return self._div.set(mode, phase_deg, ratio_db, source, slice_id,
                              nb=nb, nb_db=nb_db, pan=pan, null_source=null_source,
-                             focus=focus)
+                             focus=focus, subband=subband)
 
     def diversity_realign(self):
         if self._div is None:

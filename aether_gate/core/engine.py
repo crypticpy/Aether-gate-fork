@@ -3842,7 +3842,7 @@ def start_control_server(radio, port):
             # ---- RSPduo diversity: two coherent tuners combined into one RX ----
             # GET /diversity                            -> current mode/weight/alignment
             # GET /diversity/set?mode=&phase=&ratio=&source=&slice=&nb=&nb_db=&pan=&null_source=
-            #                                            -> apply what's present
+            #                    &focus=&subband=        -> apply what's present
             # GET /diversity/align                      -> re-measure the inter-tuner lag
             # GET /diversity/map                        -> coherence/level sweep for the panel
             # GET /diversity/spatial                    -> live per-bin phase/coherence/level rows
@@ -3910,6 +3910,11 @@ def start_control_server(radio, port):
                         if null_source < 0:
                             raise ValueError(f"null_source={q['null_source'][0]!r}")
                         kwargs["null_source"] = null_source
+                    if "subband" in q:
+                        sb = q["subband"][0]
+                        if sb not in ("on", "off"):
+                            raise ValueError(f"subband={sb!r}")
+                        kwargs["subband"] = sb == "on"
                     if "focus" in q:
                         # focus=<talker id> pins; focus=off releases (a blank
                         # value never reaches here: parse_qs drops it)

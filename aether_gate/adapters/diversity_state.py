@@ -49,6 +49,11 @@ def _fd():
     return finder
 
 
+def _sb():
+    from ..core import subband
+    return subband
+
+
 def _balance():
     from ..core import balance
     return balance
@@ -98,6 +103,9 @@ class _DiversityState:
         self.balance = _balance().LoopBalance()   # G7: a sick loop, said out loud
         self.nb_db = self.NB_DEFAULT_DB
         self.blanked_pct = 0.0
+        # per-bin refinement of the tracker's weight in the demod passband
+        self.subband_on = True
+        self.subbands = {}                  # sid -> SubbandCombiner
         # spatial map: rebuilt whenever the hardware centre or rate moves,
         # since its bins are absolute frequencies
         self.map = None
@@ -392,6 +400,9 @@ class _DiversityState:
             "updates": int(t.updates) if t is not None else 0,
             "nb": {"enabled": self.nb_on, "threshold_db": self.nb_db,
                    "blanked_pct": round(self.blanked_pct, 2)},
+            "subband": {"enabled": self.subband_on,
+                        **(self.subbands[sid].status() if sid in self.subbands
+                           else {"bins": 0, "extra_db": 0.0})},
             "sources": self._sources(),
             "memory": self.memory.status(time.monotonic()),
             "talker": self.memory.talker(time.monotonic()),
@@ -403,9 +414,39 @@ class _DiversityState:
             "slice_id": sid,
         }
 
+    def combine_passband(self, sid, pa, pb, m0, m1, rate_hz):
+        """The demod passband pair of slice sid -> one combined block.
+
+        In null/track with the sub-band refinement on, every bin gets its own
+        weight (core.subband): the tracker's wideband weight, refined to a
+        per-bin null wherever the learned noise has a direction, with the
+        talker's steering vector held distortionless. Otherwise, and whenever
+        the pair is not aligned, the wideband combiner with its click-free
+        ramp from m0 to m1."""
+        t = self.trackers.get(sid)
+        if (not self.subband_on or self.mode not in ("null", "track")
+                or not self.aligner.aligned or t is None):
+            return _dv().combine_ramp(pa, pb, m0, m1)
+        np = self.a._np
+        sb = self.subbands.get(sid)
+        if sb is None or sb.rate_hz != float(rate_hz):
+            sb = self.subbands[sid] = _sb().SubbandCombiner(rate_hz)
+        s = None
+        if t.Rs is not None and t.Rn is not None:
+            S = t.Rs - t.Rn
+            if float(np.real(np.trace(S))) > 0:
+                s = _dv().steering_of(S)
+        if s is None:
+            s = np.array([1.0, np.conj(m1)], dtype=np.complex128)    # the weight's own beam
+        return sb.process(pa, pb, m1, s, bool(t.talking))
+
     def set(self, mode=None, phase_deg=None, ratio_db=None, source=None, sid=None,
-            nb=None, nb_db=None, pan=None, null_source=None, focus=None):
+            nb=None, nb_db=None, pan=None, null_source=None, focus=None, subband=None):
         sid = self.active_slice if sid is None else int(sid)
+        if subband is not None:
+            self.subband_on = bool(subband)
+            if not self.subband_on:
+                self.subbands.clear()       # relearn from scratch when it comes back
         if mode is not None:
             mode = str(mode).lower()
             if mode not in self.MODES:

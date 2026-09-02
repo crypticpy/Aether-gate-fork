@@ -326,3 +326,40 @@ def test_spatial_and_finder_follow_the_map_and_carry_the_passband():
     st.a.center_hz += 50_000.0                             # retune rebuilds all three
     _feed_scene(st, rng, 1, [])
     assert st.live is not live and st.finder.fast_n == 1
+
+
+# --- the per-bin passband combiner ------------------------------------------
+def test_combine_passband_refines_only_in_track_or_null_and_reports_it():
+    from aether_gate.core.diversity import combine_ramp
+    from aether_gate.core.subband import NFFT
+    rng = np.random.default_rng(11)
+    st = _aligned_state(mode="USB")
+    rate = 25_000.0
+    pa = (rng.normal(size=2000) + 1j * rng.normal(size=2000))
+    pb = (rng.normal(size=2000) + 1j * rng.normal(size=2000))
+    m = 0.5 + 0.2j
+    # off / manual: the wideband ramp, nothing learned, nothing reported
+    for mode in ("off", "manual"):
+        st.set(mode=mode)
+        y = st.combine_passband(0, pa, pb, m, m, rate)
+        assert np.allclose(y, combine_ramp(pa, pb, m, m))
+    assert st.subbands == {} and st.status()["subband"] == {"enabled": True, "bins": 0,
+                                                             "extra_db": 0.0}
+    # track with no tracker yet: still the ramp (nothing to refine against)
+    st.set(mode="track")
+    assert np.allclose(st.combine_passband(0, pa, pb, m, m, rate), combine_ramp(pa, pb, m, m))
+    # once the tracker exists the STFT path takes over: hop-sized output,
+    # a combiner per slice at the passband rate, status carries it
+    st.observe(0, pa[:1024].astype(np.complex128), pb[:1024].astype(np.complex128))
+    out = np.concatenate([st.combine_passband(0, pa, pb, m, m, rate) for _ in range(4)])
+    assert len(out) % (NFFT // 2) == 0 and len(out) >= 4 * 2000 - NFFT
+    assert 0 in st.subbands and st.subbands[0].rate_hz == rate
+    sb = st.status()["subband"]
+    assert sb["enabled"] is True and set(sb) == {"enabled", "bins", "extra_db"}
+    # a rate change (retune to another decimation) rebuilds the combiner
+    st.combine_passband(0, pa, pb, m, m, 50_000.0)
+    assert st.subbands[0].rate_hz == 50_000.0
+    # switching it off falls back to the ramp and forgets what was learned
+    st.set(subband=False)
+    assert st.subbands == {} and st.status()["subband"]["enabled"] is False
+    assert np.allclose(st.combine_passband(0, pa, pb, m, m, rate), combine_ramp(pa, pb, m, m))
