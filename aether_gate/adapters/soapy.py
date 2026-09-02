@@ -1475,6 +1475,16 @@ class SoapyAdapter(RadioAdapter):
             return {"available": False}
         return self._div.map_json()
 
+    def diversity_spatial(self):
+        if self._div is None:
+            return {"available": False}
+        return self._div.spatial_json()
+
+    def diversity_finder(self):
+        if self._div is None:
+            return {"available": False}
+        return self._div.finder_json()
+
     def diversity_capture(self, seconds):
         if self._div is None:
             raise RuntimeError("no dual-tuner stream")

@@ -97,6 +97,18 @@ class FakeDiversityAdapter:
         self._status["aligned"] = False
         return dict(self._status)
 
+    def diversity_spatial(self):
+        self.calls.append(("spatial", {}))
+        return {"available": True, "start_hz": 3500000.0, "step_hz": 1000.0, "points": 4,
+                "phase_deg": [0.0, 90.0, -120.0, 10.0], "coherence": [0.1, 0.9, 0.8, 0.2],
+                "level_db": [-90.0, -70.0, -72.0, -88.0], "passband_hz": None}
+
+    def diversity_finder(self):
+        self.calls.append(("finder", {}))
+        return {"available": True, "span_hz": [3500000.0, 3504000.0], "history_s": 42.0,
+                "points": 4, "activity": [0.0, 0.5, 0.5, 0.0],
+                "candidates": [{"hz": 3501300.0, "mode": "LSB", "score": 0.8}]}
+
     def diversity_map(self):
         self.calls.append(("map", {}))
         return {
@@ -143,6 +155,8 @@ class FakeDiversityAdapterNoV2(FakeDiversityAdapter):
     AttributeError."""
 
     diversity_map = None
+    diversity_spatial = None
+    diversity_finder = None
     diversity_capture = None
     diversity_memory_clear = None
     diversity_memory_name = None
@@ -591,3 +605,21 @@ def test_focus_pins_a_talker_releases_and_rejects_the_unknown():
     assert out["error"].startswith("bad value")
     out = _get(port, "/diversity/set?focus=bob")
     assert out["error"].startswith("bad value")
+
+
+# ---- /diversity/spatial and /diversity/finder ---------------------------
+
+def test_spatial_and_finder_routes_pass_the_adapter_answer_through():
+    a = FakeDiversityAdapter()
+    _, port = _start(a)
+    sp = _get(port, "/diversity/spatial")
+    assert sp["available"] and sp["points"] == 4 and sp["phase_deg"][1] == 90.0
+    fi = _get(port, "/diversity/finder")
+    assert fi["available"] and fi["candidates"][0]["hz"] == 3501300.0
+    assert ("spatial", {}) in a.calls and ("finder", {}) in a.calls
+
+
+def test_spatial_and_finder_answer_not_supported_on_a_v1_adapter():
+    _, port = _start(FakeDiversityAdapterNoV2())
+    assert _get(port, "/diversity/spatial") == {"error": "not supported"}
+    assert _get(port, "/diversity/finder") == {"error": "not supported"}

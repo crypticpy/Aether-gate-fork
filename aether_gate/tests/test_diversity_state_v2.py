@@ -300,3 +300,29 @@ def test_loop_balance_warns_only_after_a_gap_has_held():
 def test_status_carries_the_loop_balance():
     st = _aligned_state()
     assert st.status()["loops"] == {"b_minus_a_db": None, "warning": None}
+
+
+# --- live spatial rows and the finder ---------------------------------------
+
+def test_spatial_and_finder_follow_the_map_and_carry_the_passband():
+    rng = np.random.default_rng(21)
+    st = _DiversityState(_FakeAdapter())
+    assert st.spatial_json() == {"available": False}
+    assert st.finder_json() == {"available": False}
+    st.aligner.set_lag(0, 20.0, True)
+    _feed_scene(st, rng, 3, [(10_000.0, 14_000.0, 1.1, 0.9, 30.0)])
+    sj = st.spatial_json()
+    assert sj["available"] and sj["points"] == 512 and len(sj["phase_deg"]) == 512
+    assert sj["passband_hz"] is None
+    st.a._slice_hz = 3_610_000.0
+    assert st.spatial_json()["passband_hz"] == [3_610_000.0, 3_610_000.0 + 3_000.0]
+    fj = st.finder_json()
+    assert fj == {"available": False}                     # needs ~4 s of frames
+    _feed_scene(st, rng, 300, [])                          # ~10 s: the source is out of the ring
+    fj = st.finder_json()
+    assert fj["available"] and len(fj["activity"]) == 512
+    assert fj["candidates"] == [], "plain noise must never be a conversation"
+    live = st.live
+    st.a.center_hz += 50_000.0                             # retune rebuilds all three
+    _feed_scene(st, rng, 1, [])
+    assert st.live is not live and st.finder.fast_n == 1

@@ -3845,6 +3845,8 @@ def start_control_server(radio, port):
             #                                            -> apply what's present
             # GET /diversity/align                      -> re-measure the inter-tuner lag
             # GET /diversity/map                        -> coherence/level sweep for the panel
+            # GET /diversity/spatial                    -> live per-bin phase/coherence/level rows
+            # GET /diversity/finder                     -> where people are talking (ranked)
             # GET /diversity/capture?seconds=            -> start a diagnostic IQ capture
             # GET /diversity/memory/clear                -> forget remembered talker positions
             # GET /diversity/memory/name?id=&name=       -> label a remembered talker ('' clears)
@@ -3934,6 +3936,16 @@ def start_control_server(radio, port):
             if u.path == "/diversity/map":
                 a = radio.adapter
                 fn = (getattr(a, "diversity_map", None)
+                      if getattr(a, "diversity_available", False) else None)
+                if fn is None:
+                    return self._json({"error": "not supported"})
+                return self._json(fn())
+            if u.path in ("/diversity/spatial", "/diversity/finder"):
+                # live per-bin phase/coherence rows for the spatial waterfall,
+                # and the conversation finder's ranked candidates
+                a = radio.adapter
+                name = "diversity_spatial" if u.path.endswith("spatial") else "diversity_finder"
+                fn = (getattr(a, name, None)
                       if getattr(a, "diversity_available", False) else None)
                 if fn is None:
                     return self._json({"error": "not supported"})

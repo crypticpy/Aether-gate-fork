@@ -44,6 +44,11 @@ def _sp():
     return spatial
 
 
+def _fd():
+    from ..core import finder
+    return finder
+
+
 def _balance():
     from ..core import balance
     return balance
@@ -97,6 +102,8 @@ class _DiversityState:
         # since its bins are absolute frequencies
         self.map = None
         self._map_key = None
+        self.live = None                    # LiveSpatial: the span right now
+        self.finder = None                  # Finder: where people are talking
         self._win = {}                      # length -> Hann window
         # raw two-channel capture (see capture())
         self._cap_lock = threading.Lock()
@@ -195,10 +202,15 @@ class _DiversityState:
         key = (float(self.a.center_hz), float(self.a.samp_rate))
         if self.map is None or self._map_key != key:
             self.map = _sp().SpatialMap(n, self.a.samp_rate)
+            self.live = _fd().LiveSpatial(n, self.a.samp_rate)
+            self.finder = _fd().Finder(n, self.a.samp_rate)
             self._map_key = key
         w = self._window(n)
         X = np.fft.fft(np.stack([a[:n], b[:n]]) * w, axis=1)
-        self.map.update(X, len(a) / self.a.samp_rate)
+        frame_s = len(a) / self.a.samp_rate
+        self.map.update(X, frame_s)
+        self.live.update(X, frame_s)
+        self.finder.update(X, frame_s)
 
     def _nulled(self, a, b):
         """The pan block with every coherent bin steered to its own null and
@@ -324,15 +336,30 @@ class _DiversityState:
             return {"available": False, "coherence": [], "sources": []}
         out = self.map.map(float(self.a.center_hz))
         out["available"] = True
-        # where the receiver's passband sits inside the span, so a strip can
-        # mark it: absolute Hz, or None when the adapter has no slice yet
+        out["passband_hz"] = self._passband_hz()
+        return out
+
+    def _passband_hz(self):
+        """Where the receiver's passband sits inside the span, so a strip can
+        mark it: absolute Hz, or None when the adapter has no slice yet."""
         slice_hz = getattr(self.a, "_slice_hz", None)
         if slice_hz is None:
-            out["passband_hz"] = None
-        else:
-            lo, hi = self._pass_edges(getattr(self.a, "_mode", "USB"))
-            out["passband_hz"] = [float(slice_hz) + lo, float(slice_hz) + hi]
-        return out
+            return None
+        lo, hi = self._pass_edges(getattr(self.a, "_mode", "USB"))
+        return [float(slice_hz) + lo, float(slice_hz) + hi]
+
+    def spatial_json(self):
+        rows = self.live.rows(float(self.a.center_hz)) if self.live is not None else None
+        if rows is None:
+            return {"available": False}
+        rows["available"] = True
+        rows["passband_hz"] = self._passband_hz()
+        return rows
+
+    def finder_json(self):
+        if self.finder is None:
+            return {"available": False}
+        return self.finder.candidates(float(self.a.center_hz), self.live)
 
     def status(self, sid=None):
         sid = self.active_slice if sid is None else int(sid)
