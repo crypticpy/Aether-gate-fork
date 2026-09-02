@@ -1316,6 +1316,30 @@ class Radio:
             # status-pushed SUB slice is never rendered (AE only knows slices
             # it created or discovered via slice list).
             self.reply(conn, seq, " ".join(str(i) for i in sorted(self.slices)))
+        elif c.startswith("filt "):
+            # SmartSDR "filt <slice> <low> <high>" is how AE sends the filter
+            # width and shift (SliceModel::setFilterWidth -> FlexBackend::
+            # setSliceFilter). Until this branch existed the command fell
+            # through unanswered and the RX panel's filter was a picture.
+            parts = c.split()
+            try:
+                idx, lo, hi = int(parts[1]), float(parts[2]), float(parts[3])
+                if not (-20000.0 <= lo < hi <= 20000.0):
+                    raise ValueError("edges")
+            except (IndexError, ValueError):
+                log("[filt] rejected:", c)
+                self.reply(conn, seq, code=0x50000000)
+                return
+            self.reply(conn, seq)
+            if idx in self.slices and idx == self.active_slice and self.adapter is not None:
+                try:
+                    if hasattr(self.adapter, "set_filter_edges_hz"):
+                        self.adapter.set_filter_edges_hz(lo, hi)
+                    elif hasattr(self.adapter, "set_filter_width_hz"):
+                        self.adapter.set_filter_width_hz(hi - lo)
+                except Exception as e:
+                    log("[adapter] filt error:", e)
+                self.emit_slice_status(conn, idx)
         elif c.startswith("display panafall create") or c.startswith("display pan create"):
             pid = self._new_pan()                          # AE's +RX = a NEW stacked panadapter
             self.reply(conn, seq, f"0x{pid:08X},0x{self.pans[pid]['wf_id']:08X}")
@@ -2010,10 +2034,24 @@ class Radio:
         if self._tx_capable():
             is_tx = 1 if sl.get("active") else 0
             tx_fields = f" tx={is_tx} tx_ant=ANT1 tx_ant_list=ANT1"
+        # FILTER EDGES, RADIO-WINS: an adapter with its own passband filter
+        # says where its edges are (signed Hz from the carrier, the Flex
+        # convention: LSB is negative). AE reads filter_lo/filter_hi from slice
+        # status into SliceModel, so the passband it draws is the one heard.
+        filt_fields = ""
+        edges_fn = getattr(self.adapter, "filter_edges_hz", None)
+        if edges_fn is not None and idx == self.active_slice:
+            try:
+                edges = edges_fn()
+            except Exception as e:
+                log("[adapter] filter edges error:", e)
+                edges = None
+            if edges:
+                filt_fields = f" filter_lo={int(round(edges[0]))} filter_hi={int(round(edges[1]))}"
         self.status(conn, f"slice {idx} client_handle=0x{self.handle_hex} pan=0x{pid:08X} "
                           f"index_letter={letter} "
                           f"RF_frequency={sl['freq']:.6f} mode={sl['mode']} in_use=1 "
-                          f"active={1 if sl['active'] else 0}{tx_fields}")
+                          f"active={1 if sl['active'] else 0}{tx_fields}{filt_fields}")
 
     # SUB slice reserved index: primary receiver is slice 0, SUB is slice 1.
     SUB_SLICE = 1

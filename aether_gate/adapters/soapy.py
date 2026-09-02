@@ -1490,6 +1490,13 @@ class SoapyAdapter(RadioAdapter):
             self._filt.notch_add(add_hz, width_hz)
         return self.filter_status()
 
+    def filter_edges_hz(self):
+        """Signed passband edges in use (auto included), for slice status."""
+        if self._filt is None or self._is_fm_mode(self._mode):
+            return None
+        self._filt.lsb = (self._mode or "").upper().startswith("LSB")
+        return self._filt.edges()
+
     def set_filter_edges_hz(self, low_hz, high_hz):
         """AE's slice filter edges (signed Hz from the carrier): twin PBT."""
         if self._filt is not None:

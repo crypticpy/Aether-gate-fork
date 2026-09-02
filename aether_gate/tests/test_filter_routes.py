@@ -101,3 +101,80 @@ def test_notch_add_and_clear_forward():
     assert a.calls[-1][1]["clear"] is True and a.calls[-1][1]["clear_hz"] == 1000.0
     _get(port, "/filter/notch?clear=1")
     assert a.calls[-1][1] == {"add_hz": None, "width_hz": 140.0, "clear": True, "clear_hz": None}
+
+
+# ----- the slice exchange: edges in, edges out ---------------------------------
+class FakeConn:
+    def __init__(self):
+        self.out = bytearray()
+
+    def sendall(self, b):
+        self.out.extend(b)
+
+
+class EdgesAdapter:
+    """A sim adapter that also owns a passband filter."""
+
+    def __init__(self):
+        from aether_gate.adapters import SimAdapter
+        self._sim = SimAdapter(model="FLEX-6700")
+        self.edges = (-2700.0, -100.0)
+        self.set_calls = []
+
+    def __getattr__(self, name):
+        return getattr(self._sim, name)
+
+    def filter_edges_hz(self):
+        return self.edges
+
+    def set_filter_edges_hz(self, low_hz, high_hz):
+        self.set_calls.append((low_hz, high_hz))
+        self.edges = (low_hz, high_hz)
+
+
+def _radio_with(adapter):
+    from aether_gate.core import Radio
+    r = Radio("127.0.0.1", None, adapter=adapter, port=_free_port())
+    pid = r._new_pan()
+    r.slices[0] = {"freq": 7.204, "mode": "LSB", "active": True, "pan": pid}
+    r.active_slice = 0
+    return r
+
+
+def test_slice_status_carries_the_filters_edges_and_slice_set_moves_them():
+    a = EdgesAdapter()
+    r = _radio_with(a)
+    conn = FakeConn()
+    r.emit_slice_status(conn, 0)
+    text = conn.out.decode()
+    assert "filter_lo=-2700 filter_hi=-100" in text, text
+    r.on_line(conn, "C7|slice set 0 filter_low=-2400 filter_high=-300")
+    assert a.set_calls[-1] == (-2400.0, -300.0)
+    conn.out.clear()
+    r.emit_slice_status(conn, 0)
+    assert "filter_lo=-2400 filter_hi=-300" in conn.out.decode()
+
+
+def test_an_adapter_without_a_filter_emits_no_edges():
+    from aether_gate.adapters import SimAdapter
+    r = _radio_with(SimAdapter(model="FLEX-6700"))
+    conn = FakeConn()
+    r.emit_slice_status(conn, 0)
+    assert "filter_lo" not in conn.out.decode()
+
+
+def test_the_flex_filt_command_moves_the_edges_and_answers():
+    a = EdgesAdapter()
+    r = _radio_with(a)
+    conn = FakeConn()
+    r.on_line(conn, "C9|filt 0 -2400 -300")
+    text = conn.out.decode()
+    assert "R9|0|" in text
+    assert a.set_calls[-1] == (-2400.0, -300.0)
+    assert "filter_lo=-2400 filter_hi=-300" in text          # status follows the write
+    conn.out.clear()
+    r.on_line(conn, "C10|filt 0 300 abc")
+    assert "R10|50000000|" in conn.out.decode() and a.set_calls[-1] == (-2400.0, -300.0)
+    conn.out.clear()
+    r.on_line(conn, "C11|filt 0 2700 100")                    # low above high
+    assert "R11|50000000|" in conn.out.decode()
