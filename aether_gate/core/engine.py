@@ -2321,7 +2321,12 @@ class Radio:
                         and hasattr(self.adapter, "get_audio"):
                     # Aether-gate: real demodulated RF from the adapter at the active slice.
                     slice_hz = self.slice_freq * 1e6
-                    a = self.adapter.get_audio(AUDIO_FRAMES, slice_hz=slice_hz, mode=self.slice_mode)
+                    # RSPduo diversity: weights are per slice, so only an adapter that
+                    # actually knows about diversity gets the slice_id kwarg — adapters
+                    # whose get_audio predates it would raise on an unknown keyword.
+                    div_kw = {"slice_id": self.active_slice} \
+                        if getattr(self.adapter, "diversity_available", False) else {}
+                    a = self.adapter.get_audio(AUDIO_FRAMES, slice_hz=slice_hz, mode=self.slice_mode, **div_kw)
                     mono = a if a is not None else [0.0] * AUDIO_FRAMES   # silence while IQ fills
                 else:  # AUDIO_SRC_SILENCE (default) — no audio. The DEFAULT so the bench is quiet.
                     mono = [0.0] * AUDIO_FRAMES
@@ -3032,6 +3037,27 @@ h2{{color:#5cf}} label{{display:block;margin:16px 0 4px}} select,input[type=rang
   </div>
   <div id=resnote style="font-size:12px;color:#789;margin-top:7px">&nbsp;</div>
 </div>
+<div id=divbox style="background:#15202b;border:1px solid #243;border-radius:6px;padding:10px 12px;margin:0 0 14px;display:none">
+  <div style="display:flex;align-items:baseline;justify-content:space-between">
+    <b style="color:#5cf">Diversity</b><span class=v id=divmodev style="font-size:15px">&mdash;</span>
+  </div>
+  <div style="display:flex;gap:6px;margin-top:8px">
+    <button id=dm_off onclick="setDivMode('off')">Off</button>
+    <button id=dm_manual onclick="setDivMode('manual')">Manual</button>
+    <button id=dm_null onclick="setDivMode('null')">Null</button>
+    <button id=dm_track onclick="setDivMode('track')">Track</button>
+    <button onclick="divRealign()" style="margin-left:auto">&#8635; Realign</button>
+  </div>
+  <label style="margin:10px 0 3px;font-size:12px;color:#9ab">Phase: <span class=v id=divphasev>0</span>&deg;</label>
+  <input type=range id=divphase min=0 max=360 step=1 value=0 oninput=divPhaseInput()>
+  <label style="margin:10px 0 3px;font-size:12px;color:#9ab">Ratio: <span class=v id=divratiov>0</span> dB</label>
+  <input type=range id=divratio min=-20 max=20 step=0.5 value=0 oninput=divRatioInput()>
+  <label style="margin:10px 0 3px;font-size:12px;color:#9ab">Source</label>
+  <select id=divsource onchange=setDivSource()>
+    <option value=combined>Combined</option><option value=a>A</option><option value=b>B</option>
+  </select>
+  <div id=divnote style="font-size:12px;color:#789;margin-top:7px">&nbsp;</div>
+</div>
 <label>Pattern</label><select id=pat onchange=upd()>{options}</select>
 <div id=hint style="background:#15202b;border-left:3px solid #5cf;padding:8px 11px;margin:8px 0;font-size:13px;color:#bcd;line-height:1.45"></div>
 <label>Noise floor: <span class=v id=floorv>-120</span> dBm <span class=v id=floors>(S1)</span></label>
@@ -3246,6 +3272,46 @@ function pollStatus(){{fetch('/status').then(r=>r.json()).then(s=>{{
   document.getElementById('conn').textContent='sim unreachable';
 }});}}
 
+// ---- diversity (RSPduo two-tuner combine) ----
+function fmtSnr(v){{return v==null?'—':v.toFixed(1);}}
+function debounce(fn,ms){{var t=null;return function(){{var args=arguments;clearTimeout(t);
+  t=setTimeout(function(){{fn.apply(null,args);}},ms);}};}}
+function paintDiv(s){{
+  var box=document.getElementById('divbox');
+  if(!s||!s.available){{box.style.display='none';return;}}
+  box.style.display='block';
+  document.getElementById('divmodev').textContent=s.mode;
+  ['off','manual','null','track'].forEach(function(m){{
+    document.getElementById('dm_'+m).style.background=(s.mode===m?'#5cf':'');
+  }});
+  var active=document.activeElement?document.activeElement.id:'';
+  if(active!=='divphase'){{document.getElementById('divphase').value=s.phase_deg;
+    document.getElementById('divphasev').textContent=Math.round(s.phase_deg);}}
+  if(active!=='divratio'){{document.getElementById('divratio').value=s.ratio_db;
+    document.getElementById('divratiov').textContent=s.ratio_db;}}
+  if(active!=='divsource')document.getElementById('divsource').value=s.source;
+  var snr=s.snr_db||{{}};
+  document.getElementById('divnote').textContent='lag '+s.lag_samples+' samples · aligned '
+    +(s.aligned?'yes':'no')+' · corr peak '+(s.corr_peak!=null?s.corr_peak.toFixed(2):'—')
+    +' · SNR a/b/out '+fmtSnr(snr.a)+'/'+fmtSnr(snr.b)+'/'+fmtSnr(snr.out);
+}}
+function pollDiv(){{fetch('/diversity').then(r=>r.json()).then(paintDiv).catch(()=>{{
+  document.getElementById('divbox').style.display='none';}});}}
+function setDivMode(m){{fetch('/diversity/set?mode='+m).then(r=>r.json()).then(paintDiv);}}
+function setDivSource(){{fetch('/diversity/set?source='+document.getElementById('divsource').value)
+  .then(r=>r.json()).then(paintDiv);}}
+function divRealign(){{fetch('/diversity/align').then(r=>r.json()).then(paintDiv);}}
+var sendDivPhase=debounce(function(){{
+  fetch('/diversity/set?phase='+document.getElementById('divphase').value).then(r=>r.json()).then(paintDiv);
+}},150);
+function divPhaseInput(){{document.getElementById('divphasev').textContent=document.getElementById('divphase').value;
+  sendDivPhase();}}
+var sendDivRatio=debounce(function(){{
+  fetch('/diversity/set?ratio='+document.getElementById('divratio').value).then(r=>r.json()).then(paintDiv);
+}},150);
+function divRatioInput(){{document.getElementById('divratiov').textContent=document.getElementById('divratio').value;
+  sendDivRatio();}}
+
 // ---- live test (drive the real AE) ----
 var liveTimer=null, livePaused=false;
 function liveStart(){{
@@ -3294,6 +3360,7 @@ function livePoll(){{fetch('/live-test/status').then(r=>r.json()).then(s=>{{
 
 loadFixtures();loadRulers();loadReports();
 pollStatus();setInterval(pollStatus,1500);
+pollDiv();setInterval(pollDiv,1000);
 upd();
 </script></body></html>"""
 
@@ -3343,6 +3410,14 @@ def start_control_server(radio, port):
             u = urllib.parse.urlparse(self.path)
             # ---- live status (panel polls this for connection + stream state) ----
             if u.path == "/status":
+                # RSPduo diversity: a compact readout for the control panel's poll —
+                # None on every single-channel adapter (RTL, Kenwood, HPSDR, ...).
+                div = None
+                if getattr(radio.adapter, "diversity_available", False):
+                    ds = radio.adapter.diversity_status()
+                    div = {"mode": ds.get("mode"), "phase_deg": ds.get("phase_deg"),
+                           "ratio_db": ds.get("ratio_db"), "aligned": ds.get("aligned"),
+                           "snr_db": ds.get("snr_db")}
                 return self._json({
                     "connected": radio.conn is not None,
                     "peer": radio.ae_peer_ip,
@@ -3359,6 +3434,7 @@ def start_control_server(radio, port):
                     "res": radio.resolution(),
                     "audio_backlog_ms": (round(radio.adapter.audio_backlog_ms(), 1)
                                          if hasattr(radio.adapter, "audio_backlog_ms") else None),
+                    "diversity": div,
                 })
             # ---- radio diagnostics: 'what the gate sees from the radio' ----
             if u.path == "/diagnostics":
@@ -3526,6 +3602,52 @@ def start_control_server(radio, port):
                     "gain_ref_db": GAIN_REF_DB,
                     "total_offset_db": dbm_offset_for(gain, a.dbm_trim, base),
                 })
+
+            # ---- RSPduo diversity: two coherent tuners combined into one RX ----
+            # GET /diversity                            -> current mode/weight/alignment
+            # GET /diversity/set?mode=&phase=&ratio=&source=&slice= -> apply what's present
+            # GET /diversity/align                      -> re-measure the inter-tuner lag
+            #
+            # {"available": false} (never an error page) on any adapter that isn't
+            # diversity-capable, so the panel can poll it unconditionally.
+            if u.path == "/diversity":
+                a = radio.adapter
+                if not getattr(a, "diversity_available", False):
+                    return self._json({"available": False})
+                return self._json(a.diversity_status())
+            if u.path == "/diversity/set":
+                a = radio.adapter
+                if not getattr(a, "diversity_available", False):
+                    return self._json({"available": False})
+                q = urllib.parse.parse_qs(u.query)
+                kwargs = {}
+                try:
+                    if "mode" in q:
+                        mode = q["mode"][0]
+                        if mode not in ("off", "manual", "null", "track"):
+                            raise ValueError(f"mode={mode!r}")
+                        kwargs["mode"] = mode
+                    if "source" in q:
+                        source = q["source"][0]
+                        if source not in ("combined", "a", "b"):
+                            raise ValueError(f"source={source!r}")
+                        kwargs["source"] = source
+                    if "phase" in q:
+                        kwargs["phase_deg"] = float(q["phase"][0])
+                    if "ratio" in q:
+                        kwargs["ratio_db"] = float(q["ratio"][0])
+                    if "slice" in q:
+                        kwargs["slice_id"] = int(q["slice"][0])
+                except (ValueError, TypeError) as e:
+                    return self._json({"error": f"bad value: {e}"})
+                log(f"[ctl] diversity/set -> {kwargs}")
+                return self._json(a.set_diversity(**kwargs))
+            if u.path == "/diversity/align":
+                a = radio.adapter
+                if not getattr(a, "diversity_available", False):
+                    return self._json({"available": False})
+                log("[ctl] diversity realign")
+                return self._json(a.diversity_realign())
 
             if u.path == "/resolution":
                 q = urllib.parse.parse_qs(u.query)
