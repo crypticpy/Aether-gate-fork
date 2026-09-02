@@ -85,6 +85,14 @@ class FakeSingleChannelAdapter:
         return [0.0] * n_samples
 
 
+class FakeRaisingDiversityAdapter(FakeDiversityAdapter):
+    """diversity_available is True, but the status call itself blows up —
+    e.g. the adapter's numpy alignment code raising on bad hardware state."""
+
+    def diversity_status(self, slice_id=None):
+        raise RuntimeError("boom")
+
+
 def _start(adapter):
     from aether_gate.core import Radio
     from aether_gate.core.engine import start_control_server
@@ -170,6 +178,30 @@ def test_bad_source_value_is_an_error():
     assert "error" in out and out["error"].startswith("bad value:")
 
 
+def test_phase_nan_is_an_error_not_a_crash():
+    a = FakeDiversityAdapter()
+    _, port = _start(a)
+    out = _get(port, "/diversity/set?phase=nan")
+    assert "error" in out and out["error"].startswith("bad value:")
+    assert not any(c[0] == "set" for c in a.calls), "adapter must not be called with a NaN weight"
+
+
+def test_phase_inf_is_an_error_not_a_crash():
+    a = FakeDiversityAdapter()
+    _, port = _start(a)
+    out = _get(port, "/diversity/set?phase=inf")
+    assert "error" in out and out["error"].startswith("bad value:")
+    assert not any(c[0] == "set" for c in a.calls), "adapter must not be called with an infinite weight"
+
+
+def test_ratio_nan_is_an_error_not_a_crash():
+    a = FakeDiversityAdapter()
+    _, port = _start(a)
+    out = _get(port, "/diversity/set?ratio=nan")
+    assert "error" in out and out["error"].startswith("bad value:")
+    assert not any(c[0] == "set" for c in a.calls), "adapter must not be called with a NaN weight"
+
+
 # ---- /diversity/align reaches diversity_realign() ---------------------------
 
 def test_align_calls_diversity_realign():
@@ -199,6 +231,14 @@ def test_status_diversity_is_none_for_a_single_channel_adapter():
     assert s["diversity"] is None
 
 
+def test_status_survives_diversity_status_raising():
+    a = FakeRaisingDiversityAdapter()
+    _, port = _start(a)
+    s = _get(port, "/status")               # must still be 200 JSON, not a crash
+    assert s["diversity"] is None
+    assert "connected" in s and "streaming" in s and "res" in s
+
+
 def main():
     tests = [
         test_unavailable_adapter_reports_unavailable_not_an_error,
@@ -208,9 +248,13 @@ def main():
         test_bad_phase_value_is_an_error_not_a_crash,
         test_bad_mode_value_is_an_error,
         test_bad_source_value_is_an_error,
+        test_phase_nan_is_an_error_not_a_crash,
+        test_phase_inf_is_an_error_not_a_crash,
+        test_ratio_nan_is_an_error_not_a_crash,
         test_align_calls_diversity_realign,
         test_status_carries_compact_diversity_dict,
         test_status_diversity_is_none_for_a_single_channel_adapter,
+        test_status_survives_diversity_status_raising,
     ]
     fails = 0
     for t in tests:

@@ -2276,80 +2276,94 @@ class Radio:
         amp      = 0.1  # −20 dBFS
 
         wav_path = self.audio_wav_path        # track which file is open, to detect live changes
+        last_err_msg = None    # throttle-state for the per-iteration error guard below
+        last_err_t = 0.0
         try:
             while self.run and not self.audio_stop.is_set():
-                # Re-read the source each iteration so the control panel can hot-swap
-                # tone/noise/wav (and the WAV path) live without recreating the stream.
-                src = self.audio_source
-                # Choose stream id + format LIVE: when a dax_rx (RADE/digital) channel is
-                # active, stream on the DAX id and FORCE full-BW float32 stereo — the RADE
-                # OFDM modem needs full bandwidth, so ignore send_reduced_bw_dax here. If AE
-                # arms RADE after remote_audio_rx already started this loop, this switches the
-                # running loop onto the dax stream without recreating it.
-                dax_on   = self.dax_channel is not None
-                # remote_audio_rx (the speaker path) always goes full-BW stereo float32 — AE's
-                # AudioEngine playback expects "one native 24 kHz stereo source" (AudioEngine.cpp).
-                # send_reduced_bw_dax governs DAX streams, NOT the RX speaker audio, so don't let
-                # it drop us to mono int16 here or the demod audio won't reach the output.
-                reduced  = False
-                stream_id = self.audio_stream_id
-                route = (f"dax_rx ch{self.dax_channel} (full-BW f32)" if dax_on
-                         else f"remote_audio_rx ({'mono int16' if reduced else 'stereo f32'})")
-                if route != last_route:
-                    log(f"[audio] route -> {route}, sid 0x{stream_id:08X}")
-                    last_route = route
-                if src == AUDIO_SRC_WAV and (wav is None or self.audio_wav_path != wav_path):
-                    try:
-                        if wav: wav.close()
-                        wav = WavPlayer(self.audio_wav_path)
-                        wav_path = self.audio_wav_path
-                        log(f"[audio] source -> wav: {wav_path}")
-                    except Exception as e:
-                        log(f"[audio] WAV open failed ({e}), tone"); src = AUDIO_SRC_TONE; wav = None
-
-                any_muted = any(sl.get("muted") for sl in self.slices.values())
-                if self.paused or any_muted:                       # Stop / slice mute: silence (stream stays
-                    mono = [0.0] * AUDIO_FRAMES                     #   alive so Go resumes with continuous timing)
-                elif src == AUDIO_SRC_WAV and wav:
-                    mono = wav.read(AUDIO_FRAMES)
-                elif src == AUDIO_SRC_NOISE:
-                    mono = [random.gauss(0, amp) for _ in range(AUDIO_FRAMES)]
-                elif src == AUDIO_SRC_TONE:
-                    mono = [amp * math.sin(2 * math.pi * self.audio_tone_hz * (sample_t + i) / AUDIO_RATE)
-                            for i in range(AUDIO_FRAMES)]
-                elif src == AUDIO_SRC_DEMOD and self.adapter is not None \
-                        and hasattr(self.adapter, "get_audio"):
-                    # Aether-gate: real demodulated RF from the adapter at the active slice.
-                    slice_hz = self.slice_freq * 1e6
-                    # RSPduo diversity: weights are per slice, so only an adapter that
-                    # actually knows about diversity gets the slice_id kwarg — adapters
-                    # whose get_audio predates it would raise on an unknown keyword.
-                    div_kw = {"slice_id": self.active_slice} \
-                        if getattr(self.adapter, "diversity_available", False) else {}
-                    a = self.adapter.get_audio(AUDIO_FRAMES, slice_hz=slice_hz, mode=self.slice_mode, **div_kw)
-                    mono = a if a is not None else [0.0] * AUDIO_FRAMES   # silence while IQ fills
-                else:  # AUDIO_SRC_SILENCE (default) — no audio. The DEFAULT so the bench is quiet.
-                    mono = [0.0] * AUDIO_FRAMES
-
-                sample_t += AUDIO_FRAMES  # harmless for non-tone sources
-
-                if reduced:
-                    samples = mono
-                else:
-                    samples = []
-                    for v in mono: samples.extend([v, v])
-
                 try:
-                    s.sendto(audio_packet(stream_id, seq & 0xF, samples, reduced_bw=reduced), dest)
-                except OSError as e:
-                    log("[audio] send error:", e); break
+                    # Re-read the source each iteration so the control panel can hot-swap
+                    # tone/noise/wav (and the WAV path) live without recreating the stream.
+                    src = self.audio_source
+                    # Choose stream id + format LIVE: when a dax_rx (RADE/digital) channel is
+                    # active, stream on the DAX id and FORCE full-BW float32 stereo — the RADE
+                    # OFDM modem needs full bandwidth, so ignore send_reduced_bw_dax here. If AE
+                    # arms RADE after remote_audio_rx already started this loop, this switches the
+                    # running loop onto the dax stream without recreating it.
+                    dax_on   = self.dax_channel is not None
+                    # remote_audio_rx (the speaker path) always goes full-BW stereo float32 — AE's
+                    # AudioEngine playback expects "one native 24 kHz stereo source" (AudioEngine.cpp).
+                    # send_reduced_bw_dax governs DAX streams, NOT the RX speaker audio, so don't let
+                    # it drop us to mono int16 here or the demod audio won't reach the output.
+                    reduced  = False
+                    stream_id = self.audio_stream_id
+                    route = (f"dax_rx ch{self.dax_channel} (full-BW f32)" if dax_on
+                             else f"remote_audio_rx ({'mono int16' if reduced else 'stereo f32'})")
+                    if route != last_route:
+                        log(f"[audio] route -> {route}, sid 0x{stream_id:08X}")
+                        last_route = route
+                    if src == AUDIO_SRC_WAV and (wav is None or self.audio_wav_path != wav_path):
+                        try:
+                            if wav: wav.close()
+                            wav = WavPlayer(self.audio_wav_path)
+                            wav_path = self.audio_wav_path
+                            log(f"[audio] source -> wav: {wav_path}")
+                        except Exception as e:
+                            log(f"[audio] WAV open failed ({e}), tone"); src = AUDIO_SRC_TONE; wav = None
 
-                seq += 1
-                # Absolute deadline — prevents accumulated drift
-                deadline = t_start + seq * AUDIO_INTERVAL
-                wait = deadline - time.monotonic()
-                if wait > 0:
-                    time.sleep(wait)
+                    any_muted = any(sl.get("muted") for sl in self.slices.values())
+                    if self.paused or any_muted:                       # Stop / slice mute: silence (stream stays
+                        mono = [0.0] * AUDIO_FRAMES                     #   alive so Go resumes with continuous timing)
+                    elif src == AUDIO_SRC_WAV and wav:
+                        mono = wav.read(AUDIO_FRAMES)
+                    elif src == AUDIO_SRC_NOISE:
+                        mono = [random.gauss(0, amp) for _ in range(AUDIO_FRAMES)]
+                    elif src == AUDIO_SRC_TONE:
+                        mono = [amp * math.sin(2 * math.pi * self.audio_tone_hz * (sample_t + i) / AUDIO_RATE)
+                                for i in range(AUDIO_FRAMES)]
+                    elif src == AUDIO_SRC_DEMOD and self.adapter is not None \
+                            and hasattr(self.adapter, "get_audio"):
+                        # Aether-gate: real demodulated RF from the adapter at the active slice.
+                        slice_hz = self.slice_freq * 1e6
+                        # RSPduo diversity: weights are per slice, so only an adapter that
+                        # actually knows about diversity gets the slice_id kwarg — adapters
+                        # whose get_audio predates it would raise on an unknown keyword.
+                        div_kw = {"slice_id": self.active_slice} \
+                            if getattr(self.adapter, "diversity_available", False) else {}
+                        a = self.adapter.get_audio(AUDIO_FRAMES, slice_hz=slice_hz, mode=self.slice_mode, **div_kw)
+                        mono = a if a is not None else [0.0] * AUDIO_FRAMES   # silence while IQ fills
+                    else:  # AUDIO_SRC_SILENCE (default) — no audio. The DEFAULT so the bench is quiet.
+                        mono = [0.0] * AUDIO_FRAMES
+
+                    sample_t += AUDIO_FRAMES  # harmless for non-tone sources
+
+                    if reduced:
+                        samples = mono
+                    else:
+                        samples = []
+                        for v in mono: samples.extend([v, v])
+
+                    try:
+                        s.sendto(audio_packet(stream_id, seq & 0xF, samples, reduced_bw=reduced), dest)
+                    except OSError as e:
+                        log("[audio] send error:", e); break
+
+                    seq += 1
+                    # Absolute deadline — prevents accumulated drift
+                    deadline = t_start + seq * AUDIO_INTERVAL
+                    wait = deadline - time.monotonic()
+                    if wait > 0:
+                        time.sleep(wait)
+                except Exception as e:
+                    # Any exception here (e.g. adapter numpy linear algebra raising on
+                    # a bad diversity weight) must not kill the audio thread silently —
+                    # log it (throttled) and keep the loop alive.
+                    now = time.monotonic()
+                    msg = str(e)
+                    if msg != last_err_msg or now - last_err_t >= 5.0:
+                        log(f"[audio] loop error: {e}")
+                        last_err_msg = msg
+                        last_err_t = now
+                    time.sleep(AUDIO_INTERVAL)
         finally:
             s.close()
             if wav:
@@ -3414,10 +3428,13 @@ def start_control_server(radio, port):
                 # None on every single-channel adapter (RTL, Kenwood, HPSDR, ...).
                 div = None
                 if getattr(radio.adapter, "diversity_available", False):
-                    ds = radio.adapter.diversity_status()
-                    div = {"mode": ds.get("mode"), "phase_deg": ds.get("phase_deg"),
-                           "ratio_db": ds.get("ratio_db"), "aligned": ds.get("aligned"),
-                           "snr_db": ds.get("snr_db")}
+                    try:
+                        ds = radio.adapter.diversity_status()
+                        div = {"mode": ds.get("mode"), "phase_deg": ds.get("phase_deg"),
+                               "ratio_db": ds.get("ratio_db"), "aligned": ds.get("aligned"),
+                               "snr_db": ds.get("snr_db")}
+                    except Exception:
+                        div = None
                 return self._json({
                     "connected": radio.conn is not None,
                     "peer": radio.ae_peer_ip,
@@ -3633,9 +3650,15 @@ def start_control_server(radio, port):
                             raise ValueError(f"source={source!r}")
                         kwargs["source"] = source
                     if "phase" in q:
-                        kwargs["phase_deg"] = float(q["phase"][0])
+                        phase = float(q["phase"][0])
+                        if not math.isfinite(phase):
+                            raise ValueError(f"phase={q['phase'][0]!r}")
+                        kwargs["phase_deg"] = phase
                     if "ratio" in q:
-                        kwargs["ratio_db"] = float(q["ratio"][0])
+                        ratio = float(q["ratio"][0])
+                        if not math.isfinite(ratio):
+                            raise ValueError(f"ratio={q['ratio'][0]!r}")
+                        kwargs["ratio_db"] = ratio
                     if "slice" in q:
                         kwargs["slice_id"] = int(q["slice"][0])
                 except (ValueError, TypeError) as e:
