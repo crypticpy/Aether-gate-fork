@@ -35,6 +35,7 @@ Shapes carry a channel axis (nbins, N, N): an N-element array is the same
 code with N = 2 today. Only the multiplier form of the null weight (one
 complex m for y = a + m b) is two-element specific.
 """
+import functools
 import math
 
 import numpy as np
@@ -42,8 +43,37 @@ import numpy as np
 from .diversity import WEIGHT_MAX_ABS, weight_to_polar
 
 # A source needs this much coherence over at least this many bins to be listed.
-# E[p | p < median] / E[p] for exponentially distributed bin powers.
-TRIM_HALF_MEAN = 1.0 - math.log(2.0)
+
+
+def _reg_lower_gamma(a, x):
+    """P(a, x), the regularised lower incomplete gamma, by its series."""
+    term = 1.0 / math.gamma(a + 1)
+    total = term
+    for k in range(1, 500):
+        term *= x / (a + k)
+        total += term
+        if term < 1e-15 * total:
+            break
+    return total * math.exp(-x) * x ** a
+
+
+@functools.lru_cache(maxsize=None)
+def trim_half_mean(n_channels):
+    """E[p | p < median(p)] / E[p] when p is the SUM of n_channels bin powers
+    of noise, i.e. Gamma(n, 1): 1 - ln 2 = 0.307 for one channel, 0.474 for
+    two. The quieter-half trim divides by this so it still reads as the
+    noise's mean (found live: uncorrected, a VAD referenced to the trimmed
+    guard band never went quiet)."""
+    n = int(n_channels)
+    lo, hi = 0.0, 4.0 * n + 8.0
+    for _ in range(80):                                     # median by bisection
+        mid = 0.5 * (lo + hi)
+        if _reg_lower_gamma(n, mid) < 0.5:
+            lo = mid
+        else:
+            hi = mid
+    m = 0.5 * (lo + hi)
+    return n * _reg_lower_gamma(n + 1, m) / _reg_lower_gamma(n, m) / n
 
 SOURCE_MIN_COHERENCE = 0.5
 SOURCE_MIN_BINS = 3
@@ -67,13 +97,10 @@ STALE_S = 30.0
 def region_covariance(X, idx, trim=False):
     """Mean per-bin covariance of the bins idx of the spectra X (N, nbins).
 
-    trim=True averages only the quieter half of the bins, so a station that
-    happens to sit inside a guard band does not masquerade as noise — and
-    rescales the result so it still reads as the noise's mean: the powers of
-    noise-only bins are exponentially distributed, and the mean of the half
-    below the median is (1 - ln 2) of the whole mean, 5.1 dB low. Left
-    uncorrected, a VAD comparing in-band power against it never goes quiet
-    (found live on 80 m: the tracker refitted every 2 s to noise).
+    trim=True averages only the quieter half of the bins (by their summed
+    power), so a station that happens to sit inside a guard band does not
+    masquerade as noise — and rescales the result by trim_half_mean() so it
+    still reads as the noise's mean rather than 3-5 dB under it.
     Returns an (N, N) Hermitian matrix, or None when idx is empty.
     """
     X = np.asarray(X)
@@ -84,7 +111,7 @@ def region_covariance(X, idx, trim=False):
         p = np.sum(np.abs(S) ** 2, axis=0)
         keep = p <= np.median(p)
         S = S[:, keep]
-        return (S @ S.conj().T) / (S.shape[1] * TRIM_HALF_MEAN)
+        return (S @ S.conj().T) / (S.shape[1] * trim_half_mean(S.shape[0]))
     return (S @ S.conj().T) / S.shape[1]
 
 

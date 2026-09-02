@@ -72,7 +72,13 @@ NULL_MIN_COHERENCE = 0.3
 
 # A refit replaces the current weight only if it predicts at least this
 # much improvement, so the weight does not chatter on estimation noise.
+# The first fit of an over is cheap to accept (it is what makes a new
+# talker adopted within a syllable); re-steering DURING an over needs a
+# real margin, because a weak signal's 0.3 s covariance is noisy enough
+# that candidates a few dB apart in predicted SNR are the same beam
+# (seen live: a steady rag-chew re-steered every few syllables at 0.3 dB).
 REFIT_MIN_GAIN_DB = 0.3
+REFIT_HOLD_GAIN_DB = 1.0
 
 # Block power this far above the tracked floor counts as "someone talking".
 # Deliberately low: a weak DX signal only lifts the passband a couple of dB,
@@ -257,6 +263,11 @@ MEMORY_MAX = 8
 # carrier's or a noise burst's is not.
 SPEECH_MIN_MOD = 0.3
 MOD_WINDOW_S = 1.0
+# ...and only overs with this much voiced time behind them: a memory of
+# eight slots fills with syllable-long fits of one talker otherwise. An
+# over is memorised once it gets here (whatever weight it has settled on)
+# and again on any later re-steer.
+MEMORY_MIN_TALK_S = 0.5
 
 
 def combine_ramp(a, b, m0, m1):
@@ -374,7 +385,7 @@ class Tracker:
     in the block they key up in.
     """
 
-    def __init__(self, rate_hz, refresh_s=0.25, noise_tc_s=2.0, signal_tc_s=0.3,
+    def __init__(self, rate_hz, refresh_s=0.25, noise_tc_s=2.0, signal_tc_s=1.0,
                  memory=None, t0=0.0):
         self.rate_hz = float(rate_hz)
         self.refresh_s = float(refresh_s)
@@ -397,6 +408,8 @@ class Tracker:
         self._quiet_s = 0.0
         self._onset_done = False
         self._rs_n = 0
+        self._over_fits = 0                 # refits adopted during this over
+        self._memorised = False             # this over has been stored
         self._hist = []                     # (t, p_in) over the last MOD_WINDOW_S
 
     def _alpha(self, n, tc_s):
@@ -445,6 +458,8 @@ class Tracker:
                     # seen, so the beam can settle within a few syllables.
                     self._onset_done = True
                     self._rs_n = 0
+                    self._over_fits = 0
+                    self._memorised = False
                     self.Rs = None
                     self._recall(R_in, mode)
                 self._rs_n += 1
@@ -464,6 +479,8 @@ class Tracker:
         if mode in ("null", "track") and self._since_fit >= self.refresh_s:
             self._since_fit = 0.0
             self.refit(mode)
+            if mode == "track" and not self._memorised:
+                self._memorise()
 
     def _recall(self, R_in, mode):
         if self.memory is None or mode != "track":
@@ -505,16 +522,30 @@ class Tracker:
             gain_db = 10.0 * math.log10(max(s_new, 1e-30) / max(s_cur, 1e-30))
         else:
             return False
-        if gain_db >= REFIT_MIN_GAIN_DB:
+        need = REFIT_MIN_GAIN_DB if (mode != "track" or self._over_fits == 0) \
+            else REFIT_HOLD_GAIN_DB
+        if gain_db >= need:
             self.m = cand
             self.updates += 1
-            if mode == "track" and self.memory is not None and self.talking \
-                    and self.talk_mod is not None and self.talk_mod >= SPEECH_MIN_MOD:
-                S = self.Rs - Rn
-                if float(np.real(np.trace(S))) > 0:
-                    self.memory.store(steering_of(S), cand, self.t)
+            if mode == "track":
+                self._over_fits += 1
+                self._memorise()
             return True
         return False
+
+    def _memorise(self):
+        """Store this over's steering vector and weight, if it is speech and
+        has lasted long enough to be worth remembering."""
+        # _onset_done, not talking: the over is alive through a syllable's
+        # trough, and the refresh tick lands in troughs as often as not
+        if self.memory is None or not self._onset_done or self.Rs is None \
+                or self._talk_s < MEMORY_MIN_TALK_S \
+                or self.talk_mod is None or self.talk_mod < SPEECH_MIN_MOD:
+            return
+        S = self.Rs - self._loaded_noise()
+        if float(np.real(np.trace(S))) > 0:
+            self.memory.store(steering_of(S), self.m, self.t)
+            self._memorised = True
 
     def snr_db(self, m=None):
         """{"a", "b", "out"} SNRs in dB from the current covariances, or Nones."""
