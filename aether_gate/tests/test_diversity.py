@@ -288,6 +288,7 @@ def test_a_short_burst_does_not_train_the_signal_covariance():
     for _ in range(200):
         R_in, R_g = _scene(rng, block, None, 1.0)
         tr.update(R_in, R_g, block, "track")
+    n0 = tr.updates                                        # idle-time noise nulls are fine
     for _ in range(5):                                     # a crash every 200 ms
         R_in, R_g = _scene(rng, block, (2.5, 1.0), 1.0, talk_gain=30.0)
         tr.update(R_in, R_g, block, "track")
@@ -295,7 +296,7 @@ def test_a_short_burst_does_not_train_the_signal_covariance():
         for _q in range(20):
             R_in, R_g = _scene(rng, block, None, 1.0)
             tr.update(R_in, R_g, block, "track")
-    assert tr.Rs is None and tr.updates == 0
+    assert tr.Rs is None and tr.updates == n0
 
 
 # --- talker memory ------------------------------------------------------------
@@ -567,3 +568,46 @@ def test_memory_never_evicts_the_focused_talker():
     mem.store(np.array([1.0, np.exp(1j * 2.5)]) / np.sqrt(2), 0j, 3.0)
     assert len(mem.entries) == 2
     assert mem.focus_entry() is not None
+
+
+def test_idle_time_between_overs_is_spent_nulling_the_noise():
+    from aether_gate.core.diversity import _out_noise
+    rng = np.random.default_rng(29)
+    tr = Tracker(RATE, memory=TalkerMemory())
+    _run(tr, rng, 4.0, (-0.7, 1.1), "track")
+    m_beam = tr.m
+    block = 1024
+    for _ in range(int(2.5 * RATE / block)):                 # 2.5 s of nobody
+        R_in, R_g = _scene(rng, block, None, 0.5)
+        tr.update(R_in, R_g, block, "track")
+    # on a one-source scene the talker's beam already nulls the noise, so
+    # park the weight on antenna A (as a fade switch would) to see the
+    # idle null do its work
+    tr.m = 0j
+    for _ in range(int(1.0 * RATE / block)):
+        R_in, R_g = _scene(rng, block, None, 0.5)
+        tr.update(R_in, R_g, block, "track")
+    assert tr.idle_null is True
+    Rn = tr.Rn
+    floor = min(float(Rn[0, 0].real), float(Rn[1, 1].real))
+    assert _out_noise(tr.m, Rn) < 0.7 * floor, (_out_noise(tr.m, Rn), floor)
+    # the talker keys up again: the beam is back and the null is history
+    for _ in range(12):
+        R_in, R_g = _scene(rng, block, (-0.7, 1.1), 0.5, t=tr.t)
+        tr.update(R_in, R_g, block, "track")
+    assert tr.idle_null is False
+    assert abs(tr.m - m_beam) < 0.35 * max(1.0, abs(m_beam)), (tr.m, m_beam)
+
+
+def test_a_focus_keeps_its_beam_through_idle_time():
+    rng = np.random.default_rng(31)
+    mem = TalkerMemory()
+    tr = Tracker(RATE, memory=mem)
+    _run(tr, rng, 4.0, (-0.7, 1.1), "track")
+    mem.set_focus(mem.entries[0]["id"], tr.t)
+    m_beam = tr.m
+    block = 1024
+    for _ in range(int(3.0 * RATE / block)):
+        R_in, R_g = _scene(rng, block, None, 0.5)
+        tr.update(R_in, R_g, block, "track")
+    assert tr.idle_null is False and tr.m == m_beam

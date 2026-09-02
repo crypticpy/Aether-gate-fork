@@ -111,6 +111,11 @@ TALK_HOLD_S = 0.05
 # established the gap allowed is only the hold itself, so a train of static
 # crashes 200 ms apart never adds up to one (each is 10 ms above the floor).
 TALK_HANG_S = 0.6
+# In track mode the weight is idle between overs; after this much quiet it
+# is spent on nulling whatever coherent noise is there (G5), so the
+# operator listening to the band between overs hears less of it. A
+# recognised talker still gets their beam in the block they key up in.
+IDLE_NULL_AFTER_S = 2.0
 TALK_ONSET_HANG_S = TALK_HOLD_S
 # The first fit of an over waits for this much voiced time: on a weak
 # signal a quarter-second covariance steers somewhere random (seen live),
@@ -581,6 +586,7 @@ class Tracker:
         self._over_fits = 0                 # refits adopted during this over
         self._memorised = False             # this over has been stored
         self.interferer = False             # this over is being nulled, not steered (focus)
+        self.idle_null = False              # the weight is an idle-time noise null
         self._hist = []                     # (t, p_in) over the last MOD_WINDOW_S
 
     def _alpha(self, n, tc_s):
@@ -654,6 +660,7 @@ class Tracker:
                     self._over_fits = 0
                     self._memorised = False
                     self.interferer = False
+                    self.idle_null = False
                     self.Rs = None
                     if self.memory is not None:
                         self.memory.release()   # a new over is nobody until recalled
@@ -691,6 +698,14 @@ class Tracker:
             self._since_fit = 0.0
             if mode == "track" and self.interferer:
                 self._null_interferer()     # a focus holds: this over is not wanted
+            elif mode == "track" and not self._onset_done \
+                    and self._quiet_s >= IDLE_NULL_AFTER_S \
+                    and not (self.memory is not None and self.memory.focus.active):
+                # the last talker's SNR is not the yardstick here: a
+                # remembered talker gets their beam back in the block they
+                # key up in, anyone else within a refit
+                if self.refit("null", guard_signal=False):
+                    self.idle_null = True
             else:
                 # a steady carrier is nulled like any other coherent noise
                 self.refit("null" if (mode == "track" and self.steady) else mode)
@@ -741,7 +756,7 @@ class Tracker:
         load = 1e-3 * float(np.real(np.trace(Rn))) / 2.0 + 1e-30
         return Rn + load * np.eye(2)
 
-    def refit(self, mode):
+    def refit(self, mode, guard_signal=True):
         """Fit m for the mode; adopt it only if it is a real improvement."""
         if self.Rn is None:
             return False
@@ -752,7 +767,7 @@ class Tracker:
             cand = fit_null(Rn)
             gain = _out_noise(self.m, Rn) / max(_out_noise(cand, Rn), 1e-30)
             gain_db = 10.0 * math.log10(max(gain, 1e-30))
-            if self.Rs is not None and \
+            if guard_signal and self.Rs is not None and \
                     _snr_of(cand, self.Rs, Rn) < _snr_of(self.m, self.Rs, Rn):
                 return False                    # quieter, but at the signal's expense
         elif mode == "track":

@@ -357,6 +357,7 @@ class _DiversityState:
                          else None),
             "rn_source": t.rn_source if t is not None else None,
             "steady_qrm": bool(t.steady) if t is not None else False,
+            "idle_null": bool(t.idle_null) if t is not None else False,
             "passband": (self.passband[sid].status() if sid in self.passband else None),
             # how directional the noise is (0 = isotropic, nothing to null)
             "noise_coherence": (round(_dv()._coherence(t.Rn), 2)
