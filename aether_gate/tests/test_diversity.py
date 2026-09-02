@@ -491,3 +491,79 @@ def test_memory_names_survive_a_restart_by_signature(tmp_path):
     (tmp_path / "bad.json").write_text("{not json")
     assert TalkerMemory(names_path=str(tmp_path / "bad.json"))._named == []
     assert TalkerMemory(names_path=str(tmp_path / "none.json"))._named == []
+
+
+def test_focus_steers_at_the_pinned_station_and_nulls_everyone_else():
+    rng = np.random.default_rng(23)
+    mem = TalkerMemory()
+    tr = Tracker(RATE, memory=mem)
+    dx, caller = (-0.7, 1.1), (0.5, 1.0)
+    _run(tr, rng, 4.0, dx, "track")                      # learn the DX station
+    _run(tr, rng, 3.2, caller, "track")                  # and one loud caller
+    ids = {e["id"] for e in mem.entries}
+    assert len(ids) >= 2
+    dx_id = mem.entries[0]["id"]                         # first stored = the DX
+    mem.set_focus(dx_id, tr.t)
+    block = 1024
+
+    def quiet(n):
+        for _ in range(n):
+            R_in, R_g = _scene(rng, block, None, 0.5)
+            tr.update(R_in, R_g, block, "track")
+
+    def over(talker, n):
+        snr_out, snr_best = [], []
+        for _ in range(n):
+            R_in, R_g = _scene(rng, block, talker, 0.5, t=tr.t)
+            tr.update(R_in, R_g, block, "track")
+            if tr.Rs is not None:
+                s = tr.snr_db()
+                snr_out.append(s["out"]); snr_best.append(max(s["a"], s["b"]))
+        return snr_out, snr_best
+
+    # the caller keys up: within the over the output must be well below the
+    # better antenna (nulled), and the tracker says so
+    quiet(16)
+    out, best = over(caller, 40)
+    assert tr.interferer is True
+    assert mem.talker(tr.t) is not None and mem.talker(tr.t)["id"] != dx_id
+    assert out[-1] < best[-1] - 6.0, (out[-1], best[-1])
+    f = mem.focus_status(tr.t, nulling=tr.interferer)
+    assert f["nulling"] is True and f["nulled"] == 1 and f["overs"] == 0 and f["live"] is False
+    # the DX keys up: their remembered beam is back and beats either antenna
+    quiet(16)
+    out, best = over(dx, 40)
+    assert tr.interferer is False
+    assert mem.talker(tr.t)["id"] == dx_id
+    assert out[-1] > best[-1] + 3.0, (out[-1], best[-1])
+    f = mem.focus_status(tr.t, nulling=tr.interferer)
+    assert f["live"] is True and f["overs"] == 1 and f["best_db"] is not None
+    # an unknown third station is nulled too, and never learned as the DX
+    quiet(16)
+    out, best = over((2.6, 0.8), 40)
+    assert tr.interferer is True and out[-1] < best[-1] - 6.0
+    assert mem.focus_status(tr.t)["nulled"] == 2
+    # releasing the focus returns the tracker to following whoever talks
+    mem.set_focus(None, tr.t)
+    quiet(16)
+    out, best = over(caller, 40)
+    assert tr.interferer is False and out[-1] >= best[-1] - 1.0
+
+
+def test_null_of_cancels_the_steering_vector_and_caps_the_ratio():
+    from aether_gate.core.focus import null_of
+    s = np.array([0.6, 0.8j])
+    m = null_of(s)
+    assert abs(s[0] + m * s[1]) < 1e-9
+    m = null_of(np.array([1.0, 1e-4]))
+    assert abs(m) == pytest.approx(WEIGHT_MAX_ABS)
+
+
+def test_memory_never_evicts_the_focused_talker():
+    mem = TalkerMemory(max_n=2)
+    for k in range(2):
+        mem.store(np.array([1.0, np.exp(1j * k)]) / np.sqrt(2), 0j, float(k))
+    mem.set_focus(mem.entries[0]["id"], 2.0)
+    mem.store(np.array([1.0, np.exp(1j * 2.5)]) / np.sqrt(2), 0j, 3.0)
+    assert len(mem.entries) == 2
+    assert mem.focus_entry() is not None

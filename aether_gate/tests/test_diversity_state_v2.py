@@ -258,3 +258,18 @@ def test_lsb_and_fm_pick_their_own_bands():
     i, g = st._bands(BLOCK, RATE, "NFM")
     assert f[i].min() >= -8000 and f[i].max() < 8000 and i.sum() > 500
     assert f[g].min() >= -8000 - 300 - 16000 and abs(f[g]).min() >= 8300
+
+
+def test_focus_needs_a_known_talker_and_shows_in_status():
+    st = _aligned_state()
+    assert st.status()["focus"] is None
+    with pytest.raises(ValueError):
+        st.set(focus=3)
+    st.memory.store(np.array([1.0, 0.5j]) / np.sqrt(1.25), 0.4 + 0.2j, 0.0)
+    st.memory.release()                       # store() marks the entry live
+    tid = st.memory.entries[0]["id"]
+    d = st.set(focus=tid)
+    f = d["focus"]
+    assert set(f) == {"id", "name", "since_s", "live", "nulling", "overs", "nulled", "best_db"}
+    assert f["id"] == tid and f["live"] is False and f["nulling"] is False
+    assert st.set(focus="")["focus"] is None

@@ -359,13 +359,15 @@ class _DiversityState:
             "sources": self._sources(),
             "memory": self.memory.status(time.monotonic()),
             "talker": self.memory.talker(time.monotonic()),
+            "focus": self.memory.focus_status(time.monotonic(),
+                                              nulling=bool(t.interferer) if t is not None else False),
             "capture": {"active": cap is not None,
                         "path": cap["path"] if cap is not None else self.last_capture},
             "slice_id": sid,
         }
 
     def set(self, mode=None, phase_deg=None, ratio_db=None, source=None, sid=None,
-            nb=None, nb_db=None, pan=None, null_source=None):
+            nb=None, nb_db=None, pan=None, null_source=None, focus=None):
         sid = self.active_slice if sid is None else int(sid)
         if mode is not None:
             mode = str(mode).lower()
@@ -410,4 +412,15 @@ class _DiversityState:
             # weight: manual mode with the sliders parked on it
             self.manual[sid] = _dv().weight_from_polar(srcs[i]["phase_deg"], srcs[i]["ratio_db"])
             self.mode = "manual"
+        if focus is not None:
+            # '' releases; an id pins that talker (ValueError when unknown)
+            fid = int(focus) if str(focus).strip() not in ("", "off", "none") else None
+            self.memory.set_focus(fid, time.monotonic())
+            e = self.memory.focus_entry()
+            for t in self.trackers.values():
+                # pre-steer at the pinned station while nobody is talking, so
+                # the first syllable of their next over is already on beam
+                if e is not None and not t.talking and t.m != e["m"]:
+                    t.m = e["m"]
+                    t.updates += 1
         return self.status(sid)

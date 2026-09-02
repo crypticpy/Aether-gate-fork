@@ -67,10 +67,13 @@ class FakeDiversityAdapter:
         return dict(self._status)
 
     def set_diversity(self, mode=None, phase_deg=None, ratio_db=None, source=None, slice_id=None,
-                       nb=None, nb_db=None, pan=None, null_source=None):
+                       nb=None, nb_db=None, pan=None, null_source=None, focus=None):
         self.calls.append(("set", {"mode": mode, "phase_deg": phase_deg,
                                     "ratio_db": ratio_db, "source": source, "slice_id": slice_id,
-                                    "nb": nb, "nb_db": nb_db, "pan": pan, "null_source": null_source}))
+                                    "nb": nb, "nb_db": nb_db, "pan": pan, "null_source": null_source,
+                                    "focus": focus}))
+        if focus not in (None, "") and focus != 7:
+            raise ValueError(f"unknown talker id {focus}")
         if mode is not None:
             self._status["mode"] = mode
         if phase_deg is not None:
@@ -211,7 +214,8 @@ def test_set_forwards_every_given_param():
     assert method == "set"
     assert kwargs == {"mode": "track", "phase_deg": 45.5, "ratio_db": -3.5,
                        "source": "b", "slice_id": 1,
-                       "nb": True, "nb_db": 18.5, "pan": "nulled", "null_source": 2}
+                       "nb": True, "nb_db": 18.5, "pan": "nulled", "null_source": 2,
+                       "focus": None}
     assert out["mode"] == "track" and out["source"] == "b"
 
 
@@ -222,7 +226,7 @@ def test_set_with_only_one_param_leaves_the_rest_unset():
     _, kwargs = a.calls[-1]
     assert kwargs == {"mode": None, "phase_deg": None, "ratio_db": 5.0,
                        "source": None, "slice_id": None,
-                       "nb": None, "nb_db": None, "pan": None, "null_source": None}
+                       "nb": None, "nb_db": None, "pan": None, "null_source": None, "focus": None}
 
 
 # ---- v2 /diversity/set params: nb, nb_db, pan, null_source ------------------
@@ -572,3 +576,18 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def test_focus_pins_a_talker_releases_and_rejects_the_unknown():
+    a = FakeDiversityAdapter()
+    _, port = _start(a)
+    _get(port, "/diversity/set?focus=7")
+    assert a.calls[-1][1]["focus"] == 7
+    _get(port, "/diversity/set?focus=off")
+    assert a.calls[-1][1]["focus"] == ""
+    out = _get(port, "/diversity/set?focus=9")
+    assert out == {"error": "unknown talker id 9"}
+    out = _get(port, "/diversity/set?focus=0")
+    assert out["error"].startswith("bad value")
+    out = _get(port, "/diversity/set?focus=bob")
+    assert out["error"].startswith("bad value")

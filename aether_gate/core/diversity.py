@@ -50,6 +50,8 @@ import os
 
 import numpy as np
 
+from .focus import StationFocus, null_of
+
 # Alignment is accepted only when the correlation peak stands this far above
 # the window's median. The correlation is phase-transformed (GCC-PHAT): every
 # frequency bin votes with unit weight, so the peak height is the coherence
@@ -375,6 +377,7 @@ class TalkerMemory:
         self._next_id = 1                    # ids never reuse within a run
         self.active = None                   # id of the talker whose weight is live
         self.active_since = None
+        self.focus = StationFocus()          # see focus.py
         # Names outlive a run: they are keyed to the steering vector, not the
         # id, so a talker heard again after a restart gets their label back
         # as soon as their signature is stored.
@@ -472,7 +475,8 @@ class TalkerMemory:
         self._activate(e, now)
         if len(self.entries) > self.max_n:
             self.entries.sort(key=lambda e: e["last_seen"])
-            dropped = self.entries.pop(0)
+            i = next(i for i, e in enumerate(self.entries) if e["id"] != self.focus.talker_id)
+            dropped = self.entries.pop(i)
             if dropped["id"] == self.active:
                 self.release()
 
@@ -485,9 +489,29 @@ class TalkerMemory:
                 return True
         return False
 
+    def entry(self, talker_id):
+        return next((e for e in self.entries if e["id"] == talker_id), None)
+
+    def set_focus(self, talker_id, now):
+        """Pin the combiner on a remembered talker; None releases the pin."""
+        if talker_id is None:
+            self.focus.clear()
+            return
+        if self.entry(int(talker_id)) is None:
+            raise ValueError(f"unknown talker id {talker_id}")
+        self.focus.pin(talker_id, now)
+
+    def focus_entry(self):
+        return self.entry(self.focus.talker_id) if self.focus.active else None
+
+    def focus_status(self, now, nulling=False):
+        return self.focus.status(self.focus_entry(), now,
+                                 live=self.active == self.focus.talker_id, nulling=nulling)
+
     def clear(self):
         self.entries = []
         self.release()
+        self.focus.clear()
 
     def talker(self, now):
         """{"id", "since_s"} for the live talker, or None."""
@@ -556,6 +580,7 @@ class Tracker:
         self._fade_s = 0.0                  # voiced time the fade guard has held
         self._over_fits = 0                 # refits adopted during this over
         self._memorised = False             # this over has been stored
+        self.interferer = False             # this over is being nulled, not steered (focus)
         self._hist = []                     # (t, p_in) over the last MOD_WINDOW_S
 
     def _alpha(self, n, tc_s):
@@ -628,6 +653,7 @@ class Tracker:
                     self._fade_s = 0.0
                     self._over_fits = 0
                     self._memorised = False
+                    self.interferer = False
                     self.Rs = None
                     if self.memory is not None:
                         self.memory.release()   # a new over is nobody until recalled
@@ -638,7 +664,7 @@ class Tracker:
                 # the same estimate split by block parity: two independent
                 # views of the over, so a fit can be judged on data it did
                 # not see
-                if mode == "track" and self._over_fits > 0:
+                if mode == "track" and self._over_fits > 0 and not self.interferer:
                     self._fade_guard(R_in, dt)
                 h = self._rs_n % 2
                 k = (self._rs_n + 1) // 2
@@ -653,6 +679,7 @@ class Tracker:
                 self._low_mod_s = 0.0
                 self._onset_done = False
                 self.talk_mod = None
+                self.interferer = False
                 if self.memory is not None:
                     self.memory.release()
             if p_in <= NOISE_MAX_RATIO * p_ref:
@@ -662,10 +689,17 @@ class Tracker:
         self._since_fit += dt
         if mode in ("null", "track") and self._since_fit >= self.refresh_s:
             self._since_fit = 0.0
-            # a steady carrier is nulled like any other coherent noise
-            self.refit("null" if (mode == "track" and self.steady) else mode)
-            if mode == "track" and not self._memorised:
-                self._memorise()
+            if mode == "track" and self.interferer:
+                self._null_interferer()     # a focus holds: this over is not wanted
+            else:
+                # a steady carrier is nulled like any other coherent noise
+                self.refit("null" if (mode == "track" and self.steady) else mode)
+                if mode == "track" and not self._memorised:
+                    self._memorise()
+                if mode == "track" and self.memory is not None and self._onset_done \
+                        and self.memory.focus.active \
+                        and self.memory.active == self.memory.focus.talker_id:
+                    self.memory.focus.note_snr(self.snr_db()["out"])
 
     def _recall(self, R_in, mode):
         if self.memory is None or mode != "track":
@@ -674,9 +708,32 @@ class Tracker:
         S = R_in - Rn
         if float(np.real(np.trace(S))) <= 0:
             return
-        m = self.memory.recall(steering_of(S), self.t)
+        s = steering_of(S)
+        m = self.memory.recall(s, self.t)
+        focus = self.memory.focus
+        if focus.active:
+            if self.memory.active == focus.talker_id:
+                focus.overs += 1
+            else:
+                # anyone else is an interferer: null them from the first
+                # block, and keep nulling as their covariance firms up
+                self.interferer = True
+                focus.nulled += 1
+                m = null_of(s)
         if m is not None and m != self.m:
             self.m = m
+            self.updates += 1
+
+    def _null_interferer(self):
+        """Re-aim the null at the over's settled steering vector."""
+        if self.Rs is None:
+            return
+        S = self.Rs - self._loaded_noise()
+        if float(np.real(np.trace(S))) <= 0:
+            return
+        cand = null_of(steering_of(S))
+        if abs(cand - self.m) > 0.05 * max(1.0, abs(self.m)):
+            self.m = cand
             self.updates += 1
 
     def _loaded_noise(self):

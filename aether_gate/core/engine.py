@@ -3903,6 +3903,16 @@ def start_control_server(radio, port):
                         if null_source < 0:
                             raise ValueError(f"null_source={q['null_source'][0]!r}")
                         kwargs["null_source"] = null_source
+                    if "focus" in q:
+                        # focus=<talker id> pins; focus=off releases (a blank
+                        # value never reaches here: parse_qs drops it)
+                        focus = q["focus"][0].strip()
+                        if focus not in ("", "off", "none"):
+                            if int(focus) < 1:
+                                raise ValueError(f"focus={focus!r}")
+                            kwargs["focus"] = int(focus)
+                        else:
+                            kwargs["focus"] = ""
                 except (ValueError, TypeError) as e:
                     return self._json({"error": f"bad value: {e}"})
                 log(f"[ctl] diversity/set -> {kwargs}")
