@@ -372,3 +372,25 @@ def test_combine_passband_refines_only_in_track_or_null_and_reports_it():
     st.set(subband=False)
     assert st.subbands == {} and st.status()["subband"]["enabled"] is False
     assert np.allclose(st.combine_passband(0, pa, pb, m, m, rate), combine_ramp(pa, pb, m, m))
+
+
+# --- the noise profile --------------------------------------------------------
+def test_noise_profile_rides_in_status_and_sees_impulses_before_the_blanker():
+    rng = np.random.default_rng(12)
+    st = _DiversityState(_FakeAdapter())
+    st.set(nb=True)
+    a = _white(rng, BLOCK); b = _white(rng, BLOCK)
+    st.ingest(a, b)
+    assert st.status()["noise_profile"] is None            # not aligned: nothing measured
+    st.aligner.set_lag(0, 20.0, True)
+    for k in range(120):                                    # ~4 s, one impulse per block
+        a = _white(rng, BLOCK); b = _white(rng, BLOCK)
+        i = int(rng.integers(0, BLOCK - 40))
+        a[i:i + 20] += 40.0; b[i:i + 20] += 40.0
+        st.ingest(a, b)
+    prof = st.status()["noise_profile"]
+    assert set(prof) == {"mains_hz", "hum_db", "harmonics", "impulses_per_s", "impulse_db",
+                         "periodic", "seconds"}
+    # ~30 impulses/s at 125 kS/s in 4096-sample blocks, counted despite the blanker
+    assert 20.0 <= prof["impulses_per_s"] <= 40.0, prof
+    assert prof["impulse_db"] >= 20.0 and prof["mains_hz"] is None, prof

@@ -54,6 +54,11 @@ def _sb():
     return subband
 
 
+def _npf():
+    from ..core import noiseprofile
+    return noiseprofile
+
+
 def _balance():
     from ..core import balance
     return balance
@@ -106,6 +111,7 @@ class _DiversityState:
         # per-bin refinement of the tracker's weight in the demod passband
         self.subband_on = True
         self.subbands = {}                  # sid -> SubbandCombiner
+        self.profile = None                 # what kind of noise this is (core.noiseprofile)
         # spatial map: rebuilt whenever the hardware centre or rate moves,
         # since its bins are absolute frequencies
         self.map = None
@@ -183,6 +189,11 @@ class _DiversityState:
                       f"peak {peak:.1f}x the floor — "
                       f"{'locked' if ok else 'NOT credible; holding lag 0'}", flush=True)
         a, b = self.aligner.apply(a, b)
+        if self.aligner.aligned:
+            # before the blanker: the profile must see the impulses it counts
+            if self.profile is None or self.profile.rate_hz != float(self.a.samp_rate):
+                self.profile = _npf().NoiseProfile(self.a.samp_rate)
+            self.profile.update(a, b)
         if self.nb_on:
             a, b, frac = _dv().blank_impulses(a, b, self.nb_db)
             self.blanked_pct = 0.9 * self.blanked_pct + 0.1 * 100.0 * frac
@@ -404,6 +415,7 @@ class _DiversityState:
                         **(self.subbands[sid].status() if sid in self.subbands
                            else {"bins": 0, "extra_db": 0.0})},
             "sources": self._sources(),
+            "noise_profile": self.profile.status() if self.profile is not None else None,
             "memory": self.memory.status(time.monotonic()),
             "talker": self.memory.talker(time.monotonic()),
             "loops": self.balance.status(time.monotonic()),
