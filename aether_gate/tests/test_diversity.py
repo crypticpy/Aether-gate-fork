@@ -8,9 +8,12 @@ Run:  .venv/bin/python -m pytest aether_gate/tests/test_diversity.py -q
 """
 import numpy as np
 
+import pytest
+
 from aether_gate.core.diversity import (
-    ALIGN_MIN_PEAK, REFIT_MIN_GAIN_DB, WEIGHT_MAX_ABS, Aligner, Tracker, combine,
-    find_lag, fit_max_snr, fit_null, weight_from_polar, weight_to_polar,
+    ALIGN_MIN_PEAK, REFIT_MIN_GAIN_DB, TALK_HOLD_S, WEIGHT_MAX_ABS, Aligner,
+    Tracker, combine, find_lag, fit_max_snr, fit_null, weight_from_polar,
+    weight_to_polar,
 )
 
 RATE = 25_000.0
@@ -103,6 +106,11 @@ def test_polar_round_trip_and_cap():
     ph, ra = weight_to_polar(m)
     assert abs(ph - 210.0) < 1e-9 and abs(ra + 6.0) < 1e-9
     assert abs(weight_from_polar(0.0, 40.0)) == WEIGHT_MAX_ABS
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            weight_from_polar(bad, 0.0)
+        with pytest.raises(ValueError):
+            weight_from_polar(0.0, bad)
 
 
 def test_fit_null_kills_a_directional_noise_source():
@@ -194,3 +202,63 @@ def test_refit_declines_without_enough_gain():
     assert tr.refit("null") is False
     assert tr.m == 0j and tr.updates == 0
     assert REFIT_MIN_GAIN_DB > 0
+
+
+def test_null_refuses_to_select_the_quieter_antenna():
+    """Uncorrelated noise has nothing to null: with channel B dead (or just
+    quieter) the smallest eigenvector is 'B alone', which must not be adopted."""
+    for pb in (0.5, 0.1, 1e-4):
+        tr = Tracker(RATE)
+        tr.Rn = np.diag([1.0, pb]).astype(complex)
+        assert tr.refit("null") is False, pb
+        assert tr.m == 0j
+
+
+def test_null_declines_when_it_would_cost_signal():
+    rng = np.random.default_rng(12)
+    n = 50_000
+    qrm = _noise(rng, n, 1.0)
+    sig = 0.5 * _noise(rng, n)
+    a_n, b_n = _two_channel(rng, n, [(qrm, 1.1, 0.8)], white=0.05)
+    a_s, b_s = _two_channel(rng, n, [(sig, 1.1, 0.8)], white=0.0)   # same bearing as the QRM
+    Xn = np.vstack([a_n, b_n]); X = np.vstack([a_n + a_s, b_n + b_s])
+    tr = Tracker(RATE)
+    tr.Rn = (Xn @ Xn.conj().T) / n
+    tr.Rs = (X @ X.conj().T) / n
+    assert tr.refit("null") is False       # the null would land on the talker too
+    tr.Rs = None
+    assert tr.refit("null") is True        # with no signal knowledge it is a valid null
+
+
+def test_weak_signal_below_the_vad_is_not_learned_as_noise():
+    rng = np.random.default_rng(13)
+    tr = Tracker(RATE)
+    block = 1024
+    for _ in range(60):                                    # settle floor and Rn on noise
+        a, b = _two_channel(rng, block, [], white=1.0)
+        tr.update(a, b, "off")
+    Rn_before = tr.Rn.copy()
+    for _ in range(60):                                    # +1 dB coherent signal, one bearing
+        a, b = _two_channel(rng, block, [(np.sqrt(0.26) * _noise(rng, block), 0.9, 1.0)], white=1.0)
+        tr.update(a, b, "off")
+        assert not tr.talking
+    # Rn kept its (uncorrelated) shape: the signal's spatial signature was not booked.
+    assert abs(tr.Rn[0, 1]) < 0.05 * abs(tr.Rn[0, 0]), tr.Rn
+    assert np.allclose(np.diag(tr.Rn), np.diag(Rn_before), rtol=0.15)
+
+
+def test_a_short_burst_does_not_train_the_signal_covariance():
+    rng = np.random.default_rng(14)
+    tr = Tracker(RATE)
+    block = 256                                            # ~10 ms, shorter than TALK_HOLD_S
+    assert block / RATE < TALK_HOLD_S
+    for _ in range(200):
+        a, b = _two_channel(rng, block, [], white=1.0)
+        tr.update(a, b, "track")
+    for _ in range(5):                                     # crash, quiet, crash, quiet ...
+        a, b = _two_channel(rng, block, [(30.0 * _noise(rng, block), 2.5, 1.0)], white=1.0)
+        tr.update(a, b, "track")
+        assert tr.talking
+        a, b = _two_channel(rng, block, [], white=1.0)
+        tr.update(a, b, "track")
+    assert tr.Rs is None and tr.updates == 0

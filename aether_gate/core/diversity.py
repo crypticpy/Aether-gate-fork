@@ -55,9 +55,16 @@ import numpy as np
 # true offset is outside the search window.
 ALIGN_MIN_PEAK = 10.0
 
-# |m| is capped so a dead or disconnected channel B cannot be amplified into
-# the output by a fit that "sees" less noise there (20 dB either way).
+# |m| is capped at 20 dB either way so a fit can never hand the output to one
+# channel alone by a large factor. The cap is not what protects a dead or
+# disconnected channel B: that is NULL_MIN_COHERENCE below.
 WEIGHT_MAX_ABS = 10.0
+
+# A null is adopted only when the two channels' noise is this coherent
+# (|Rn01| / sqrt(Rn00 Rn11)). Uncorrelated noise has nothing to null, and the
+# smallest eigenvector of a near-diagonal Rn is simply the quieter channel:
+# with tuner 2 unplugged it would put 99 % of the output on the dead input.
+NULL_MIN_COHERENCE = 0.3
 
 # A refit replaces the current weight only if it predicts at least this
 # much improvement, so the weight does not chatter on estimation noise.
@@ -68,6 +75,20 @@ REFIT_MIN_GAIN_DB = 0.3
 # and the block mean of ~1000 noise samples wanders by ~3%, so 1.5 is still
 # far outside the noise's own scatter.
 VAD_RATIO = 1.5                     # ~ +1.8 dB
+
+# A quiet block is booked into the noise covariance only if its power is
+# within this ratio of the noise power already learned (the mean of Rn's
+# diagonal), so a signal too weak to trip the VAD is booked nowhere rather
+# than learned as "noise" and then nulled: the classic signal-cancellation
+# failure of adaptive nulling, which bites at exactly the SNR where
+# diversity is worth having. Measured against the learned mean, not the
+# tracked floor, so it does not depend on how much block powers scatter.
+NOISE_MAX_RATIO = 1.15              # ~ +0.6 dB
+
+# The signal covariance only learns from talking that has lasted this long.
+# A static crash is many dB above the floor for a few milliseconds; booking
+# it would steer the beam at the lightning instead of the operator.
+TALK_HOLD_S = 0.05
 
 
 def find_lag(a, b, max_lag):
@@ -144,7 +165,10 @@ class Aligner:
 
 def weight_from_polar(phase_deg, ratio_db):
     """The manual weight: |m| from a dB ratio, angle from degrees."""
-    mag = min(WEIGHT_MAX_ABS, 10.0 ** (float(ratio_db) / 20.0))
+    phase_deg, ratio_db = float(phase_deg), float(ratio_db)
+    if not (math.isfinite(phase_deg) and math.isfinite(ratio_db)):
+        raise ValueError("phase and ratio must be finite")
+    mag = min(WEIGHT_MAX_ABS, 10.0 ** (ratio_db / 20.0))
     return mag * np.exp(1j * math.radians(float(phase_deg)))
 
 
@@ -237,6 +261,7 @@ class Tracker:
         self.updates = 0
         self.talking = False
         self._since_fit = 0.0
+        self._talk_s = 0.0
 
     def _alpha(self, n, tc_s):
         """EMA coefficient for a block of n samples against a time constant."""
@@ -258,11 +283,16 @@ class Tracker:
             self.floor += self._alpha(n, self.floor_rise_s) * (p - self.floor)
         self.talking = p > VAD_RATIO * self.floor
         if self.talking:
-            al = self._alpha(n, self.signal_tc_s)
-            self.Rs = R if self.Rs is None else (1 - al) * self.Rs + al * R
+            self._talk_s += n / self.rate_hz
+            if self._talk_s >= TALK_HOLD_S:
+                al = self._alpha(n, self.signal_tc_s)
+                self.Rs = R if self.Rs is None else (1 - al) * self.Rs + al * R
         else:
-            al = self._alpha(n, self.noise_tc_s)
-            self.Rn = R if self.Rn is None else (1 - al) * self.Rn + al * R
+            self._talk_s = 0.0
+            ref = float(np.real(np.trace(self.Rn))) / 2.0 if self.Rn is not None else p
+            if p <= NOISE_MAX_RATIO * ref:
+                al = self._alpha(n, self.noise_tc_s)
+                self.Rn = R if self.Rn is None else (1 - al) * self.Rn + al * R
         self._since_fit += n / self.rate_hz
         if mode in ("null", "track") and self._since_fit >= self.refresh_s:
             self._since_fit = 0.0
@@ -279,9 +309,14 @@ class Tracker:
             return False
         Rn = self._loaded_noise()
         if mode == "null":
+            if _coherence(Rn) < NULL_MIN_COHERENCE:
+                return False                    # nothing directional to null
             cand = fit_null(Rn)
             gain = _out_noise(self.m, Rn) / max(_out_noise(cand, Rn), 1e-30)
             gain_db = 10.0 * math.log10(max(gain, 1e-30))
+            if self.Rs is not None and \
+                    _snr_of(cand, self.Rs, Rn) < _snr_of(self.m, self.Rs, Rn):
+                return False                    # quieter, but at the signal's expense
         elif mode == "track":
             if self.Rs is None:
                 return False
@@ -310,6 +345,12 @@ class Tracker:
         sb = (float(np.real(self.Rs[1, 1] - Rn[1, 1])) / float(np.real(Rn[1, 1])))
         return {"a": db(max(sa, 0.0)), "b": db(max(sb, 0.0)),
                 "out": db(_snr_of(m, self.Rs, Rn))}
+
+
+def _coherence(R):
+    """|R01| / sqrt(R00 R11): how much of the two channels' power is shared."""
+    d = math.sqrt(max(float(np.real(R[0, 0])) * float(np.real(R[1, 1])), 0.0))
+    return abs(complex(R[0, 1])) / d if d > 0 else 0.0
 
 
 def _out_noise(m, Rn):
