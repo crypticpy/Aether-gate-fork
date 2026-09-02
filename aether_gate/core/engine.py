@@ -3070,6 +3070,23 @@ h2{{color:#5cf}} label{{display:block;margin:16px 0 4px}} select,input[type=rang
   <select id=divsource onchange=setDivSource()>
     <option value=combined>Combined</option><option value=a>A</option><option value=b>B</option>
   </select>
+  <label style="margin:10px 0 3px;font-size:12px;color:#9ab">
+    <input type=checkbox id=divnb onchange=divNbToggle()> Noise blanker &mdash; threshold
+    <input type=number id=divnbdb min=0 max=40 step=0.5 value=12 style="width:54px" oninput=divNbDbInput()> dB
+  </label>
+  <label style="margin:10px 0 3px;font-size:12px;color:#9ab">Pan</label>
+  <select id=divpan onchange=setDivPan()>
+    <option value=a>A</option><option value=b>B</option><option value=combined>Combined</option><option value=nulled>Nulled</option>
+  </select>
+  <label style="margin:10px 0 3px;font-size:12px;color:#9ab">Noise map</label>
+  <canvas id=divmap width=386 height=28 style="display:block;background:#0d1620;border:1px solid #234;border-radius:3px"></canvas>
+  <div id=divsources style="font-size:12px;color:#bcd;margin-top:6px;line-height:1.5">&nbsp;</div>
+  <div style="font-size:12px;color:#9ab;margin-top:6px">memory: <span id=divmemn>0</span> talkers &middot; <a href="#" onclick="divMemClear();return false" style="color:#5cf">clear</a></div>
+  <div style="display:flex;gap:6px;align-items:center;margin-top:8px">
+    <input type=number id=divcapsec min=1 max=60 step=1 value=10 style="width:54px">
+    <button onclick="divCapture()">Capture</button>
+    <span id=divcapstat style="font-size:12px;color:#789"></span>
+  </div>
   <div id=divnote style="font-size:12px;color:#789;margin-top:7px">&nbsp;</div>
 </div>
 <label>Pattern</label><select id=pat onchange=upd()>{options}</select>
@@ -3304,10 +3321,26 @@ function paintDiv(s){{
   if(active!=='divratio'){{document.getElementById('divratio').value=s.ratio_db;
     document.getElementById('divratiov').textContent=s.ratio_db;}}
   if(active!=='divsource')document.getElementById('divsource').value=s.source;
+  var nb=s.nb||{{}};
+  if(active!=='divnb')document.getElementById('divnb').checked=!!nb.enabled;
+  if(active!=='divnbdb'&&nb.threshold_db!=null)document.getElementById('divnbdb').value=nb.threshold_db;
+  if(active!=='divpan'&&s.pan)document.getElementById('divpan').value=s.pan;
+  var srcs=s.sources||[];
+  document.getElementById('divsources').innerHTML=srcs.length?srcs.map(function(src,i){{
+    return (src.lo_hz/1e6).toFixed(3)+'&ndash;'+(src.hi_hz/1e6).toFixed(3)+' MHz &middot; coh '
+      +src.coherence.toFixed(2)+' &middot; &phi; '+Math.round(src.phase_deg)+'&deg; &middot; '
+      +src.ratio_db.toFixed(1)+' dB <button onclick="nullSource('+i+')">Null</button>';
+  }}).join('<br>'):'&nbsp;';
+  document.getElementById('divmemn').textContent=(s.memory||[]).length;
+  var cap=s.capture||{{}};
+  document.getElementById('divcapstat').textContent=cap.active?'recording…':(cap.path||'');
   var snr=s.snr_db||{{}};
+  var extra='';
+  if(s.rn_source)extra+=' · rn: '+s.rn_source;
+  if(s.talk_mod!=null)extra+=' · talk_mod '+s.talk_mod.toFixed(2);
   document.getElementById('divnote').textContent='lag '+s.lag_samples+' samples · aligned '
     +(s.aligned?'yes':'no')+' · corr peak '+(s.corr_peak!=null?s.corr_peak.toFixed(2):'—')
-    +' · SNR a/b/out '+fmtSnr(snr.a)+'/'+fmtSnr(snr.b)+'/'+fmtSnr(snr.out);
+    +' · SNR a/b/out '+fmtSnr(snr.a)+'/'+fmtSnr(snr.b)+'/'+fmtSnr(snr.out)+extra;
 }}
 function pollDiv(){{fetch('/diversity').then(r=>r.json()).then(paintDiv).catch(()=>{{
   document.getElementById('divbox').style.display='none';}});}}
@@ -3325,6 +3358,47 @@ var sendDivRatio=debounce(function(){{
 }},150);
 function divRatioInput(){{document.getElementById('divratiov').textContent=document.getElementById('divratio').value;
   sendDivRatio();}}
+function sendDivSet(qs){{fetch('/diversity/set?'+qs).then(r=>r.json()).then(paintDiv);}}
+function divNbToggle(){{sendDivSet('nb='+(document.getElementById('divnb').checked?'on':'off'));}}
+var sendDivNbDb=debounce(function(){{sendDivSet('nb_db='+document.getElementById('divnbdb').value);}},150);
+function divNbDbInput(){{sendDivNbDb();}}
+function setDivPan(){{sendDivSet('pan='+document.getElementById('divpan').value);}}
+function nullSource(i){{sendDivSet('null_source='+i);}}
+function divMemClear(){{fetch('/diversity/memory/clear').then(r=>r.json()).then(pollDiv);}}
+function divCapture(){{
+  var secs=document.getElementById('divcapsec').value;
+  var stat=document.getElementById('divcapstat');
+  stat.textContent='capturing…';
+  fetch('/diversity/capture?seconds='+secs).then(r=>r.json()).then(function(r){{
+    stat.textContent=r.error?('error: '+r.error):('saved: '+r.path);
+  }}).catch(function(e){{stat.textContent='failed: '+e;}});
+}}
+function paintDivMap(m){{
+  var cv=document.getElementById('divmap');
+  if(!cv)return;
+  var ctx=cv.getContext('2d');
+  ctx.clearRect(0,0,cv.width,cv.height);
+  if(!m||m.error||!m.coherence||!m.coherence.length)return;
+  var n=m.coherence.length,w=cv.width/n;
+  for(var i=0;i<n;i++){{
+    var c=Math.max(0,Math.min(1,m.coherence[i]));
+    var lo=[0x23,0x34,0x45],hi=[0x55,0xcc,0xff];
+    var rgb=lo.map(function(v,k){{return Math.round(v+(hi[k]-v)*c);}});
+    ctx.fillStyle='rgb('+rgb.join(',')+')';
+    var h=Math.max(1,c*cv.height);
+    ctx.fillRect(i*w,cv.height-h,Math.max(1,w),h);
+  }}
+  (m.sources||[]).forEach(function(src){{
+    if(!m.step_hz||!m.start_hz)return;
+    var lo=Math.round((src.lo_hz-m.start_hz)/m.step_hz);
+    var hi=Math.round((src.hi_hz-m.start_hz)/m.step_hz);
+    ctx.strokeStyle='#5cf';ctx.lineWidth=2;
+    ctx.beginPath();
+    ctx.moveTo(lo*w,cv.height-1);ctx.lineTo(hi*w,cv.height-1);
+    ctx.stroke();
+  }});
+}}
+function pollDivMap(){{fetch('/diversity/map').then(r=>r.json()).then(paintDivMap).catch(function(){{}});}}
 
 // ---- live test (drive the real AE) ----
 var liveTimer=null, livePaused=false;
@@ -3375,6 +3449,7 @@ function livePoll(){{fetch('/live-test/status').then(r=>r.json()).then(s=>{{
 loadFixtures();loadRulers();loadReports();
 pollStatus();setInterval(pollStatus,1500);
 pollDiv();setInterval(pollDiv,1000);
+pollDivMap();setInterval(pollDivMap,2000);
 upd();
 </script></body></html>"""
 
@@ -3430,9 +3505,12 @@ def start_control_server(radio, port):
                 if getattr(radio.adapter, "diversity_available", False):
                     try:
                         ds = radio.adapter.diversity_status()
+                        nb = ds.get("nb")
                         div = {"mode": ds.get("mode"), "phase_deg": ds.get("phase_deg"),
                                "ratio_db": ds.get("ratio_db"), "aligned": ds.get("aligned"),
-                               "snr_db": ds.get("snr_db")}
+                               "snr_db": ds.get("snr_db"),
+                               "nb": nb.get("enabled") if isinstance(nb, dict) else None,
+                               "pan": ds.get("pan")}
                     except Exception:
                         div = None
                 return self._json({
@@ -3622,11 +3700,18 @@ def start_control_server(radio, port):
 
             # ---- RSPduo diversity: two coherent tuners combined into one RX ----
             # GET /diversity                            -> current mode/weight/alignment
-            # GET /diversity/set?mode=&phase=&ratio=&source=&slice= -> apply what's present
+            # GET /diversity/set?mode=&phase=&ratio=&source=&slice=&nb=&nb_db=&pan=&null_source=
+            #                                            -> apply what's present
             # GET /diversity/align                      -> re-measure the inter-tuner lag
+            # GET /diversity/map                        -> coherence/level sweep for the panel
+            # GET /diversity/capture?seconds=            -> start a diagnostic IQ capture
+            # GET /diversity/memory/clear                -> forget remembered talker positions
             #
             # {"available": false} (never an error page) on any adapter that isn't
-            # diversity-capable, so the panel can poll it unconditionally.
+            # diversity-capable, so the panel can poll it unconditionally. The v2
+            # additions (map/capture/memory) may not exist on every diversity-capable
+            # adapter yet, so those are gated on getattr(...) and answer a plain
+            # {"error": "not supported"} rather than a traceback when absent.
             if u.path == "/diversity":
                 a = radio.adapter
                 if not getattr(a, "diversity_available", False):
@@ -3661,6 +3746,26 @@ def start_control_server(radio, port):
                         kwargs["ratio_db"] = ratio
                     if "slice" in q:
                         kwargs["slice_id"] = int(q["slice"][0])
+                    if "nb" in q:
+                        nb = q["nb"][0]
+                        if nb not in ("on", "off"):
+                            raise ValueError(f"nb={nb!r}")
+                        kwargs["nb"] = nb == "on"
+                    if "nb_db" in q:
+                        nb_db = float(q["nb_db"][0])
+                        if not math.isfinite(nb_db) or not (0.0 <= nb_db <= 40.0):
+                            raise ValueError(f"nb_db={q['nb_db'][0]!r}")
+                        kwargs["nb_db"] = nb_db
+                    if "pan" in q:
+                        pan = q["pan"][0]
+                        if pan not in ("a", "b", "combined", "nulled"):
+                            raise ValueError(f"pan={pan!r}")
+                        kwargs["pan"] = pan
+                    if "null_source" in q:
+                        null_source = int(q["null_source"][0])
+                        if null_source < 0:
+                            raise ValueError(f"null_source={q['null_source'][0]!r}")
+                        kwargs["null_source"] = null_source
                 except (ValueError, TypeError) as e:
                     return self._json({"error": f"bad value: {e}"})
                 log(f"[ctl] diversity/set -> {kwargs}")
@@ -3671,6 +3776,41 @@ def start_control_server(radio, port):
                     return self._json({"available": False})
                 log("[ctl] diversity realign")
                 return self._json(a.diversity_realign())
+            if u.path == "/diversity/map":
+                a = radio.adapter
+                fn = (getattr(a, "diversity_map", None)
+                      if getattr(a, "diversity_available", False) else None)
+                if fn is None:
+                    return self._json({"error": "not supported"})
+                return self._json(fn())
+            if u.path == "/diversity/capture":
+                a = radio.adapter
+                fn = (getattr(a, "diversity_capture", None)
+                      if getattr(a, "diversity_available", False) else None)
+                if fn is None:
+                    return self._json({"error": "not supported"})
+                q = urllib.parse.parse_qs(u.query)
+                try:
+                    seconds = int(q.get("seconds", ["10"])[0])
+                    if not (1 <= seconds <= 60):
+                        raise ValueError(f"seconds={q.get('seconds', ['10'])[0]!r}")
+                except (ValueError, TypeError) as e:
+                    return self._json({"error": f"bad value: {e}"})
+                try:
+                    path = fn(seconds)
+                except RuntimeError as e:
+                    return self._json({"error": str(e)})
+                log(f"[ctl] diversity capture ({seconds}s) -> {path}")
+                return self._json({"ok": True, "path": path})
+            if u.path == "/diversity/memory/clear":
+                a = radio.adapter
+                fn = (getattr(a, "diversity_memory_clear", None)
+                      if getattr(a, "diversity_available", False) else None)
+                if fn is None:
+                    return self._json({"error": "not supported"})
+                fn()
+                log("[ctl] diversity memory cleared")
+                return self._json({"ok": True})
 
             if u.path == "/resolution":
                 q = urllib.parse.parse_qs(u.query)
