@@ -3448,6 +3448,10 @@ function paintDivScopeText(s){{
     +' peak:'+(s.corr_peak!=null?s.corr_peak.toFixed(2):'—')
     +' nb:'+(nb.blanked_pct!=null?nb.blanked_pct.toFixed(1)+'%':'—')
     +' mem:'+(s.memory||[]).length+' cap:'+(cap.active?'REC':'off');
+  var tk=s.talker,tkName='';
+  if(tk){{var e=(s.memory||[]).find(function(m){{return m.id===tk.id;}});
+    tkName=' talker:#'+tk.id+(e&&e.name?' '+e.name:'')+' '+tk.since_s.toFixed(0)+'s';}}
+  line2+=tkName;
   var pb=s.passband||{{}};
   var line3='qrm:'+(s.steady_qrm?'<span style="color:#e94">STEADY</span>':'none  ')
     +' passband flat:'+(pb.flatness!=null?pb.flatness.toFixed(2):'—')
