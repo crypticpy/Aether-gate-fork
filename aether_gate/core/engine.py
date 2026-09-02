@@ -3053,18 +3053,30 @@ h2{{color:#5cf}} label{{display:block;margin:16px 0 4px}} select,input[type=rang
 </div>
 <div id=divbox style="background:#15202b;border:1px solid #243;border-radius:6px;padding:10px 12px;margin:0 0 14px;display:none">
   <div style="display:flex;align-items:baseline;justify-content:space-between">
-    <b style="color:#5cf">Diversity</b><span class=v id=divmodev style="font-size:15px">&mdash;</span>
+    <b style="color:#5cf">Diversity</b><span class=v id=divmodev style="font-size:15px;display:inline-block;width:64px;text-align:right;font-family:monospace">&mdash;</span>
   </div>
-  <div style="display:flex;gap:6px;margin-top:8px">
+  <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">
     <button id=dm_off onclick="setDivMode('off')">Off</button>
     <button id=dm_manual onclick="setDivMode('manual')">Manual</button>
     <button id=dm_null onclick="setDivMode('null')">Null</button>
     <button id=dm_track onclick="setDivMode('track')">Track</button>
+    <button id=divheara
+      onmousedown="divHearAStart(event)" ontouchstart="divHearAStart(event)"
+      onmouseup="divHearAEnd(event)" onmouseleave="divHearAEnd(event)"
+      ontouchend="divHearAEnd(event)" ontouchcancel="divHearAEnd(event)"
+      onblur="divHearAEnd(event)"
+      title="Hold to bypass diversity and hear tuner A alone; releases back to the current mode">
+      &#128066; Hear A only (hold)</button>
     <button onclick="divRealign()" style="margin-left:auto">&#8635; Realign</button>
   </div>
-  <label style="margin:10px 0 3px;font-size:12px;color:#9ab">Phase: <span class=v id=divphasev>0</span>&deg;</label>
+  <div style="margin-top:10px">
+    <label style="margin:0 0 3px;font-size:12px;color:#9ab">Diversity scope</label>
+    <canvas id=divscope width=386 height=140 style="display:block;background:#0d1620;border:1px solid #234;border-radius:3px"></canvas>
+    <div id=divscopetxt style="font-family:monospace;font-size:11px;color:#9ab;height:34px;line-height:17px;overflow:hidden;white-space:nowrap;margin-top:4px">&nbsp;</div>
+  </div>
+  <label style="margin:10px 0 3px;font-size:12px;color:#9ab">Phase: <span class=v id=divphasev style="display:inline-block;width:32px;text-align:right;font-family:monospace">0</span>&deg;</label>
   <input type=range id=divphase min=0 max=360 step=1 value=0 oninput=divPhaseInput()>
-  <label style="margin:10px 0 3px;font-size:12px;color:#9ab">Ratio: <span class=v id=divratiov>0</span> dB</label>
+  <label style="margin:10px 0 3px;font-size:12px;color:#9ab">Ratio: <span class=v id=divratiov style="display:inline-block;width:40px;text-align:right;font-family:monospace">0</span> dB</label>
   <input type=range id=divratio min=-20 max=20 step=0.5 value=0 oninput=divRatioInput()>
   <label style="margin:10px 0 3px;font-size:12px;color:#9ab">Source</label>
   <select id=divsource onchange=setDivSource()>
@@ -3087,7 +3099,6 @@ h2{{color:#5cf}} label{{display:block;margin:16px 0 4px}} select,input[type=rang
     <button onclick="divCapture()">Capture</button>
     <span id=divcapstat style="font-size:12px;color:#789"></span>
   </div>
-  <div id=divnote style="font-size:12px;color:#789;margin-top:7px">&nbsp;</div>
 </div>
 <label>Pattern</label><select id=pat onchange=upd()>{options}</select>
 <div id=hint style="background:#15202b;border-left:3px solid #5cf;padding:8px 11px;margin:8px 0;font-size:13px;color:#bcd;line-height:1.45"></div>
@@ -3304,7 +3315,18 @@ function pollStatus(){{fetch('/status').then(r=>r.json()).then(s=>{{
 }});}}
 
 // ---- diversity (RSPduo two-tuner combine) ----
+// The panel used to write the phase/ratio controls straight from every poll,
+// which made them visibly jitter in null/track mode (the algorithm, not the
+// operator, owns the weight there) and glitch mid-drag in manual mode. The
+// rule now: null/track lock the controls and never touch them; manual only
+// rewrites a control when the server disagrees with what we last sent, and
+// never while the operator has it focused. divSent is that "what we last
+// sent" baseline (null until the operator or an initial poll establishes it).
+var divSent={{phase:null,ratio:null}};
+var divCurMode='manual';   // last real mode seen (not the transient 'off' from Hear-A)
+var divTrail=[];           // last ~30 [phase_deg,ratio_db] weight samples, for the scope trail
 function fmtSnr(v){{return v==null?'—':v.toFixed(1);}}
+function pad(v,n){{v=''+v;while(v.length<n)v+=' ';return v;}}
 function debounce(fn,ms){{var t=null;return function(){{var args=arguments;clearTimeout(t);
   t=setTimeout(function(){{fn.apply(null,args);}},ms);}};}}
 function paintDiv(s){{
@@ -3315,11 +3337,22 @@ function paintDiv(s){{
   ['off','manual','null','track'].forEach(function(m){{
     document.getElementById('dm_'+m).style.background=(s.mode===m?'#5cf':'');
   }});
+  if(!divHearActive)divCurMode=s.mode;
   var active=document.activeElement?document.activeElement.id:'';
-  if(active!=='divphase'){{document.getElementById('divphase').value=s.phase_deg;
-    document.getElementById('divphasev').textContent=Math.round(s.phase_deg);}}
-  if(active!=='divratio'){{document.getElementById('divratio').value=s.ratio_db;
-    document.getElementById('divratiov').textContent=s.ratio_db;}}
+  var phaseEl=document.getElementById('divphase'),ratioEl=document.getElementById('divratio');
+  // null/track own the weight — the slider/box are locked and never written.
+  var lockWeight=(s.mode==='null'||s.mode==='track');
+  phaseEl.disabled=lockWeight;ratioEl.disabled=lockWeight;
+  if(!lockWeight){{
+    if(active!=='divphase'&&(divSent.phase===null||Math.abs(s.phase_deg-divSent.phase)>1e-6)){{
+      phaseEl.value=s.phase_deg;document.getElementById('divphasev').textContent=Math.round(s.phase_deg);
+      divSent.phase=s.phase_deg;
+    }}
+    if(active!=='divratio'&&(divSent.ratio===null||Math.abs(s.ratio_db-divSent.ratio)>1e-6)){{
+      ratioEl.value=s.ratio_db;document.getElementById('divratiov').textContent=s.ratio_db;
+      divSent.ratio=s.ratio_db;
+    }}
+  }}
   if(active!=='divsource')document.getElementById('divsource').value=s.source;
   var nb=s.nb||{{}};
   if(active!=='divnb')document.getElementById('divnb').checked=!!nb.enabled;
@@ -3334,27 +3367,120 @@ function paintDiv(s){{
   document.getElementById('divmemn').textContent=(s.memory||[]).length;
   var cap=s.capture||{{}};
   document.getElementById('divcapstat').textContent=cap.active?'recording…':(cap.path||'');
+  paintDivScope(s);
+  paintDivScopeText(s);
+}}
+// ---- diversity scope: a canvas + a fixed-height text row instead of text
+// that reflows the page every poll (that reflow was the operator's original
+// complaint) ----
+function paintDivScope(s){{
+  var cv=document.getElementById('divscope');
+  if(!cv)return;
+  var ctx=cv.getContext('2d');
+  ctx.clearRect(0,0,cv.width,cv.height);
+  if(!s||!s.available)return;
+  // left: polar plot of the live weight — radius = ratio_db (-20..+20dB -> 0..R), angle = phase_deg
+  var cx=72,cy=68,R=54;
+  ctx.strokeStyle='#234';ctx.lineWidth=1;
+  [0.25,0.5,0.75,1].forEach(function(f){{ctx.beginPath();ctx.arc(cx,cy,R*f,0,2*Math.PI);ctx.stroke();}});
+  ctx.beginPath();ctx.moveTo(cx-R,cy);ctx.lineTo(cx+R,cy);ctx.moveTo(cx,cy-R);ctx.lineTo(cx,cy+R);ctx.stroke();
+  ctx.fillStyle='#789';ctx.font='9px monospace';ctx.textAlign='center';
+  ctx.fillText('phase / ratio',cx,cy+R+16);
+  function mapPt(phase,ratio){{
+    var th=(phase||0)*Math.PI/180;
+    var r=Math.max(0,Math.min(R,((ratio==null?0:ratio)+20)/40*R));
+    return [cx+r*Math.cos(th),cy-r*Math.sin(th)];
+  }}
+  (s.memory||[]).forEach(function(mem){{
+    var p=mapPt(mem.phase_deg,mem.ratio_db);
+    ctx.strokeStyle='#789';ctx.lineWidth=1;
+    ctx.beginPath();ctx.arc(p[0],p[1],3,0,2*Math.PI);ctx.stroke();
+  }});
+  if(s.phase_deg!=null&&s.ratio_db!=null){{
+    divTrail.push([s.phase_deg,s.ratio_db]);
+    if(divTrail.length>30)divTrail.shift();
+  }}
+  divTrail.forEach(function(pt,i){{
+    var p=mapPt(pt[0],pt[1]);
+    ctx.globalAlpha=0.12+0.5*(i/Math.max(1,divTrail.length-1));
+    ctx.fillStyle='#5cf';
+    ctx.beginPath();ctx.arc(p[0],p[1],2,0,2*Math.PI);ctx.fill();
+  }});
+  ctx.globalAlpha=1;
+  if(divTrail.length){{
+    var last=mapPt(divTrail[divTrail.length-1][0],divTrail[divTrail.length-1][1]);
+    ctx.fillStyle='#fa3';
+    ctx.beginPath();ctx.arc(last[0],last[1],4,0,2*Math.PI);ctx.fill();
+  }}
+  // middle: SNR bars A / B / OUT (fixed -10..+30dB scale), OUT in the accent colour
+  var bx=158,bw=cv.width-bx-10;
+  function snrBar(y,label,v,color){{
+    ctx.fillStyle='#9ab';ctx.font='10px monospace';ctx.textAlign='left';
+    ctx.fillText(label,bx,y-3);
+    ctx.strokeStyle='#234';ctx.strokeRect(bx,y,bw,12);
+    if(v!=null){{
+      var frac=Math.max(0,Math.min(1,(v+10)/40));
+      ctx.fillStyle=color;
+      ctx.fillRect(bx,y,bw*frac,12);
+    }}
+    ctx.fillStyle='#bcd';ctx.font='9px monospace';ctx.textAlign='right';
+    ctx.fillText(v==null?'—':v.toFixed(1)+'dB',bx+bw-2,y+10);
+  }}
   var snr=s.snr_db||{{}};
-  var extra='';
-  if(s.rn_source)extra+=' · rn: '+s.rn_source;
-  if(s.talk_mod!=null)extra+=' · talk_mod '+s.talk_mod.toFixed(2);
-  document.getElementById('divnote').textContent='lag '+s.lag_samples+' samples · aligned '
-    +(s.aligned?'yes':'no')+' · corr peak '+(s.corr_peak!=null?s.corr_peak.toFixed(2):'—')
-    +' · SNR a/b/out '+fmtSnr(snr.a)+'/'+fmtSnr(snr.b)+'/'+fmtSnr(snr.out)+extra;
+  snrBar(20,'A',snr.a,'#888');
+  snrBar(56,'B',snr.b,'#888');
+  snrBar(92,'OUT',snr.out,'#5cf');
+  var best=(snr.a==null&&snr.b==null)?null:Math.max(snr.a==null?-1e9:snr.a,snr.b==null?-1e9:snr.b);
+  var gain=(snr.out!=null&&best!=null)?(snr.out-best):null;
+  ctx.textAlign='left';ctx.fillStyle='#5cf';ctx.font='11px monospace';
+  ctx.fillText('gain '+(gain==null?'—':(gain>=0?'+':'')+gain.toFixed(1)+' dB'),bx,116);
+}}
+function paintDivScopeText(s){{
+  var el=document.getElementById('divscopetxt');
+  if(!el)return;
+  if(!s||!s.available){{el.textContent='';return;}}
+  var nb=s.nb||{{}},cap=s.capture||{{}};
+  var talk=s.talking?'<span style="color:#3c6">●</span>':'<span style="color:#555">○</span>';
+  var line1='mode:'+pad(s.mode,6)+' '+talk+' talk_mod:'+(s.talk_mod!=null?s.talk_mod.toFixed(2):'—')
+    +' rn:'+pad(s.rn_source||'—',7)+' upd:'+(s.updates!=null?s.updates:0);
+  var line2='aligned:'+(s.aligned?'yes':'no ')+' lag:'+(s.lag_samples!=null?s.lag_samples:'—')
+    +' peak:'+(s.corr_peak!=null?s.corr_peak.toFixed(2):'—')
+    +' nb:'+(nb.blanked_pct!=null?nb.blanked_pct.toFixed(1)+'%':'—')
+    +' mem:'+(s.memory||[]).length+' cap:'+(cap.active?'REC':'off');
+  el.innerHTML=line1+'<br>'+line2;
 }}
 function pollDiv(){{fetch('/diversity').then(r=>r.json()).then(paintDiv).catch(()=>{{
   document.getElementById('divbox').style.display='none';}});}}
+// ---- "Hear A only" compare button: bypass diversity while held, restore the
+// mode that was active before the press on release/blur so it can never get
+// stuck off. ----
+var divHearActive=false;
+function divHearAStart(e){{
+  if(e&&e.preventDefault)e.preventDefault();
+  if(divHearActive)return;
+  divHearActive=true;
+  fetch('/diversity/set?mode=off');
+}}
+function divHearAEnd(e){{
+  if(!divHearActive)return;
+  divHearActive=false;
+  fetch('/diversity/set?mode='+divCurMode).then(r=>r.json()).then(paintDiv);
+}}
 function setDivMode(m){{fetch('/diversity/set?mode='+m).then(r=>r.json()).then(paintDiv);}}
 function setDivSource(){{fetch('/diversity/set?source='+document.getElementById('divsource').value)
   .then(r=>r.json()).then(paintDiv);}}
 function divRealign(){{fetch('/diversity/align').then(r=>r.json()).then(paintDiv);}}
 var sendDivPhase=debounce(function(){{
-  fetch('/diversity/set?phase='+document.getElementById('divphase').value).then(r=>r.json()).then(paintDiv);
+  var v=document.getElementById('divphase').value;
+  divSent.phase=parseFloat(v);
+  fetch('/diversity/set?phase='+v).then(r=>r.json()).then(paintDiv);
 }},150);
 function divPhaseInput(){{document.getElementById('divphasev').textContent=document.getElementById('divphase').value;
   sendDivPhase();}}
 var sendDivRatio=debounce(function(){{
-  fetch('/diversity/set?ratio='+document.getElementById('divratio').value).then(r=>r.json()).then(paintDiv);
+  var v=document.getElementById('divratio').value;
+  divSent.ratio=parseFloat(v);
+  fetch('/diversity/set?ratio='+v).then(r=>r.json()).then(paintDiv);
 }},150);
 function divRatioInput(){{document.getElementById('divratiov').textContent=document.getElementById('divratio').value;
   sendDivRatio();}}
@@ -3448,7 +3574,7 @@ function livePoll(){{fetch('/live-test/status').then(r=>r.json()).then(s=>{{
 
 loadFixtures();loadRulers();loadReports();
 pollStatus();setInterval(pollStatus,1500);
-pollDiv();setInterval(pollDiv,1000);
+pollDiv();setInterval(pollDiv,500);
 pollDivMap();setInterval(pollDivMap,2000);
 upd();
 </script></body></html>"""
