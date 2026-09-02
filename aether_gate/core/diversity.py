@@ -44,11 +44,16 @@ import math
 import numpy as np
 
 # Alignment is accepted only when the correlation peak stands this far above
-# the window's median. Band noise from two loops a few metres apart is only
-# partly correlated, but 0.5 s of it at 125 kS/s is 62 500 samples of
-# processing gain, so a real peak is tens of times the floor. A ratio this
-# low only happens when one channel is dead or the two are not coherent.
-ALIGN_MIN_PEAK = 6.0
+# the window's median. The correlation is phase-transformed (GCC-PHAT): every
+# frequency bin votes with unit weight, so the peak height is the coherence
+# between the channels and the floor is 1/sqrt(FFT length). Band noise from
+# two loops a few metres apart is only partly coherent, but 0.5 s of it at
+# 125 kS/s is an FFT of 2^17 bins, so even 20 % coherence stands ~60x above
+# the floor. The largest of ~16 000 pure-noise bins in the search window is
+# itself ~6x the median, so the bar sits well above that: a ratio this low
+# only happens when one channel is dead, the two are not coherent, or the
+# true offset is outside the search window.
+ALIGN_MIN_PEAK = 10.0
 
 # |m| is capped so a dead or disconnected channel B cannot be amplified into
 # the output by a fit that "sees" less noise there (20 dB either way).
@@ -72,6 +77,12 @@ def find_lag(a, b, max_lag):
     lag means channel B runs LATE by that many samples. peak_ratio is the
     correlation peak over the median of the search window, the confidence
     that there is a peak at all (see ALIGN_MIN_PEAK).
+
+    The cross-spectrum is whitened before the inverse transform (the phase
+    transform, GCC-PHAT), so a DC/LO spur or one strong broadcast carrier
+    that both antennas hear cannot smear the correlation into a broad hump
+    that drifts by hundreds of samples between measurements; only the phase
+    slope across the band, which is the delay, survives.
     """
     n = min(len(a), len(b))
     max_lag = int(min(max_lag, n - 1))
@@ -82,7 +93,10 @@ def find_lag(a, b, max_lag):
     a = a - a.mean()
     b = b - b.mean()
     m = 1 << int(2 * n - 1).bit_length()          # linear, not circular, correlation
-    xc = np.fft.ifft(np.fft.fft(a, m) * np.conj(np.fft.fft(b, m)))
+    cross = np.fft.fft(a, m) * np.conj(np.fft.fft(b, m))
+    mag = np.abs(cross)
+    cross /= mag + 1e-12 * (float(mag.max()) or 1.0)
+    xc = np.fft.ifft(cross)
     # xc[k] = sum_n a[n] conj(b[n-k]) peaks where a[n] ~ b[n-k], i.e. lag = -k.
     win = np.concatenate([xc[m - max_lag:], xc[:max_lag + 1]]) if max_lag else xc[:1]
     mag = np.abs(win)
