@@ -42,6 +42,9 @@ import numpy as np
 from .diversity import WEIGHT_MAX_ABS, weight_to_polar
 
 # A source needs this much coherence over at least this many bins to be listed.
+# E[p | p < median] / E[p] for exponentially distributed bin powers.
+TRIM_HALF_MEAN = 1.0 - math.log(2.0)
+
 SOURCE_MIN_COHERENCE = 0.5
 SOURCE_MIN_BINS = 3
 # A run of coherent bins is split where the steering phase jumps by more than
@@ -65,7 +68,12 @@ def region_covariance(X, idx, trim=False):
     """Mean per-bin covariance of the bins idx of the spectra X (N, nbins).
 
     trim=True averages only the quieter half of the bins, so a station that
-    happens to sit inside a guard band does not masquerade as noise.
+    happens to sit inside a guard band does not masquerade as noise — and
+    rescales the result so it still reads as the noise's mean: the powers of
+    noise-only bins are exponentially distributed, and the mean of the half
+    below the median is (1 - ln 2) of the whole mean, 5.1 dB low. Left
+    uncorrected, a VAD comparing in-band power against it never goes quiet
+    (found live on 80 m: the tracker refitted every 2 s to noise).
     Returns an (N, N) Hermitian matrix, or None when idx is empty.
     """
     X = np.asarray(X)
@@ -76,6 +84,7 @@ def region_covariance(X, idx, trim=False):
         p = np.sum(np.abs(S) ** 2, axis=0)
         keep = p <= np.median(p)
         S = S[:, keep]
+        return (S @ S.conj().T) / (S.shape[1] * TRIM_HALF_MEAN)
     return (S @ S.conj().T) / S.shape[1]
 
 

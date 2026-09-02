@@ -287,6 +287,22 @@ def test_null_source_forwards_as_int():
     assert a.calls[-1][1]["null_source"] == 0
 
 
+def test_adapter_rejecting_a_value_is_an_error_not_a_500():
+    """The adapter validates what the route cannot (a null_source index past
+    the source list it alone knows): its ValueError must come back as
+    {"error"}, not as an HTTP 500 with a traceback in the log."""
+    a = FakeDiversityAdapter()
+    real = a.set_diversity
+
+    def rejecting(**kw):
+        real(**kw)
+        raise ValueError("no such source: 99 (have 3)")
+    a.set_diversity = rejecting
+    _, port = _start(a)
+    out = _get(port, "/diversity/set?null_source=99")
+    assert out == {"error": "no such source: 99 (have 3)"}
+
+
 def test_negative_null_source_is_an_error():
     a = FakeDiversityAdapter()
     _, port = _start(a)

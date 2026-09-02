@@ -3769,7 +3769,10 @@ def start_control_server(radio, port):
                 except (ValueError, TypeError) as e:
                     return self._json({"error": f"bad value: {e}"})
                 log(f"[ctl] diversity/set -> {kwargs}")
-                return self._json(a.set_diversity(**kwargs))
+                try:
+                    return self._json(a.set_diversity(**kwargs))
+                except ValueError as e:          # e.g. null_source past the list's end
+                    return self._json({"error": str(e)})
             if u.path == "/diversity/align":
                 a = radio.adapter
                 if not getattr(a, "diversity_available", False):

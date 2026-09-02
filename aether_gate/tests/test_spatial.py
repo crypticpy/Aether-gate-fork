@@ -4,6 +4,7 @@
 #
 """Run:  .venv/bin/python -m pytest aether_gate/tests/test_spatial.py -q"""
 import numpy as np
+import pytest
 
 from aether_gate.core.spatial import (
     SOURCE_MIN_COHERENCE, SpatialMap, region_covariance,
@@ -131,3 +132,20 @@ def test_region_covariance_trims_a_station_out_of_a_guard_band():
     assert np.real(R_all[0, 0]) > 5 * np.real(R_trim[0, 0])
     assert abs(R_trim[0, 1]) < 0.3 * np.real(R_trim[0, 0])
     assert region_covariance(X, []) is None
+
+
+def test_trimmed_covariance_reads_as_the_noise_mean_not_the_quiet_half():
+    """For noise-only bins the quieter half averages (1 - ln 2) of the mean;
+    the trimmed estimate must be rescaled back, or a VAD referenced to it
+    never goes quiet. With a station in the band the trim still excludes it."""
+    rng = np.random.default_rng(11)
+    X = (rng.normal(size=(2, 4000)) + 1j * rng.normal(size=(2, 4000))) * np.sqrt(0.5)
+    idx = np.arange(4000)
+    full = region_covariance(X, idx)
+    trimmed = region_covariance(X, idx, trim=True)
+    assert np.real(np.trace(trimmed)) == pytest.approx(np.real(np.trace(full)), rel=0.08)
+    X[:, 1000:1400] *= 30.0                                  # a strong station in 10% of the bins
+    hot = region_covariance(X, idx)
+    trimmed = region_covariance(X, idx, trim=True)
+    assert np.real(np.trace(trimmed)) == pytest.approx(np.real(np.trace(full)), rel=0.08)
+    assert np.real(np.trace(hot)) > 10 * np.real(np.trace(full))
