@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from aether_gate.core.beacons import (BeaconWatch, on_air, slot_at, BANDS_HZ, BEACONS,
-                                      SLOT_S, SLOTS)
+                                      GRIDS, SLOT_S, SLOTS, bearing_distance, grid_to_latlon)
 
 RATE = 125_000.0
 BLOCK = 4096
@@ -107,3 +107,67 @@ def test_a_weak_beacon_hears_only_the_top_step_and_a_missing_one_is_not_heard():
     silent = w.results[(BANDS_HZ[2], "YV5B")]
     assert not silent["heard"] and silent["steps_heard"] == 0 and silent["lowest_w"] is None
     assert silent["phase_deg"] is None and silent["gain_db"] is None
+
+
+# --- where each beacon is, and what the samples add up to ----------------------
+
+def test_every_beacon_has_a_locator_and_the_geometry_is_right():
+    assert set(GRIDS) == {c for c, _ in BEACONS}
+    lat, lon = grid_to_latlon("EM10")                       # central Texas
+    assert (lat, lon) == pytest.approx((30.5, -97.0))
+    lat6, lon6 = grid_to_latlon("EM10cf")
+    assert abs(lat6 - lat) < 0.5 and abs(lon6 - lon) < 1.0
+    brg, km = bearing_distance(lat, lon, *grid_to_latlon(GRIDS["W6WX"]))
+    assert 285 <= brg <= 305 and 2200 <= km <= 2600           # California: WNW, ~2400 km
+    brg, km = bearing_distance(lat, lon, *grid_to_latlon(GRIDS["ZL6B"]))
+    assert 225 <= brg <= 240 and 11500 <= km <= 12500         # New Zealand: SW, long path
+    for bad in ("", "E1", "ZZ99", "EM1x", "EM10zz", "12ab"):
+        with pytest.raises(ValueError):
+            grid_to_latlon(bad)
+
+
+def test_results_gain_bearings_when_the_station_grid_is_known_and_survive_a_restart(tmp_path):
+    store = tmp_path / "beacons.json"
+    w = BeaconWatch(RATE, store_path=str(store))
+    rng = np.random.default_rng(4)
+    center = 14_120_000.0
+    a, b = _slot(rng, 40.0, phase=0.9, ratio=0.8, rel_hz=BANDS_HZ[0] - center)
+    _feed(w, a, b, center, T0 + 20.0)                            # W6WX
+    q, qb = _slot(rng, -40.0)
+    _feed(w, q[:BLOCK * 4], qb[:BLOCK * 4], center, T0 + 30.0)
+    r = w.results[(BANDS_HZ[0], "W6WX")]
+    assert r["bearing_deg"] is None and r["distance_km"] is None and r["grid"] == "CM97bd"
+    assert r["samples"] == 1 and r["heard_n"] == 1 and r["snr_mean_db"] == r["snr_db"]
+    st = w.status(T0 + 31.0)
+    assert st["station_grid"] is None and st["pattern"] == []
+    assert st["propagation"] == [{"band_hz": BANDS_HZ[0], "sampled": 1, "heard": 1, "of": SLOTS,
+                                  "best_w": 0.1, "median_snr_db": r["snr_db"],
+                                  "updated": r["at"]}]
+    w.set_station("EM10")
+    r = w.results[(BANDS_HZ[0], "W6WX")]
+    assert 285 <= r["bearing_deg"] <= 305 and 2200 <= r["distance_km"] <= 2600
+    st = w.status(T0 + 31.0)
+    assert st["station_grid"] == "EM10"
+    assert st["pattern"] == [{"call": "W6WX", "band_hz": BANDS_HZ[0],
+                              "bearing_deg": r["bearing_deg"], "distance_km": r["distance_km"],
+                              "b_minus_a_db": pytest.approx(r["snr_b"] - r["snr_a"], abs=0.11),
+                              "phase_deg": r["phase_deg"], "snr_db": r["snr_db"]}]
+    with pytest.raises(ValueError):
+        w.set_station("ZZ99")
+    assert w.station_grid == "EM10"
+    # a second sample of the same beacon merges into the running record
+    a2, b2 = _slot(rng, 30.0, phase=0.9, ratio=0.8, rel_hz=BANDS_HZ[0] - center)
+    _feed(w, a2, b2, center, T0 + 180.0 + 20.0)
+    _feed(w, q[:BLOCK * 4], qb[:BLOCK * 4], center, T0 + 180.0 + 30.0)
+    r2 = w.results[(BANDS_HZ[0], "W6WX")]
+    assert r2["samples"] == 2 and r2["heard_n"] == 2 and r2["at"] == pytest.approx(T0 + 200.0)
+    assert r2["snr_mean_db"] == pytest.approx((r["snr_db"] + r2["snr_db"]) / 2, abs=0.11)
+    # a fresh watch on the same store remembers the grid and the samples
+    w2 = BeaconWatch(RATE, store_path=str(store))
+    assert w2.station_grid == "EM10"
+    got = w2.results[(BANDS_HZ[0], "W6WX")]
+    assert got["samples"] == 2 and got["bearing_deg"] == r2["bearing_deg"]
+    assert w2.status(T0)["propagation"][0]["heard"] == 1
+    w2.set_station("")
+    assert w2.station_grid is None and w2.results[(BANDS_HZ[0], "W6WX")]["bearing_deg"] is None
+    assert BeaconWatch(RATE, store_path=str(store)).station_grid is None

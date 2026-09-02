@@ -683,7 +683,9 @@ class SoapyAdapter(RadioAdapter):
         np = self._np
         chain = self._chain     # ONE read: A and B see the same generation (F9)
         filt = self._filt
-        if filt is not None and filt.spec.nb_on:
+        if filt is not None and filt.spec.nb_on and self._div is None:
+            # the dual-tuner pair is blanked once, in _DiversityState.ingest,
+            # before the map and the trackers see it; this is the one-tuner path
             # blank at the full rate, before any filter smears an impulse
             # across milliseconds (the same reason WDSP's blanker sits first)
             if isinstance(block, tuple):
@@ -1460,6 +1462,11 @@ class SoapyAdapter(RadioAdapter):
         st = self._filt.status()
         st["available"] = True
         st["mode"] = self._mode
+        if self._div is not None:
+            # /filter's NB is the pair's blanker (the same knob as /diversity/set)
+            st["nb"] = {"enabled": bool(self._div.nb_on),
+                        "threshold_db": float(self._div.nb_db),
+                        "blanked_pct": round(float(self._div.blanked_pct), 2)}
         st["roofing"]["analogue_hz"] = self._analogue_if_hz()
         st["response"] = self._filt.response_db()
         return st
@@ -1478,7 +1485,10 @@ class SoapyAdapter(RadioAdapter):
     def filter_set(self, **kw):
         if self._filt is None:
             return {"available": False}
-        self._filt.set(**kw)
+        if self._div is not None and ("nb" in kw or "nb_db" in kw):
+            self._div.set(nb=kw.pop("nb", None), nb_db=kw.pop("nb_db", None))
+        if kw:
+            self._filt.set(**kw)
         return self.filter_status()
 
     def filter_notch(self, add_hz=None, width_hz=80.0, clear=False, clear_hz=None):
@@ -1517,12 +1527,12 @@ class SoapyAdapter(RadioAdapter):
 
     def set_diversity(self, mode=None, phase_deg=None, ratio_db=None, source=None,
                       slice_id=None, nb=None, nb_db=None, pan=None, null_source=None,
-                      focus=None, subband=None):
+                      focus=None, subband=None, grid=None):
         if self._div is None:
             return {"available": False}
         return self._div.set(mode, phase_deg, ratio_db, source, slice_id,
                              nb=nb, nb_db=nb_db, pan=pan, null_source=null_source,
-                             focus=focus, subband=subband)
+                             focus=focus, subband=subband, grid=grid)
 
     def diversity_realign(self):
         if self._div is None:

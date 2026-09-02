@@ -447,16 +447,31 @@ def test_noise_profile_rides_in_status_and_sees_impulses_before_the_blanker():
         st.ingest(a, b)
     prof = st.status()["noise_profile"]
     assert set(prof) == {"mains_hz", "hum_db", "harmonics", "impulses_per_s", "impulse_db",
-                         "periodic", "seconds"}
+                         "periodic", "seconds", "window_s", "impulse_window_s", "kinds"}
     # ~30 impulses/s at 125 kS/s in 4096-sample blocks, counted despite the blanker
     assert 20.0 <= prof["impulses_per_s"] <= 40.0, prof
     assert prof["impulse_db"] >= 20.0 and prof["mains_hz"] is None, prof
+    # the finding names itself, says how long it looked, and offers the one
+    # thing to do about it: the blanker is already on, so the button releases it
+    kinds = {k["kind"]: k for k in prof["kinds"]}
+    assert set(kinds) == {"impulse"}, prof["kinds"]
+    imp = kinds["impulse"]
+    assert imp["window_s"] == prof["impulse_window_s"] and imp["active"] is True
+    assert imp["action"] == {"label": "UNBLANK", "route": "/diversity/set", "query": "nb=off"}
+    assert "blanking" in imp["detail"]
+    st.set(nb=False)
+    imp = {k["kind"]: k for k in st.status()["noise_profile"]["kinds"]}["impulse"]
+    assert imp["active"] is False and imp["action"]["label"] == "BLANK"
+    assert imp["action"]["query"].startswith("nb=on&nb_db=")
+    rec = float(imp["action"]["query"].split("=")[-1])
+    assert 6.0 <= rec <= 30.0 and rec <= prof["impulse_db"], (rec, prof)
 
 
 # --- the beacon watch -----------------------------------------------------------
 def test_beacon_watch_rides_along_once_aligned_and_answers_its_route():
     rng = np.random.default_rng(13)
     st = _DiversityState(_FakeAdapter(center_hz=14_120_000.0))
+    st.BEACONS_PATH = None                                  # no store on disk in a test
     assert st.beacons_json() == {"available": False}
     st.aligner.set_lag(0, 20.0, True)
     st.ingest(_white(rng, BLOCK), _white(rng, BLOCK))
@@ -468,3 +483,92 @@ def test_beacon_watch_rides_along_once_aligned_and_answers_its_route():
     st.a.center_hz = 7_200_000.0
     st.ingest(_white(rng, BLOCK), _white(rng, BLOCK))
     assert st.beacons_json()["band_hz"] is None
+
+
+# --- the noise profile's kinds: what it is and what to do about it -------------
+class _FixedProfile:
+    def __init__(self, **over):
+        self.rate_hz = RATE
+        self.d = {"mains_hz": None, "hum_db": 0.0, "harmonics": 0, "impulses_per_s": 0.0,
+                  "impulse_db": None, "periodic": [], "seconds": 2.0, "window_s": 2.0,
+                  "impulse_window_s": 4.0}
+        self.d.update(over)
+
+    def update(self, a, b):
+        pass
+
+    def status(self):
+        return dict(self.d)
+
+
+class _FixedFilter:
+    def __init__(self, found, notches=()):
+        self.found = found
+        self.notches = list(notches)
+
+    def status(self):
+        return {"notches": [{"hz": h, "width_hz": 140, "depth_db": -30.0} for h in self.notches],
+                "anf": {"enabled": True, "found_hz": [f for f, _ in self.found],
+                        "depth_db": [d for _, d in self.found]}}
+
+
+def _kinds(st):
+    return {k["kind"]: k for k in st.status()["noise_profile"]["kinds"]}
+
+
+def test_mains_hum_offers_a_null_only_when_the_noise_has_a_direction():
+    st = _DiversityState(_FakeAdapter())
+    st.profile = _FixedProfile(mains_hz=60.0, hum_db=18.0, harmonics=5)
+    k = _kinds(st)
+    assert set(k) == {"mains"}
+    m = k["mains"]
+    assert m["label"] == "Mains hum · 60 Hz grid" and m["detail"] == "120 Hz comb, 5 harmonics"
+    assert m["db"] == 18.0 and m["window_s"] == 2.0 and m["active"] is False
+    assert m["action"] is None and m["why"] == "no noise estimate yet"
+    # a tracker whose noise covariance is isotropic: nothing to null
+    st.set(mode="track")
+    from aether_gate.core.diversity import Tracker
+    t = Tracker(RATE)
+    t.Rn_guard = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=complex)    # Rn reads the guard band
+    st.trackers[0] = t
+    m = _kinds(st)["mains"]
+    assert m["action"] is None and m["why"].startswith("not directional enough")
+    # a directional noise: the button nulls it
+    t.Rn_guard = np.array([[1.0, 0.9], [0.9, 1.0]], dtype=complex)
+    m = _kinds(st)["mains"]
+    assert m["action"] == {"label": "NULL", "route": "/diversity/set", "query": "mode=null"}
+    st.set(mode="null")
+    m = _kinds(st)["mains"]
+    assert m["active"] is True and m["action"]["label"] == "NULLED"
+    assert m["action"]["query"] == "mode=track"
+
+
+def test_periodic_lines_tones_and_the_floor_each_say_what_they_are():
+    st = _DiversityState(_FakeAdapter())
+    st.profile = _FixedProfile(periodic=[{"hz": 182.0, "db": 14.0}])
+    st.a._filt = _FixedFilter(found=[(1240.0, -31.0), (2010.0, -28.0)], notches=[2000.0])
+    k = st.status()["noise_profile"]["kinds"]
+    assert [x["kind"] for x in k] == ["periodic", "tone", "tone"]
+    assert k[0]["label"] == "Periodic · 182 Hz" and k[0]["action"] is None and k[0]["why"]
+    assert k[1]["label"] == "Tone · 1240 Hz" and k[1]["db"] == -31.0
+    assert k[1]["action"] == {"label": "NOTCH", "route": "/filter/notch",
+                              "query": "add=1240&width=160"}
+    assert k[2]["active"] is True and k[2]["action"] is None      # 2010 sits in the 2000 notch
+    st.profile = _FixedProfile()
+    st.a._filt = None
+    k = st.status()["noise_profile"]["kinds"]
+    assert [x["kind"] for x in k] == ["floor"] and k[0]["db"] is None
+    assert k[0]["detail"].startswith("nothing mains-locked")
+
+
+def test_the_station_grid_builds_the_beacon_watch_and_rides_in_its_status(tmp_path):
+    st = _DiversityState(_FakeAdapter())
+    st.BEACONS_PATH = str(tmp_path / "beacons.json")
+    assert st.beacons is None and st.beacons_json()["available"] is False
+    st.set(grid="EM10")
+    assert st.beacons is not None and st.beacons_json()["station_grid"] == "EM10"
+    with pytest.raises(ValueError):
+        st.set(grid="ZZ99")
+    assert st.beacons_json()["station_grid"] == "EM10"
+    st.set(grid="")
+    assert st.beacons_json()["station_grid"] is None

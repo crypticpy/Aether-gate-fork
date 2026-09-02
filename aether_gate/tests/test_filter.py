@@ -272,3 +272,21 @@ def test_the_blanker_sits_ahead_of_the_filter_in_the_adapter():
     _pull(a, 2 * AUDIO_RATE // CHUNK)
     st = a.filter_status()
     assert st["nb"]["enabled"] and 0.05 < st["nb"]["blanked_pct"] < 1.0
+
+
+def test_with_a_tuner_pair_the_filters_nb_is_the_pairs_blanker():
+    """The RSPduo pair is blanked once, in _DiversityState.ingest, before the
+    spatial map and the trackers see it. /filter's NB must be that knob,
+    not a second blanker on the slice."""
+    from aether_gate.adapters.soapy import _DiversityState
+    a = _adapter()
+    a._div = _DiversityState(a)
+    a._div.BEACONS_PATH = None
+    st = a.filter_set(nb=True, nb_db=15)
+    assert a._div.nb_on is True and a._div.nb_db == 15.0
+    assert st["nb"]["enabled"] is True and st["nb"]["threshold_db"] == 15.0
+    assert a._filt.spec.nb_on is False                    # the slice blanker stays off
+    a._div.blanked_pct = 0.37
+    assert a.filter_status()["nb"]["blanked_pct"] == 0.37
+    a.filter_set(nb=False, shape="soft")
+    assert a._div.nb_on is False and a.filter_status()["shape"] == "soft"

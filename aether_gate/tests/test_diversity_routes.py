@@ -68,13 +68,15 @@ class FakeDiversityAdapter:
 
     def set_diversity(self, mode=None, phase_deg=None, ratio_db=None, source=None, slice_id=None,
                        nb=None, nb_db=None, pan=None, null_source=None, focus=None,
-                       subband=None):
+                       subband=None, grid=None):
         self.calls.append(("set", {"mode": mode, "phase_deg": phase_deg,
                                     "ratio_db": ratio_db, "source": source, "slice_id": slice_id,
                                     "nb": nb, "nb_db": nb_db, "pan": pan, "null_source": null_source,
-                                    "focus": focus, "subband": subband}))
+                                    "focus": focus, "subband": subband, "grid": grid}))
         if focus not in (None, "") and focus != 7:
             raise ValueError(f"unknown talker id {focus}")
+        if grid not in (None, "", "EM10", "EM10cf"):
+            raise ValueError(f"not a Maidenhead locator: {grid!r}")
         if mode is not None:
             self._status["mode"] = mode
         if phase_deg is not None:
@@ -239,8 +241,19 @@ def test_set_forwards_every_given_param():
     assert kwargs == {"mode": "track", "phase_deg": 45.5, "ratio_db": -3.5,
                        "source": "b", "slice_id": 1,
                        "nb": True, "nb_db": 18.5, "pan": "nulled", "null_source": 2,
-                       "focus": None, "subband": False}
+                       "focus": None, "subband": False, "grid": None}
     assert out["mode"] == "track" and out["source"] == "b"
+
+
+def test_grid_is_forwarded_and_a_bad_locator_is_an_error():
+    a = FakeDiversityAdapter()
+    _, port = _start(a)
+    _get(port, "/diversity/set?grid=EM10cf")
+    assert a.calls[-1][1]["grid"] == "EM10cf"
+    _get(port, "/diversity/set?grid=off")
+    assert a.calls[-1][1]["grid"] == ""
+    out = _get(port, "/diversity/set?grid=ZZ99")
+    assert out["error"].startswith("not a Maidenhead locator")
 
 
 def test_set_with_only_one_param_leaves_the_rest_unset():
@@ -251,7 +264,7 @@ def test_set_with_only_one_param_leaves_the_rest_unset():
     assert kwargs == {"mode": None, "phase_deg": None, "ratio_db": 5.0,
                        "source": None, "slice_id": None,
                        "nb": None, "nb_db": None, "pan": None, "null_source": None, "focus": None,
-                       "subband": None}
+                       "subband": None, "grid": None}
 
 
 # ---- v2 /diversity/set params: nb, nb_db, pan, null_source ------------------

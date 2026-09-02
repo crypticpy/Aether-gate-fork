@@ -51,6 +51,28 @@ def test_find_lag_recovers_a_positive_and_a_negative_offset():
         assert peak >= ALIGN_MIN_PEAK, peak
 
 
+def test_find_lag_prefers_the_peak_nearest_zero_over_a_ring_alias():
+    """A calibration window straddling a ring wrap correlates at the true lag
+    in one part and one ring length away in the other (live: 4032 = -63 +
+    4095). Even when the alias's part is the larger, the near-zero peak
+    wins as long as it is a real peak."""
+    rng = np.random.default_rng(3)
+    ring, true = 4095, -63
+    alias = true + ring
+    n = 24_000
+    common = _noise(rng, n + 2 * ring + 200)
+    a = common[ring + 100:ring + 100 + n].copy()
+    b = np.empty_like(a)
+    split = n * 2 // 5                                  # 40 % true, 60 % alias
+    b[:split] = common[ring + 100 - true:ring + 100 - true + split]
+    b[split:] = common[ring + 100 - alias + split:ring + 100 - alias + n]
+    a = a + _noise(rng, n, 0.3)
+    b = b + _noise(rng, n, 0.3)
+    got, peak = find_lag(a, b, ring + 200)
+    assert got == true, got
+    assert peak >= ALIGN_MIN_PEAK
+
+
 def test_find_lag_reports_no_peak_for_unrelated_channels():
     rng = np.random.default_rng(2)
     a = _noise(rng, 20_000)

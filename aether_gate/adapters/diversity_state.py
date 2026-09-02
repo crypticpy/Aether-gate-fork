@@ -93,6 +93,8 @@ class _DiversityState:
     NB_DEFAULT_DB = 12.0
     CAPTURE_DIR = "~/aether-gate-captures"
     NAMES_PATH = "~/.aether-gate/diversity-names.json"   # talker labels, by signature
+    BEACONS_PATH = "~/.aether-gate/beacons.json"          # beacon samples + station grid
+    NULLABLE_COHERENCE = 0.4     # below this the noise has no direction to null
 
     def __init__(self, adapter):
         self.a = adapter
@@ -210,7 +212,7 @@ class _DiversityState:
                 self.profile = _npf().NoiseProfile(self.a.samp_rate)
             self.profile.update(a, b)
             if self.beacons is None or self.beacons.rate_hz != float(self.a.samp_rate):
-                self.beacons = _bc().BeaconWatch(self.a.samp_rate)
+                self.beacons = self._beacon_watch()
             self.beacons.update(a, b, float(self.a.center_hz), time.time())
         if self.nb_on:
             a, b, frac = _dv().blank_impulses(a, b, self.nb_db)
@@ -395,6 +397,9 @@ class _DiversityState:
         rows["passband_hz"] = self._passband_hz()
         return rows
 
+    def _beacon_watch(self):
+        return _bc().BeaconWatch(self.a.samp_rate, store_path=self.BEACONS_PATH)
+
     def beacons_json(self):
         if self.beacons is None:
             return {"available": False}
@@ -440,7 +445,7 @@ class _DiversityState:
                         **(self.subbands[sid].status() if sid in self.subbands
                            else {"bins": 0, "extra_db": 0.0})},
             "sources": self._sources(),
-            "noise_profile": self.profile.status() if self.profile is not None else None,
+            "noise_profile": self._noise_profile(t),
             "memory": self._memory_status(sid),
             "talker": self.memory.talker(time.monotonic()),
             "loops": self.balance.status(time.monotonic()),
@@ -450,6 +455,84 @@ class _DiversityState:
                         "path": cap["path"] if cap is not None else self.last_capture},
             "slice_id": sid,
         }
+
+    def _noise_profile(self, t):
+        """The profile's numbers plus `kinds`: one row per thing found, each
+        naming what it is, how long it was measured over, and the one
+        control-port call that does something about it (or why nothing can)."""
+        if self.profile is None:
+            return None
+        st = self.profile.status()
+        coh = (float(_dv()._coherence(t.Rn))
+               if t is not None and t.Rn is not None else None)
+        directional = coh is not None and coh >= self.NULLABLE_COHERENCE
+        kinds = []
+
+        def null_action(active_ok=True):
+            if self.mode == "null":
+                return {"label": "NULLED", "route": "/diversity/set", "query": "mode=track"}, None, True
+            if directional:
+                return {"label": "NULL", "route": "/diversity/set", "query": "mode=null"}, None, False
+            if coh is None:
+                return None, "no noise estimate yet", False
+            return None, f"not directional enough to null (coherence {coh:.2f})", False
+
+        if st["mains_hz"]:
+            act, why, active = null_action()
+            f2 = int(2 * st["mains_hz"])
+            kinds.append({
+                "kind": "mains", "label": f"Mains hum · {int(st['mains_hz'])} Hz grid",
+                "detail": f"{f2} Hz comb, {st['harmonics']} harmonic{'s' if st['harmonics'] != 1 else ''}",
+                "db": st["hum_db"], "window_s": st["window_s"],
+                "action": act, "why": why, "active": active,
+            })
+        if st["impulse_db"] is not None and st["impulses_per_s"] >= 1.0:
+            rec = min(30.0, max(6.0, round((st["impulse_db"] - 3.0) * 2) / 2))
+            if self.nb_on:
+                act = {"label": "UNBLANK", "route": "/diversity/set", "query": "nb=off"}
+            else:
+                act = {"label": "BLANK", "route": "/diversity/set", "query": f"nb=on&nb_db={rec:g}"}
+            kinds.append({
+                "kind": "impulse", "label": f"Impulses · {st['impulses_per_s']:g}/s",
+                "detail": (f"{st['impulse_db']:g} dB over the floor"
+                           + (f", blanking {self.blanked_pct:.1f} %" if self.nb_on else "")),
+                "db": st["impulse_db"], "window_s": st["impulse_window_s"],
+                "action": act, "why": None, "active": bool(self.nb_on),
+            })
+        for line in st["periodic"]:
+            kinds.append({
+                "kind": "periodic", "label": f"Periodic · {line['hz']:g} Hz",
+                "detail": "a modulation rate of the noise, not a tone in the audio",
+                "db": line["db"], "window_s": st["window_s"],
+                "action": None, "why": "nothing to notch; ANF handles tones in the passband",
+                "active": False,
+            })
+        filt = getattr(self.a, "_filt", None)
+        if filt is not None:
+            fs = filt.status()
+            have = [n["hz"] for n in fs["notches"]]
+            for hz, db in zip(fs["anf"]["found_hz"], fs["anf"]["depth_db"]):
+                pinned = any(abs(hz - h) <= 30 for h in have)
+                kinds.append({
+                    "kind": "tone", "label": f"Tone · {hz:g} Hz",
+                    "detail": f"ANF is holding it {abs(db):g} dB down",
+                    "db": db, "window_s": 1.0,
+                    "action": (None if pinned else
+                               {"label": "NOTCH", "route": "/filter/notch",
+                                "query": f"add={hz:g}&width=160"}),
+                    "why": "already a fixed notch" if pinned else None, "active": pinned,
+                })
+        if not kinds:
+            act, why, active = null_action()
+            kinds.append({
+                "kind": "floor", "label": "Broadband floor",
+                "detail": ("nothing mains-locked, impulsive or periodic"
+                           + (f"; coherence {coh:.2f}" if coh is not None else "")),
+                "db": None, "window_s": st["window_s"],
+                "action": act, "why": why, "active": active,
+            })
+        st["kinds"] = kinds
+        return st
 
     def _memory_status(self, sid):
         """The memory's entries with each talker's voice/rig print attached."""
@@ -522,8 +605,13 @@ class _DiversityState:
         return sb.process(pa, pb, m1, s, talking)
 
     def set(self, mode=None, phase_deg=None, ratio_db=None, source=None, sid=None,
-            nb=None, nb_db=None, pan=None, null_source=None, focus=None, subband=None):
+            nb=None, nb_db=None, pan=None, null_source=None, focus=None, subband=None,
+            grid=None):
         sid = self.active_slice if sid is None else int(sid)
+        if grid is not None:
+            if self.beacons is None:
+                self.beacons = self._beacon_watch()
+            self.beacons.set_station(grid)           # ValueError on a bad locator
         if subband is not None:
             self.subband_on = bool(subband)
             if not self.subband_on:

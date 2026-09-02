@@ -131,6 +131,9 @@ FIRST_FIT_MIN_TALK_S = 0.4
 # and falling back to one antenna is a low-regret move.
 FADE_DROP_DB = 3.0
 FADE_HOLD_S = 0.2
+# find_lag: a correlation peak this close to the strongest one is a
+# candidate too, and the candidate nearest zero lag wins (ring aliases)
+ALIAS_PEAK_FRAC = 0.5
 
 
 def find_lag(a, b, max_lag):
@@ -164,6 +167,14 @@ def find_lag(a, b, max_lag):
     win = np.concatenate([xc[m - max_lag:], xc[:max_lag + 1]]) if max_lag else xc[:1]
     mag = np.abs(win)
     i = int(np.argmax(mag))
+    # The two tuners share a chip: the true lag is tens of samples. A
+    # calibration window that straddles a ring-buffer wrap also shows a
+    # peak one ring length away (seen live: 4032 = -63 + 4095, held for
+    # half an hour). Among peaks within ALIAS_PEAK_FRAC of the strongest,
+    # take the one nearest zero.
+    strong = np.flatnonzero(mag >= ALIAS_PEAK_FRAC * mag[i])
+    if len(strong) > 1:
+        i = int(strong[np.argmin(np.abs(strong - max_lag))])
     k = i - max_lag
     med = float(np.median(mag))
     ratio = float(mag[i] / med) if med > 0 else 0.0

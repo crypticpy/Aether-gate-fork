@@ -24,7 +24,10 @@ chunks; the beacon is the strongest bin within +-100 Hz of nominal over the
 slot, the floor is the median of the other bins. A slot is scored when it
 ends. Nothing is done unless a beacon frequency is inside the span.
 """
+import json
 import math
+import os
+import tempfile
 
 import numpy as np
 
@@ -43,6 +46,16 @@ BEACONS = (
     ("CS3B", "Sao Jorge, Madeira"), ("LU4AA", "Buenos Aires, Argentina"),
     ("OA4B", "Lima, Peru"), ("YV5B", "Caracas, Venezuela"),
 )
+# Maidenhead locators from the NCDXF beacon list; the bearing and distance
+# from the station to each beacon come from these once the station's own
+# grid is known (set_station), so every heard slot is a labelled direction.
+GRIDS = {
+    "4U1UN": "FN30as", "VE8AT": "EQ79ax", "W6WX": "CM97bd", "KH6RS": "BL10ts",
+    "ZL6B": "RE78tw", "VK6RBP": "OF87av", "JA2IGY": "PM84jk", "RR9O": "NO14kx",
+    "VR2B": "OL72bg", "4S7B": "MJ96wv", "ZS6DN": "KG44dc", "5Z4B": "KI88ks",
+    "4X6TU": "KM72jb", "OH2B": "KP20eh", "CS3B": "IM12jt", "LU4AA": "GF05tj",
+    "OA4B": "FH17mw", "YV5B": "FJ69cc",
+}
 STEPS_W = (100.0, 10.0, 1.0, 0.1)
 DECIM = 16
 CHUNK_S = 0.02
@@ -50,6 +63,41 @@ SEARCH_HZ = 100.0
 HEARD_DB = 6.0             # a step counts as heard this far over the bin's floor
 REF_BW_HZ = 500.0          # SNRs are reported in this bandwidth, the CW convention
 EDGE_MARGIN_HZ = 5_000.0
+
+
+def grid_to_latlon(grid):
+    """Centre of a 4- or 6-character Maidenhead locator (lat, lon) in degrees.
+    Raises ValueError on anything that is not one."""
+    g = str(grid).strip()
+    if len(g) not in (4, 6) or not g[:2].isalpha() or not g[2:4].isdigit():
+        raise ValueError(f"not a Maidenhead locator: {grid!r}")
+    g = g[:2].upper() + g[2:4] + g[4:].lower()
+    if not ("A" <= g[0] <= "R" and "A" <= g[1] <= "R"):
+        raise ValueError(f"not a Maidenhead locator: {grid!r}")
+    lon = (ord(g[0]) - 65) * 20.0 - 180.0 + int(g[2]) * 2.0
+    lat = (ord(g[1]) - 65) * 10.0 - 90.0 + int(g[3])
+    if len(g) == 6:
+        if not ("a" <= g[4] <= "x" and "a" <= g[5] <= "x"):
+            raise ValueError(f"not a Maidenhead locator: {grid!r}")
+        lon += (ord(g[4]) - 97) * (2.0 / 24) + 1.0 / 24
+        lat += (ord(g[5]) - 97) * (1.0 / 24) + 1.0 / 48
+    else:
+        lon += 1.0
+        lat += 0.5
+    return lat, lon
+
+
+def bearing_distance(lat1, lon1, lat2, lon2):
+    """Initial great-circle bearing (degrees true, 0..360) and distance (km)."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dl = math.radians(lon2 - lon1)
+    y = math.sin(dl) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    brg = (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+    h = (math.sin((p2 - p1) / 2) ** 2
+         + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2)
+    km = 2.0 * 6371.0 * math.asin(min(1.0, math.sqrt(h)))
+    return brg, km
 
 
 def slot_at(t_utc):
@@ -65,8 +113,11 @@ def on_air(t_utc, band_hz):
 
 
 class BeaconWatch:
-    def __init__(self, rate_hz):
+    def __init__(self, rate_hz, store_path=None):
         self.rate_hz = float(rate_hz)
+        self.store_path = os.path.expanduser(store_path) if store_path else None
+        self.station_grid = None
+        self._station = None               # (lat, lon) once the grid is known
         self.chunk = max(8, int(round(CHUNK_S * self.rate_hz / DECIM)))
         self.band_hz = None
         self._offset_hz = 0.0
@@ -75,8 +126,61 @@ class BeaconWatch:
         self._fifo_b = np.zeros(0, dtype=np.complex128)
         self._slot = None                  # (slot index, band) being collected
         self._spec = []                    # per chunk: (Paa, Pbb, Pab) over the bins
-        self.results = {}                  # (band_hz, call) -> dict
+        self.results = {}                  # (band_hz, call) -> dict (latest + running)
         self.last = None
+        self._load()
+
+    # --- the station and the store ---------------------------------------------
+    def set_station(self, grid):
+        """The station's own locator ('' forgets); every result gains a bearing."""
+        g = str(grid or "").strip()
+        if g:
+            self._station = grid_to_latlon(g)
+            self.station_grid = g[:2].upper() + g[2:4] + g[4:].lower()
+        else:
+            self._station, self.station_grid = None, None
+        for r in self.results.values():
+            self._geometry(r)
+        self._save()
+
+    def _geometry(self, r):
+        grid = GRIDS.get(r["call"])
+        r["grid"] = grid
+        if self._station is None or grid is None:
+            r["bearing_deg"], r["distance_km"] = None, None
+            return
+        brg, km = bearing_distance(*self._station, *grid_to_latlon(grid))
+        r["bearing_deg"], r["distance_km"] = round(brg), round(km)
+
+    def _load(self):
+        if not self.store_path or not os.path.exists(self.store_path):
+            return
+        try:
+            with open(self.store_path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            grid = d.get("station_grid")
+            if grid:
+                self._station = grid_to_latlon(grid)
+                self.station_grid = grid
+            for r in d.get("results", []):
+                if r.get("call") in GRIDS and r.get("band_hz") in BANDS_HZ:
+                    self._geometry(r)
+                    self.results[(float(r["band_hz"]), r["call"])] = r
+        except (OSError, ValueError, TypeError, KeyError):
+            self.results = {}
+
+    def _save(self):
+        if not self.store_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.store_path), exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self.store_path), suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"station_grid": self.station_grid,
+                           "results": list(self.results.values())}, f)
+            os.replace(tmp, self.store_path)
+        except OSError:
+            pass
 
     # --- driving ---------------------------------------------------------------
     def update(self, a, b, center_hz, t_utc):
@@ -191,8 +295,59 @@ class BeaconWatch:
             "steps_heard": int(steps_heard),
             "lowest_w": STEPS_W[steps_heard - 1] if steps_heard else None,
         }
+        prev = self.results.get((band, call))
+        n = int(prev.get("samples", 1)) if prev else 0
+        heard_n = int(prev.get("heard_n", 0)) if prev else 0
+        res["samples"] = n + 1
+        res["heard_n"] = heard_n + (1 if heard else 0)
+        if heard:
+            # running mean of the heard SNRs: the band's reach toward this
+            # direction over the sessions, not just the last three minutes
+            m = prev.get("snr_mean_db") if prev else None
+            res["snr_mean_db"] = (round(snr_db, 1) if m is None or heard_n == 0
+                                  else round((m * heard_n + snr_db) / (heard_n + 1), 1))
+            res["last_heard"] = res["at"]
+        else:
+            res["snr_mean_db"] = prev.get("snr_mean_db") if prev else None
+            res["last_heard"] = prev.get("last_heard") if prev else None
+        self._geometry(res)
         self.results[(band, call)] = res
         self.last = res
+        self._save()
+
+    # --- what the samples add up to ----------------------------------------
+    def propagation(self):
+        """Per band: how many of the eighteen are heard, the weakest power
+        step still heard anywhere on the band, and the median SNR."""
+        out = []
+        for band in BANDS_HZ:
+            rows = [r for (b, _c), r in self.results.items() if b == band]
+            if not rows:
+                continue
+            heard = [r for r in rows if r.get("heard")]
+            lowest = [r["lowest_w"] for r in heard if r.get("lowest_w") is not None]
+            snrs = sorted(r["snr_db"] for r in heard)
+            out.append({
+                "band_hz": band, "sampled": len(rows), "heard": len(heard), "of": SLOTS,
+                "best_w": min(lowest) if lowest else None,
+                "median_snr_db": snrs[len(snrs) // 2] if snrs else None,
+                "updated": max(r["at"] for r in rows),
+            })
+        return out
+
+    def pattern(self):
+        """Loop B against loop A by bearing: one point per beacon heard on
+        both loops, the raw material of a two-loop pattern plot."""
+        pts = []
+        for r in self.results.values():
+            if (r.get("bearing_deg") is None or r.get("snr_a") is None
+                    or r.get("snr_b") is None):
+                continue
+            pts.append({"call": r["call"], "band_hz": r["band_hz"],
+                        "bearing_deg": r["bearing_deg"], "distance_km": r["distance_km"],
+                        "b_minus_a_db": round(r["snr_b"] - r["snr_a"], 1),
+                        "phase_deg": r.get("phase_deg"), "snr_db": r["snr_db"]})
+        return sorted(pts, key=lambda p: p["bearing_deg"])
 
     def status(self, t_utc):
         now = None
@@ -201,4 +356,6 @@ class BeaconWatch:
             now = {"call": call, "location": loc, "seconds_left": round(left, 1)}
         rows = sorted(self.results.values(), key=lambda r: (r["band_hz"], -r["at"]))
         return {"available": True, "band_hz": self.band_hz, "slot": slot_at(t_utc),
-                "now": now, "results": rows, "last": self.last}
+                "now": now, "results": rows, "last": self.last,
+                "station_grid": self.station_grid,
+                "propagation": self.propagation(), "pattern": self.pattern()}

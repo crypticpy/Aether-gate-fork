@@ -3910,7 +3910,7 @@ def start_control_server(radio, port):
 
             # ---- RSPduo diversity: two coherent tuners combined into one RX ----
             # GET /diversity                            -> current mode/weight/alignment
-            # GET /diversity/set?mode=&phase=&ratio=&source=&slice=&nb=&nb_db=&pan=&null_source=
+            # GET /diversity/set?mode=&phase=&ratio=&source=&slice=&nb=&nb_db=&pan=&null_source=&grid=
             #                    &focus=&subband=        -> apply what's present
             # GET /diversity/align                      -> re-measure the inter-tuner lag
             # GET /diversity/map                        -> coherence/level sweep for the panel
@@ -4012,6 +4012,11 @@ def start_control_server(radio, port):
                         if sb not in ("on", "off"):
                             raise ValueError(f"subband={sb!r}")
                         kwargs["subband"] = sb == "on"
+                    if "grid" in q:
+                        # the station's Maidenhead locator ('' or off forgets);
+                        # validated by the beacon watch (ValueError -> error reply)
+                        grid = q["grid"][0].strip()
+                        kwargs["grid"] = "" if grid.lower() in ("", "off", "none") else grid
                     if "focus" in q:
                         # focus=<talker id> pins; focus=off releases (a blank
                         # value never reaches here: parse_qs drops it)

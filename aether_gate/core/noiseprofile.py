@@ -169,4 +169,8 @@ class NoiseProfile:
             "impulse_db": round(float(self.impulse_db), 1) if self.impulse_seen else None,
             "periodic": [{"hz": hz, "db": d} for hz, d in self.periodic],
             "seconds": round(float(self.ring_n / self.env_rate), 1),
+            # what each number looks back over: the lines come from the
+            # envelope ring, the impulse rate from a smoothed count
+            "window_s": round(float(RING_S), 1),
+            "impulse_window_s": round(float(IMPULSE_TC_S), 1),
         }
