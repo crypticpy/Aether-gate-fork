@@ -209,6 +209,15 @@ class _DiversityState:
         return np.fft.ifft(Y).astype(a.dtype)
 
     # --- audio thread ----------------------------------------------------
+    @staticmethod
+    def _pass_edges(mode):
+        """The demodulated passband relative to the slice, in Hz."""
+        if _is_fm(mode):
+            return -FM_PASS_HZ, FM_PASS_HZ
+        if (mode or "").upper().startswith("LSB"):
+            return -SSB_PASS_HZ, 0.0
+        return 0.0, SSB_PASS_HZ
+
     def _bands(self, n, rate, mode):
         """(in-band index, guard index) for a length-n spectrum of the MIXED
         block: the slice sits at DC, so the passband is what _init_demod
@@ -216,12 +225,7 @@ class _DiversityState:
         and are as wide as the passband."""
         np = self.a._np
         f = np.fft.fftfreq(n, 1.0 / rate)
-        if _is_fm(mode):
-            lo, hi = -FM_PASS_HZ, FM_PASS_HZ
-        elif (mode or "").upper().startswith("LSB"):
-            lo, hi = -SSB_PASS_HZ, 0.0
-        else:
-            lo, hi = 0.0, SSB_PASS_HZ
+        lo, hi = self._pass_edges(mode)
         bw, gap = hi - lo, self.GUARD_GAP_HZ
         idx_in = (f >= lo) & (f < hi)
         idx_g = ((f >= hi + gap) & (f < hi + gap + bw)) | ((f < lo - gap) & (f >= lo - gap - bw))
@@ -295,6 +299,10 @@ class _DiversityState:
     def memory_clear(self):
         self.memory.clear()
 
+    def memory_name(self, talker_id, name):
+        if not self.memory.name(talker_id, name):
+            raise ValueError(f"unknown talker id {talker_id}")
+
     # --- control port ----------------------------------------------------
     def _sources(self):
         if self.map is None or self.map.R is None:
@@ -306,6 +314,14 @@ class _DiversityState:
             return {"available": False, "coherence": [], "sources": []}
         out = self.map.map(float(self.a.center_hz))
         out["available"] = True
+        # where the receiver's passband sits inside the span, so a strip can
+        # mark it: absolute Hz, or None when the adapter has no slice yet
+        slice_hz = getattr(self.a, "_slice_hz", None)
+        if slice_hz is None:
+            out["passband_hz"] = None
+        else:
+            lo, hi = self._pass_edges(getattr(self.a, "_mode", "USB"))
+            out["passband_hz"] = [float(slice_hz) + lo, float(slice_hz) + hi]
         return out
 
     def status(self, sid=None):
@@ -340,6 +356,7 @@ class _DiversityState:
                    "blanked_pct": round(self.blanked_pct, 2)},
             "sources": self._sources(),
             "memory": self.memory.status(time.monotonic()),
+            "talker": self.memory.talker(time.monotonic()),
             "capture": {"active": cap is not None,
                         "path": cap["path"] if cap is not None else self.last_capture},
             "slice_id": sid,

@@ -3838,6 +3838,7 @@ def start_control_server(radio, port):
             # GET /diversity/map                        -> coherence/level sweep for the panel
             # GET /diversity/capture?seconds=            -> start a diagnostic IQ capture
             # GET /diversity/memory/clear                -> forget remembered talker positions
+            # GET /diversity/memory/name?id=&name=       -> label a remembered talker ('' clears)
             #
             # {"available": false} (never an error page) on any adapter that isn't
             # diversity-capable, so the panel can poll it unconditionally. The v2
@@ -3945,6 +3946,24 @@ def start_control_server(radio, port):
                     return self._json({"error": "not supported"})
                 fn()
                 log("[ctl] diversity memory cleared")
+                return self._json({"ok": True})
+            if u.path == "/diversity/memory/name":
+                a = radio.adapter
+                fn = (getattr(a, "diversity_memory_name", None)
+                      if getattr(a, "diversity_available", False) else None)
+                if fn is None:
+                    return self._json({"error": "not supported"})
+                q = urllib.parse.parse_qs(u.query)
+                try:
+                    talker_id = int(q["id"][0])
+                except (KeyError, ValueError, IndexError):
+                    return self._json({"error": "bad value: id"})
+                name = q.get("name", [""])[0][:32]
+                try:
+                    fn(talker_id, name)
+                except (ValueError, RuntimeError) as e:
+                    return self._json({"error": str(e)})
+                log(f"[ctl] diversity talker {talker_id} named {name!r}")
                 return self._json({"ok": True})
 
             if u.path == "/resolution":

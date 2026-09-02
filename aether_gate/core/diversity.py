@@ -368,7 +368,20 @@ class TalkerMemory:
     def __init__(self, max_n=MEMORY_MAX, match=MEMORY_MATCH):
         self.max_n = int(max_n)
         self.match = float(match)
-        self.entries = []                    # dicts: s, m, hits, last_seen
+        self.entries = []                    # dicts: id, s, m, hits, first_seen, last_seen, name
+        self._next_id = 1                    # ids never reuse within a run
+        self.active = None                   # id of the talker whose weight is live
+        self.active_since = None
+
+    def _activate(self, e, now):
+        if self.active != e["id"]:
+            self.active_since = now
+        self.active = e["id"]
+
+    def release(self):
+        """The over ended: nobody's weight is live."""
+        self.active = None
+        self.active_since = None
 
     def recall(self, s, now):
         best, best_c = None, 0.0
@@ -379,6 +392,7 @@ class TalkerMemory:
         if best is not None and best_c >= self.match:
             best["hits"] += 1
             best["last_seen"] = now
+            self._activate(best, now)
             return best["m"]
         return None
 
@@ -392,21 +406,47 @@ class TalkerMemory:
                 v = (1.0 - MEMORY_MERGE) * e["s"] + MEMORY_MERGE * s_al
                 e["s"] = v / max(np.linalg.norm(v), 1e-12)
                 e["m"], e["last_seen"] = m, now
+                self._activate(e, now)
                 return
-        self.entries.append({"s": s, "m": m, "hits": 0, "last_seen": now})
+        e = {"id": self._next_id, "s": s, "m": m, "hits": 0,
+             "first_seen": now, "last_seen": now, "name": None}
+        self._next_id += 1
+        self.entries.append(e)
+        self._activate(e, now)
         if len(self.entries) > self.max_n:
             self.entries.sort(key=lambda e: e["last_seen"])
-            del self.entries[0]
+            dropped = self.entries.pop(0)
+            if dropped["id"] == self.active:
+                self.release()
+
+    def name(self, talker_id, name):
+        """Label an entry; '' or None clears. False when the id is unknown."""
+        for e in self.entries:
+            if e["id"] == int(talker_id):
+                e["name"] = (str(name).strip() or None) if name is not None else None
+                return True
+        return False
 
     def clear(self):
         self.entries = []
+        self.release()
+
+    def talker(self, now):
+        """{"id", "since_s"} for the live talker, or None."""
+        if self.active is None:
+            return None
+        return {"id": int(self.active),
+                "since_s": round(max(0.0, now - self.active_since), 1)}
 
     def status(self, now):
         out = []
         for e in sorted(self.entries, key=lambda e: -e["last_seen"]):
             ph, ra = weight_to_polar(e["m"])
-            out.append({"phase_deg": round(ph, 1), "ratio_db": round(ra, 1),
-                        "age_s": round(max(0.0, now - e["last_seen"]), 1), "hits": int(e["hits"])})
+            out.append({"id": int(e["id"]), "name": e["name"],
+                        "phase_deg": round(ph, 1), "ratio_db": round(ra, 1),
+                        "age_s": round(max(0.0, now - e["last_seen"]), 1),
+                        "first_seen_s": round(max(0.0, now - e["first_seen"]), 1),
+                        "hits": int(e["hits"])})
         return out
 
 
@@ -531,6 +571,8 @@ class Tracker:
                     self._over_fits = 0
                     self._memorised = False
                     self.Rs = None
+                    if self.memory is not None:
+                        self.memory.release()   # a new over is nobody until recalled
                     self._recall(R_in, mode)
                 self._rs_n += 1
                 al = max(self._alpha(n, self.signal_tc_s), 1.0 / self._rs_n)
@@ -553,6 +595,8 @@ class Tracker:
                 self._low_mod_s = 0.0
                 self._onset_done = False
                 self.talk_mod = None
+                if self.memory is not None:
+                    self.memory.release()
             if p_in <= NOISE_MAX_RATIO * p_ref:
                 al = self._alpha(n, self.noise_tc_s)
                 self.Rn_in = R_in if self.Rn_in is None else (1 - al) * self.Rn_in + al * R_in

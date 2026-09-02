@@ -1482,6 +1482,11 @@ class SoapyAdapter(RadioAdapter):
         if self._div is not None:
             self._div.memory_clear()
 
+    def diversity_memory_name(self, talker_id, name):
+        if self._div is None:
+            raise RuntimeError("no dual-tuner stream")
+        self._div.memory_name(talker_id, name)
+
     def set_mode(self, mode):
         self._mode = (mode or "USB").upper()
 

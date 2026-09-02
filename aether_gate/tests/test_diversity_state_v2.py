@@ -121,6 +121,11 @@ def test_sources_list_a_coherent_noise_source_at_its_frequency():
     mj = st.map_json()
     assert mj["available"] and len(mj["coherence"]) == 256 and mj["sources"] == srcs
     assert mj["start_hz"] == pytest.approx(3_600_000 - RATE / 2)
+    assert mj["passband_hz"] is None                          # the fake has no slice
+    st.a._slice_hz = 3_610_000.0
+    assert st.map_json()["passband_hz"] == [3_610_000.0, 3_610_000.0 + 3_000.0]
+    st.a._mode = "LSB"
+    assert st.map_json()["passband_hz"] == [3_610_000.0 - 3_000.0, 3_610_000.0]
 
 
 def test_nulled_pan_suppresses_the_source_and_leaves_the_rest_alone():
@@ -222,7 +227,13 @@ def test_observe_feeds_the_tracker_and_ramps_between_weights():
     s = st.status()
     assert s["snr_db"]["out"] > max(s["snr_db"]["a"], s["snr_db"]["b"]) + 3.0, s["snr_db"]
     assert s["rn_source"] in ("guard", "inband") and s["talk_mod"] is not None
-    assert set(s) >= {"nb", "pan", "sources", "memory", "capture", "rn_source", "talk_mod"}
+    assert set(s) >= {"nb", "pan", "sources", "memory", "capture", "rn_source", "talk_mod",
+                      "talker"}
+    assert s["memory"] and all("id" in e and "name" in e for e in s["memory"])
+    st.memory_name(s["memory"][0]["id"], "Ted")
+    assert st.status()["memory"][0]["name"] == "Ted"
+    with pytest.raises(ValueError):
+        st.memory_name(999, "x")
     assert st.last_m[0] == m1
 
 

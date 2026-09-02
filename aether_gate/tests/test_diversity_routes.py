@@ -113,6 +113,11 @@ class FakeDiversityAdapter:
         self.calls.append(("memory_clear", {}))
         self._status["memory"] = []
 
+    def diversity_memory_name(self, talker_id, name):
+        self.calls.append(("memory_name", {"id": talker_id, "name": name}))
+        if talker_id != 7:
+            raise ValueError(f"unknown talker id {talker_id}")
+
     def get_audio(self, n_samples, slice_hz=None, mode=None, slice_id=None):
         self.calls.append(("get_audio", {"slice_id": slice_id}))
         return [0.0] * n_samples
@@ -137,6 +142,7 @@ class FakeDiversityAdapterNoV2(FakeDiversityAdapter):
     diversity_map = None
     diversity_capture = None
     diversity_memory_clear = None
+    diversity_memory_name = None
 
 
 class FakeSingleChannelAdapter:
@@ -454,6 +460,28 @@ def test_diversity_memory_clear_not_supported_on_v2_less_adapter():
     _, port = _start(a)
     out = _get(port, "/diversity/memory/clear")
     assert out == {"error": "not supported"}
+
+
+# ---- /diversity/memory/name ------------------------------------------------
+
+def test_diversity_memory_name_labels_a_talker_and_rejects_unknown_ids():
+    a = FakeDiversityAdapter()
+    _, port = _start(a)
+    out = _get(port, "/diversity/memory/name?id=7&name=Bob%20K5XYZ")
+    assert out == {"ok": True}
+    assert a.calls[-1] == ("memory_name", {"id": 7, "name": "Bob K5XYZ"})
+    out = _get(port, "/diversity/memory/name?id=9&name=x")
+    assert out == {"error": "unknown talker id 9"}
+    out = _get(port, "/diversity/memory/name?name=x")
+    assert out == {"error": "bad value: id"}
+    out = _get(port, "/diversity/memory/name?id=7")            # clears
+    assert out == {"ok": True} and a.calls[-1][1]["name"] == ""
+
+
+def test_diversity_memory_name_not_supported_on_v2_less_adapter():
+    a = FakeDiversityAdapterNoV2()
+    _, port = _start(a)
+    assert _get(port, "/diversity/memory/name?id=1&name=x") == {"error": "not supported"}
 
 
 # ---- /status carries the compact diversity dict, or None -------------------

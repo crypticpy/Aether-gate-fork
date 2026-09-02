@@ -320,9 +320,40 @@ def test_memory_steers_a_known_talker_in_one_block():
     assert tr.updates > n0
     assert abs(tr.m - m1) < 0.35 * max(1.0, abs(m1)), (tr.m, m1)
     st = mem.status(tr.t)
-    assert all(set(e) == {"phase_deg", "ratio_db", "age_s", "hits"} for e in st)
+    assert all(set(e) == {"id", "name", "phase_deg", "ratio_db", "age_s",
+                          "first_seen_s", "hits"} for e in st)
+    # talker 1 is the live talker while its over runs, nobody after the hangover
+    live = mem.talker(tr.t)
+    assert live is not None and live["id"] == st[0]["id"] and live["since_s"] >= 0.0
+    for _ in range(16):
+        R_in, R_g = _scene(rng, block, None, 0.5)
+        tr.update(R_in, R_g, block, "track")
+    assert mem.talker(tr.t) is None
     mem.clear()
-    assert mem.entries == []
+    assert mem.entries == [] and mem.talker(tr.t) is None
+
+
+def test_memory_ids_are_stable_and_names_stick_to_them():
+    mem = TalkerMemory()
+    s1 = np.array([1.0, 0.6 * np.exp(1j * 0.4)]); s1 = s1 / np.linalg.norm(s1)
+    s2 = np.array([1.0, 0.6 * np.exp(1j * 2.5)]); s2 = s2 / np.linalg.norm(s2)
+    mem.store(s1, 0.3 + 0.2j, now=0.0)
+    mem.store(s2, 0.1 + 0.0j, now=1.0)
+    ids = [e["id"] for e in mem.entries]
+    assert ids == [1, 2]
+    assert mem.talker(now=1.5) == {"id": 2, "since_s": 0.5}
+    assert mem.name(1, "  Bob K5XYZ ") and mem.entries[0]["name"] == "Bob K5XYZ"
+    assert not mem.name(9, "nobody")
+    mem.store(s1, 0.3 + 0.2j, now=2.0)                    # merge keeps id and name
+    assert [e["id"] for e in mem.entries] == [1, 2]
+    st = mem.status(now=3.0)
+    assert st[0] == {"id": 1, "name": "Bob K5XYZ", "phase_deg": st[0]["phase_deg"],
+                     "ratio_db": st[0]["ratio_db"], "age_s": 1.0, "first_seen_s": 3.0,
+                     "hits": 0}
+    assert mem.recall(s2, now=4.0) == 0.1 + 0.0j and mem.talker(4.0)["id"] == 2
+    assert mem.name(1, "") and mem.entries[0]["name"] is None
+    mem.release()
+    assert mem.talker(5.0) is None
 
 
 def test_memory_matches_on_bearing_not_exact_vector():
