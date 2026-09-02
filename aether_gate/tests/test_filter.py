@@ -290,3 +290,28 @@ def test_with_a_tuner_pair_the_filters_nb_is_the_pairs_blanker():
     assert a.filter_status()["nb"]["blanked_pct"] == 0.37
     a.filter_set(nb=False, shape="soft")
     assert a._div.nb_on is False and a.filter_status()["shape"] == "soft"
+
+
+def test_the_status_carries_what_arrives_ahead_of_the_filter():
+    """The FILTER page draws the filter over the live spectrum: a tone at
+    1 kHz is the peak (0 dB) on response_db's grid, the floor sits well
+    below it, and an LSB slice reads the same audio frequencies."""
+    a = _adapter()
+    assert a.filter_status()["spectrum"] is None                # nothing heard yet
+    a.set_filter_edges_hz(300.0, 2700.0)
+    a.filter_set(agc="off")
+    _feed_iq(a, 1.5, [(1000.0, 0.01)])
+    _pull(a, AUDIO_RATE // CHUNK)
+    sp = a.filter_status()["spectrum"]
+    assert sp["hz"] == a.filter_status()["response"]["hz"]
+    k = int(np.argmax(sp["db"]))
+    assert abs(sp["hz"][k] - 1000.0) <= 40.0 and sp["db"][k] == 0.0, (sp["hz"][k], sp["db"][k])
+    assert sp["floor_db"] < -20.0 and min(sp["db"]) >= -120.0
+    a._mode = "LSB"
+    a._init_demod()
+    a.set_filter_edges_hz(-2700.0, -300.0)
+    _feed_iq(a, 1.5, [(-1000.0, 0.01)])                          # 1 kHz audio on LSB
+    _pull(a, AUDIO_RATE // CHUNK)
+    sp = a.filter_status()["spectrum"]
+    k = int(np.argmax(sp["db"]))
+    assert abs(sp["hz"][k] - 1000.0) <= 40.0, sp["hz"][k]

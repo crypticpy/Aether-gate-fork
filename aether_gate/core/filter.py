@@ -525,6 +525,23 @@ class SliceFilter:
             "_sign": sgn,
         }
 
+    def spectrum_db(self, points=128):
+        """What is arriving ahead of the filter, on response_db's grid: the
+        1 s spectrum the auto width and the ANF read, in dB below its peak,
+        with the floor (its median) on the same scale. None until heard."""
+        if self.spec_db is None:
+            return None
+        lo, hi = self.audio_edges()
+        f_audio = np.linspace(0.0, max(hi + 500.0, 3500.0), points)
+        f = self._sign() * f_audio
+        order = np.argsort(self.spec_f)
+        p = np.interp(f, self.spec_f[order], self.spec_db[order])
+        peak = float(np.max(p))
+        floor = float(np.median(p))
+        return {"hz": [round(x) for x in f_audio],
+                "db": [round(max(float(x) - peak, -120.0), 1) for x in p],
+                "floor_db": round(floor - peak, 1)}
+
     def response_db(self, points=128):
         """The designed response across the audio band, for a picture."""
         if self.taps is None:

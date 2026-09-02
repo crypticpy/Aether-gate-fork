@@ -1469,6 +1469,7 @@ class SoapyAdapter(RadioAdapter):
                         "blanked_pct": round(float(self._div.blanked_pct), 2)}
         st["roofing"]["analogue_hz"] = self._analogue_if_hz()
         st["response"] = self._filt.response_db()
+        st["spectrum"] = self._filt.spectrum_db()
         return st
 
     def _analogue_if_hz(self):
