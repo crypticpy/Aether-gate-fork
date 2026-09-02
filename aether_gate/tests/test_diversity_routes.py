@@ -646,6 +646,15 @@ def test_beacons_route_passes_the_adapter_answer_through():
     assert ("beacons", {}) in a.calls
 
 
+def test_stereo_is_a_source_the_route_accepts():
+    a = FakeDiversityAdapter()
+    _, port = _start(a)
+    out = _get(port, "/diversity/set?source=stereo")
+    assert "error" not in out and out["source"] == "stereo"
+    assert [c for c in a.calls if c[0] == "set"][-1][1]["source"] == "stereo"
+    assert "error" in _get(port, "/diversity/set?source=left")
+
+
 def test_bad_subband_value_is_an_error():
     a = FakeDiversityAdapter()
     _, port = _start(a)

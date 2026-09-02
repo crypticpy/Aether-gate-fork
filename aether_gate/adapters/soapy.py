@@ -713,6 +713,8 @@ class SoapyAdapter(RadioAdapter):
             rot = self._nco_rotation(len(block))
             y = self._passband(block.astype(np.complex128) * rot, chain, 0)
         if self._is_fm_mode(self._mode):
+            if y.ndim == 2:
+                y = y[:, 0]        # the discriminator keeps one phase state: FM hears loop A
             return self._discriminate(y)
         return 2.0 * np.real(y)                            # x2: real() halves the one-sided energy
 
@@ -1729,7 +1731,9 @@ class SoapyAdapter(RadioAdapter):
     def get_audio(self, n_samples, slice_hz=None, mode=None, slice_id=None):
         """Return n_samples of 24 kHz mono audio (float, ~[-1,1]) demodulated from
         the live IQ at the slice frequency. None if not enough IQ buffered yet.
-        slice_id keys the diversity weight (dual tuner); ignored otherwise."""
+        slice_id keys the diversity weight (dual tuner); ignored otherwise.
+        With the diversity HEAR set to stereo the samples are (left, right)
+        pairs: loop A left, loop B right, one AGC gain for both."""
         np = self._np
         if np is None or not self._stage_firs:
             return None
@@ -1748,14 +1752,22 @@ class SoapyAdapter(RadioAdapter):
                 blk = self._audio_q.popleft() if self._audio_q else None
             if blk is None:
                 break
-            self._ar_buf = np.concatenate([self._ar_buf, self._demod_block(blk, sid)])
+            out = self._demod_block(blk, sid)
+            if out.ndim != self._ar_buf.ndim:
+                self._ar_buf = out             # HEAR switched mono <-> stereo: a fresh buffer
+            else:
+                self._ar_buf = np.concatenate([self._ar_buf, out])
         if len(self._ar_buf) < need_r:
             return None                      # not enough IQ yet (stream still filling)
 
         # fractional resample _pd_rate -> AUDIO_RATE, phase-continuous across calls.
         # At the 2.040 MS/s sweet spot the ratio is exactly 1.0 -> pure pass-through.
         idx = self._rs_phase + np.arange(n_samples) * self._rs_ratio
-        audio = np.interp(idx, np.arange(len(self._ar_buf)), self._ar_buf)
+        grid = np.arange(len(self._ar_buf))
+        if self._ar_buf.ndim == 2:
+            audio = np.stack([np.interp(idx, grid, self._ar_buf[:, c]) for c in range(2)], axis=1)
+        else:
+            audio = np.interp(idx, grid, self._ar_buf)
         nxt = self._rs_phase + n_samples * self._rs_ratio
         k = int(np.floor(nxt))
         self._ar_buf = self._ar_buf[k:]
@@ -1804,7 +1816,8 @@ class SoapyAdapter(RadioAdapter):
         self._agc_level = (1 - a) * self._agc_level + a * rms
         g_new = self._agc_target / max(self._agc_level, 1e-4)
         g_old = self._agc_gain if self._agc_gain is not None else g_new
-        audio = audio * np.linspace(g_old, g_new, len(audio))
+        ramp = np.linspace(g_old, g_new, len(audio))
+        audio = audio * (ramp[:, None] if audio.ndim == 2 else ramp)
         self._agc_gain = g_new
         np.clip(audio, -1.0, 1.0, out=audio)
         return audio.tolist()

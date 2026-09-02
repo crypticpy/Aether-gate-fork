@@ -81,7 +81,7 @@ class _DiversityState:
                                 # long enough to overflow the driver and trigger
                                 # another realign under its own stall
     MODES = ("off", "manual", "null", "track")
-    SOURCES = ("combined", "a", "b")             # the v1 `source` vocabulary
+    SOURCES = ("combined", "a", "b", "stereo")   # HEAR: what reaches the audio
     PANS = ("combined", "a", "b", "nulled")      # what the panadapter shows
     MAP_BINS = 2048            # spatial-map resolution (61 Hz at 125 kS/s)
     GUARD_GAP_HZ = 300.0       # between the passband edge and its guard band
@@ -94,6 +94,7 @@ class _DiversityState:
         self.aligner = _dv().Aligner()
         self.mode = "off"
         self.pan = "combined"
+        self.hear = "combined"              # the audio: combined, a, b, or stereo (A left, B right)
         self.manual = {}                    # slice_id -> complex weight m
         self.trackers = {}
         self.passband = {}                  # sid -> PassbandPhase                  # slice_id -> Tracker (rebuilt on a rate change)
@@ -133,8 +134,10 @@ class _DiversityState:
     # --- the `source` alias -------------------------------------------------
     @property
     def source(self):
-        """v1 name for the panadapter selection; 'nulled' reads as combined."""
-        return self.pan if self.pan in self.SOURCES else "combined"
+        """The `source` key: what the operator hears. Until 2026-09-02 this
+        was an alias of `pan` and HEAR in the window changed the panadapter,
+        not the audio."""
+        return self.hear
 
     # --- reader thread -------------------------------------------------
     def request_realign(self, why):
@@ -440,6 +443,14 @@ class _DiversityState:
             "slice_id": sid,
         }
 
+    def _monitor(self, pa, pb):
+        if self.hear == "a":
+            return pa
+        if self.hear == "b":
+            return pb
+        n = min(len(pa), len(pb))
+        return self.a._np.stack([pa[:n], pb[:n]], axis=1)
+
     def combine_passband(self, sid, pa, pb, m0, m1, rate_hz):
         """The demod passband pair of slice sid -> one combined block.
 
@@ -448,7 +459,14 @@ class _DiversityState:
         per-bin null wherever the learned noise has a direction, with the
         talker's steering vector held distortionless. Otherwise, and whenever
         the pair is not aligned, the wideband combiner with its click-free
-        ramp from m0 to m1."""
+        ramp from m0 to m1.
+
+        HEAR a / b hands that loop's passband straight through; stereo hands
+        both as an (n, 2) array, A left and B right, for the operator with
+        two speakers to hear the loops as a soundstage. The tracker keeps
+        learning from observe() either way, so a comparison costs nothing."""
+        if self.hear != "combined":
+            return self._monitor(pa, pb)
         t = self.trackers.get(sid)
         if (not self.subband_on or self.mode not in ("null", "track")
                 or not self.aligner.aligned or t is None):
@@ -497,7 +515,7 @@ class _DiversityState:
             source = str(source).lower()
             if source not in self.SOURCES:
                 raise ValueError(f"source must be one of {self.SOURCES}")
-            self.pan = source
+            self.hear = source
         if pan is not None:
             pan = str(pan).lower()
             if pan not in self.PANS:

@@ -314,6 +314,16 @@ def meter_packet(stream_id, seq, meter_id, dbm):
     return vita_header(stream_id, PCC_METER, seq, len(payload)) + payload
 
 
+def audio_frames(chunk, reduced_bw=False):
+    """An adapter's audio chunk -> the packet's sample list. A chunk is floats
+    (one channel, sent to both ears) or (left, right) pairs (the diversity
+    stereo monitor: loop A left, loop B right). The int16 mono format takes
+    the left."""
+    if not chunk or not isinstance(chunk[0], (list, tuple)):
+        return list(chunk) if reduced_bw else [x for v in chunk for x in (v, v)]
+    return [v[0] for v in chunk] if reduced_bw else [x for v in chunk for x in v]
+
+
 def audio_packet(stream_id, seq, samples, reduced_bw=False):
     """VITA-49 remote_audio_rx packet.
     reduced_bw=False: PCC 0x03E3 — float32 stereo big-endian, 128 frames (1024 B payload).
@@ -2336,11 +2346,7 @@ class Radio:
 
                     sample_t += AUDIO_FRAMES  # harmless for non-tone sources
 
-                    if reduced:
-                        samples = mono
-                    else:
-                        samples = []
-                        for v in mono: samples.extend([v, v])
+                    samples = audio_frames(mono, reduced)
 
                     try:
                         s.sendto(audio_packet(stream_id, seq & 0xF, samples, reduced_bw=reduced), dest)
@@ -3876,7 +3882,7 @@ def start_control_server(radio, port):
                         kwargs["mode"] = mode
                     if "source" in q:
                         source = q["source"][0]
-                        if source not in ("combined", "a", "b"):
+                        if source not in ("combined", "a", "b", "stereo"):
                             raise ValueError(f"source={source!r}")
                         kwargs["source"] = source
                     if "phase" in q:

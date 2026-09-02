@@ -169,12 +169,39 @@ def test_null_source_parks_the_slice_on_that_sources_null_in_manual_mode():
         st.set(null_source=5)
 
 
-def test_pan_and_source_are_one_setting():
+def test_hear_is_the_audio_and_pan_is_the_panadapter():
     st = _aligned_state()
-    assert st.set(pan="nulled")["source"] == "combined"      # v1 vocabulary has no 'nulled'
-    assert st.set(source="b")["pan"] == "b"
+    assert st.set(pan="nulled")["source"] == "combined"      # the pan does not touch the audio
+    out = st.set(source="b")
+    assert out["source"] == "b" and out["pan"] == "nulled"   # ...and HEAR does not touch the pan
+    assert st.set(source="stereo")["source"] == "stereo"
     with pytest.raises(ValueError):
         st.set(pan="c")
+    with pytest.raises(ValueError):
+        st.set(source="c")
+
+
+def test_hear_a_b_stereo_hand_the_loops_through_and_the_tracker_keeps_learning():
+    from aether_gate.core.diversity import combine_ramp
+    rng = np.random.default_rng(12)
+    st = _aligned_state(mode="USB")
+    st.set(mode="track")
+    pa = rng.normal(size=2000) + 1j * rng.normal(size=2000)
+    pb = rng.normal(size=2000) + 1j * rng.normal(size=2000)
+    m = 0.5 + 0.2j
+    st.set(source="a")
+    assert st.combine_passband(0, pa, pb, m, m, 25_000.0) is pa
+    st.set(source="b")
+    assert st.combine_passband(0, pa, pb, m, m, 25_000.0) is pb
+    st.set(source="stereo")
+    y = st.combine_passband(0, pa, pb[:1500], m, m, 25_000.0)
+    assert y.shape == (1500, 2)
+    assert np.array_equal(y[:, 0], pa[:1500]) and np.array_equal(y[:, 1], pb[:1500])
+    # observe() is what learns, and it does not look at HEAR
+    st.observe(0, pa[:1024], pb[:1024])
+    assert 0 in st.trackers
+    st.set(source="combined", subband=False)
+    assert np.allclose(st.combine_passband(0, pa, pb, m, m, 25_000.0), combine_ramp(pa, pb, m, m))
 
 
 # --- capture ------------------------------------------------------------------
