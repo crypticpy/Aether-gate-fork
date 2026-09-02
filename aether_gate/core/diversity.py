@@ -111,6 +111,16 @@ TALK_ONSET_HANG_S = TALK_HOLD_S
 # signal a quarter-second covariance steers somewhere random (seen live),
 # and the memory recall at onset already covers the known talkers.
 FIRST_FIT_MIN_TALK_S = 0.4
+# Fade guard: when, block after block for FADE_HOLD_S of voice, the better
+# antenna alone beats the output by FADE_DROP_DB on the block's own
+# covariance, switch to that antenna at once, without the hold margin. QSB
+# on the two antennas is what diversity is for; waiting for a smoothed
+# estimate to notice a 20 dB fade takes several time constants (seen live:
+# 8 dB under antenna A for three seconds). Per-block SNRs are noisy at
+# low SNR, but a 3 dB margin sustained over every block of 0.2 s is not,
+# and falling back to one antenna is a low-regret move.
+FADE_DROP_DB = 3.0
+FADE_HOLD_S = 0.2
 
 
 def find_lag(a, b, max_lag):
@@ -418,6 +428,7 @@ class Tracker:
         self._onset_done = False
         self._rs_n = 0
         self._rs_half = [None, None]        # Rs from even / odd blocks (see refit)
+        self._fade_s = 0.0                  # voiced time the fade guard has held
         self._over_fits = 0                 # refits adopted during this over
         self._memorised = False             # this over has been stored
         self._hist = []                     # (t, p_in) over the last MOD_WINDOW_S
@@ -469,6 +480,7 @@ class Tracker:
                     self._onset_done = True
                     self._rs_n = 0
                     self._rs_half = [None, None]
+                    self._fade_s = 0.0
                     self._over_fits = 0
                     self._memorised = False
                     self.Rs = None
@@ -479,6 +491,8 @@ class Tracker:
                 # the same estimate split by block parity: two independent
                 # views of the over, so a fit can be judged on data it did
                 # not see
+                if mode == "track" and self._over_fits > 0:
+                    self._fade_guard(R_in, dt)
                 h = self._rs_n % 2
                 k = (self._rs_n + 1) // 2
                 al_h = max(self._alpha(2 * n, self.signal_tc_s), 1.0 / k)
@@ -568,6 +582,21 @@ class Tracker:
                 self._memorise()
             return True
         return False
+
+    def _fade_guard(self, R_in, dt):
+        """See FADE_DROP_DB: one voiced block's covariance against the noise."""
+        Rn = self._loaded_noise()
+        cur = _snr_of(self.m, R_in, Rn)
+        alone = {a: _snr_of(a, R_in, Rn) for a in (0j, complex(WEIGHT_MAX_ABS))}
+        best = max(alone, key=alone.get)
+        if best != self.m and alone[best] > cur * 10 ** (FADE_DROP_DB / 10.0):
+            self._fade_s += dt
+            if self._fade_s >= FADE_HOLD_S:
+                self.m = best
+                self.updates += 1
+                self._fade_s = 0.0
+        else:
+            self._fade_s = 0.0
 
     def _memorise(self):
         """Store this over's steering vector and weight, if it is speech and

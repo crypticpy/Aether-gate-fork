@@ -365,3 +365,29 @@ def test_blanker_removes_an_impulse_from_both_channels_and_leaves_speech():
     c = (1 + np.cos(2 * np.pi * 400 * t)) * np.exp(2j * np.pi * 1000 * t)
     ca, cb, frac = blank_impulses(c + 0.01 * a, c + 0.01 * b, 12.0)
     assert frac == 0.0
+
+
+def test_fade_guard_switches_to_the_surviving_antenna_within_half_a_second():
+    """B carries the talker best, so the beam leans on B; then B fades away
+    in a syllable (QSB). The output must not sit under A for a time
+    constant: the fade guard moves it to A alone within half a second."""
+    rng = np.random.default_rng(23)
+    tr = Tracker(RATE)
+    block = 1024
+    t = 0.0
+    while t < 3.0:                                          # steady over, B 6 dB better
+        R_in, R_g = _scene(rng, block, (0.4, 2.0), 0.5, qrm=(2.0, 0.0), talk_gain=3.0, t=t)
+        tr.update(R_in, R_g, block, "track")
+        t += block / RATE
+    assert tr.updates >= 1 and abs(tr.m) > 1.0, tr.m         # leaning on B
+    n0 = tr.updates
+    steps = 0
+    while t < 4.0:                                          # B collapses
+        R_in, R_g = _scene(rng, block, (0.4, 0.05), 0.5, qrm=(2.0, 0.0), talk_gain=3.0, t=t)
+        tr.update(R_in, R_g, block, "track")
+        t += block / RATE
+        steps += 1
+        if tr.updates > n0:
+            break
+    assert tr.updates > n0 and steps * block / RATE <= 0.5, (steps, tr.m)
+    assert tr.m == 0j, tr.m                                 # A alone

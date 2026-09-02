@@ -323,6 +323,9 @@ class _DiversityState:
             "talk_mod": (round(t.talk_mod, 2) if t is not None and t.talk_mod is not None
                          else None),
             "rn_source": t.rn_source if t is not None else None,
+            # how directional the noise is (0 = isotropic, nothing to null)
+            "noise_coherence": (round(_dv()._coherence(t.Rn), 2)
+                                if t is not None and t.Rn is not None else None),
             "updates": int(t.updates) if t is not None else 0,
             "nb": {"enabled": self.nb_on, "threshold_db": self.nb_db,
                    "blanked_pct": round(self.blanked_pct, 2)},
