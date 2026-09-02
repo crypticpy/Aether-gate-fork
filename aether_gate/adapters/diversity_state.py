@@ -438,7 +438,10 @@ class _DiversityState:
                 s = _dv().steering_of(S)
         if s is None:
             s = np.array([1.0, np.conj(m1)], dtype=np.complex128)    # the weight's own beam
-        return sb.process(pa, pb, m1, s, bool(t.talking))
+        # a steady carrier is "talking" to the VAD but noise to the listener:
+        # the tracker learns it into Rn_in, and so does the per-bin model
+        talking = bool(t.talking) and not bool(t.steady)
+        return sb.process(pa, pb, m1, s, talking)
 
     def set(self, mode=None, phase_deg=None, ratio_db=None, source=None, sid=None,
             nb=None, nb_db=None, pan=None, null_source=None, focus=None, subband=None):

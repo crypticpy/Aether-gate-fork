@@ -135,3 +135,5 @@ def test_a_conversation_that_stopped_is_still_listed_with_its_age():
     # ~15 s of silence, minus the ~4 s the 8.5 s scoring window keeps hearing it
     assert 8.0 <= top["last_s"] <= 14.0, top
     assert top["active_s"] >= 3 * SLOW_PERIOD_S
+    # the row describes the conversation as it was, not the silence now
+    assert top["snr_db"] >= 5.0 and top["syllabic"] >= 0.6 and top["depth"] >= 0.4, top

@@ -356,6 +356,15 @@ def test_combine_passband_refines_only_in_track_or_null_and_reports_it():
     assert 0 in st.subbands and st.subbands[0].rate_hz == rate
     sb = st.status()["subband"]
     assert sb["enabled"] is True and set(sb) == {"enabled", "bins", "extra_db"}
+    # what the VAD calls talking is not learned; a steady carrier is
+    t = st.trackers[0]
+    t.talking, t.steady = True, False
+    n0 = st.subbands[0]._frames
+    st.combine_passband(0, pa, pb, m, m, rate)
+    assert st.subbands[0]._frames == n0
+    t.talking, t.steady = True, True
+    st.combine_passband(0, pa, pb, m, m, rate)
+    assert st.subbands[0]._frames > n0
     # a rate change (retune to another decimation) rebuilds the combiner
     st.combine_passband(0, pa, pb, m, m, 50_000.0)
     assert st.subbands[0].rate_hz == 50_000.0

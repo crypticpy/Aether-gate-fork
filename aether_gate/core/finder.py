@@ -130,6 +130,9 @@ class Finder:
         self.elapsed = 0.0
         self._since_slow = 0.0
         self.slow = np.zeros((SLOW_ROWS, self.nwin), dtype=np.float32)
+        # what the score was made of, per row, so a candidate can be described
+        # as it was at its best rather than as it is right now
+        self.slow_terms = np.zeros((SLOW_ROWS, 3, self.nwin), dtype=np.float32)
         self.slow_t = np.zeros(SLOW_ROWS)
         self.slow_i = 0
         self.slow_n = 0
@@ -198,6 +201,7 @@ class Finder:
         na_w = np.mean(np.median(F[:, 0], axis=1)) * self.win
         nb_w = np.mean(np.median(F[:, 1], axis=1)) * self.win
         self.slow[self.slow_i] = score
+        self.slow_terms[self.slow_i] = np.stack([snr_db, depth, syllabic])
         self.slow_t[self.slow_i] = self.elapsed
         self.slow_i = (self.slow_i + 1) % SLOW_ROWS
         self.slow_n = min(self.slow_n + 1, SLOW_ROWS)
@@ -209,10 +213,13 @@ class Finder:
 
     # --- on demand -----------------------------------------------------------
     def _slow_rows(self):
+        """The slow ring in time order: scores (n, nwin), their terms
+        (n, 3, nwin) = snr_db/depth/syllabic, times (n,)."""
         if self.slow_n < SLOW_ROWS:
-            return self.slow[:self.slow_n], self.slow_t[:self.slow_n]
-        idx = np.concatenate([np.arange(self.slow_i, SLOW_ROWS), np.arange(self.slow_i)])
-        return self.slow[idx], self.slow_t[idx]
+            idx = np.arange(self.slow_n)
+        else:
+            idx = np.concatenate([np.arange(self.slow_i, SLOW_ROWS), np.arange(self.slow_i)])
+        return self.slow[idx], self.slow_terms[idx], self.slow_t[idx]
 
     def _point_hz(self, i, center_hz):
         return center_hz - self.rate_hz / 2 + (i + 0.5) * self.step_hz
@@ -237,9 +244,15 @@ class Finder:
         last = self._last
         if last is None:
             return {"available": False}
-        rows, times = self._slow_rows()
-        recent = rows[(self.elapsed - times) <= CANDIDATE_RECENT_S]
-        rec = np.max(recent, axis=0) if len(recent) else last["score"]
+        rows, terms, times = self._slow_rows()
+        is_recent = (self.elapsed - times) <= CANDIDATE_RECENT_S
+        recent = rows[is_recent]
+        if len(recent):
+            rec = np.max(recent, axis=0)
+            best = np.nonzero(is_recent)[0][np.argmax(recent, axis=0)]   # row of each max
+        else:
+            rec = last["score"]
+            best = None
         voiced = rows >= VOICE_SCORE
         activity = np.mean(voiced, axis=0) if len(rows) else np.zeros(self.nwin)
         active_s = np.sum(voiced, axis=0) * SLOW_PERIOD_S
@@ -255,13 +268,20 @@ class Finder:
             hit = np.nonzero(voiced[:, w])[0]
             last_s = float(self.elapsed - times[hit[-1]]) if len(hit) else None
             hz, mode = self._dial_hz(w, center_hz)
+            # the terms as they were when the window scored best, not now:
+            # a row must describe the conversation it lists, and 20 s after
+            # the last over "now" is the floor
+            if best is not None:
+                snr_w, depth_w, syl_w = (float(x) for x in terms[best[w], :, w])
+            else:
+                snr_w, depth_w, syl_w = (float(last[k][w]) for k in ("snr_db", "depth", "syllabic"))
             c = {
                 "_w": int(w), "hz": round(float(hz), 1), "mode": mode,
                 "width_hz": round(self.win * self.step_hz, 1),
                 "score": round(float(rec[w]), 2),
-                "snr_db": round(float(last["snr_db"][w]), 1),
-                "syllabic": round(float(last["syllabic"][w]), 2),
-                "depth": round(float(last["depth"][w]), 2),
+                "snr_db": round(snr_w, 1),
+                "syllabic": round(syl_w, 2),
+                "depth": round(depth_w, 2),
                 "active_s": round(float(active_s[w]), 1),
                 "last_s": None if last_s is None else round(last_s, 1),
             }
