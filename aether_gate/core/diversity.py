@@ -45,6 +45,9 @@ Three pieces, each hardware-free and unit-tested on synthetic data:
 """
 import math
 
+import json
+import os
+
 import numpy as np
 
 # Alignment is accepted only when the correlation peak stands this far above
@@ -365,13 +368,67 @@ class TalkerMemory:
     to what worked last time instead of being re-learned over a refit cycle.
     """
 
-    def __init__(self, max_n=MEMORY_MAX, match=MEMORY_MATCH):
+    def __init__(self, max_n=MEMORY_MAX, match=MEMORY_MATCH, names_path=None):
         self.max_n = int(max_n)
         self.match = float(match)
         self.entries = []                    # dicts: id, s, m, hits, first_seen, last_seen, name
         self._next_id = 1                    # ids never reuse within a run
         self.active = None                   # id of the talker whose weight is live
         self.active_since = None
+        # Names outlive a run: they are keyed to the steering vector, not the
+        # id, so a talker heard again after a restart gets their label back
+        # as soon as their signature is stored.
+        self.names_path = names_path
+        self._named = self._load_names()
+
+    def _load_names(self):
+        if not self.names_path:
+            return []
+        try:
+            with open(self.names_path) as fh:
+                raw = json.load(fh)
+        except (OSError, ValueError):
+            return []
+        out = []
+        for e in raw if isinstance(raw, list) else []:
+            try:
+                v = np.array(e["s"], dtype=float)
+                s = v[0::2] + 1j * v[1::2]
+                if len(s) >= 2 and e.get("name"):
+                    out.append({"s": s / max(np.linalg.norm(s), 1e-12), "name": str(e["name"])})
+            except (KeyError, TypeError, ValueError):
+                continue
+        return out
+
+    def _save_names(self):
+        if not self.names_path:
+            return
+        raw = [{"s": [float(x) for c in e["s"] for x in (c.real, c.imag)], "name": e["name"]}
+               for e in self._named]
+        try:
+            os.makedirs(os.path.dirname(self.names_path) or ".", exist_ok=True)
+            tmp = self.names_path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(raw, fh)
+            os.replace(tmp, self.names_path)
+        except OSError:
+            pass
+
+    def _remember_name(self, s, name):
+        """Persist (or drop) the label for the signature s."""
+        kept = [e for e in self._named if abs(np.vdot(e["s"], s)) ** 2 < self.match]
+        if name:
+            kept.append({"s": s, "name": name})
+        self._named = kept
+        self._save_names()
+
+    def _known_name(self, s):
+        best, best_c = None, self.match
+        for e in self._named:
+            c = abs(np.vdot(e["s"], s)) ** 2
+            if c >= best_c:
+                best, best_c = e["name"], c
+        return best
 
     def _activate(self, e, now):
         if self.active != e["id"]:
@@ -409,7 +466,7 @@ class TalkerMemory:
                 self._activate(e, now)
                 return
         e = {"id": self._next_id, "s": s, "m": m, "hits": 0,
-             "first_seen": now, "last_seen": now, "name": None}
+             "first_seen": now, "last_seen": now, "name": self._known_name(s)}
         self._next_id += 1
         self.entries.append(e)
         self._activate(e, now)
@@ -424,6 +481,7 @@ class TalkerMemory:
         for e in self.entries:
             if e["id"] == int(talker_id):
                 e["name"] = (str(name).strip() or None) if name is not None else None
+                self._remember_name(e["s"], e["name"])
                 return True
         return False
 

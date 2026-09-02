@@ -62,6 +62,7 @@ class _DiversityState:
     GUARD_GAP_HZ = 300.0       # between the passband edge and its guard band
     NB_DEFAULT_DB = 12.0
     CAPTURE_DIR = "~/aether-gate-captures"
+    NAMES_PATH = "~/.aether-gate/diversity-names.json"   # talker labels, by signature
 
     def __init__(self, adapter):
         self.a = adapter
@@ -72,7 +73,8 @@ class _DiversityState:
         self.trackers = {}
         self.passband = {}                  # sid -> PassbandPhase                  # slice_id -> Tracker (rebuilt on a rate change)
         self.last_m = {}                    # slice_id -> weight the last block ended on
-        self.memory = _dv().TalkerMemory()  # shared by every slice's tracker
+        self.memory = _dv().TalkerMemory(   # shared by every slice's tracker
+            names_path=os.path.expanduser(self.NAMES_PATH))
         self.active_slice = 0
         self._cal_a, self._cal_b, self._cal_n = [], [], 0
         # Guards _cal_a/_cal_b/_cal_n: request_realign() can land from the

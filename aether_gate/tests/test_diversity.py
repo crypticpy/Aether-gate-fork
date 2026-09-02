@@ -468,3 +468,26 @@ def test_steady_carrier_becomes_noise_is_nulled_and_a_talker_over_it_is_tracked(
                                            (_noise(rng, 8192), 2.0, 0.9)], 0.5))
     snr_out = _snr_of(tr.m, talk + noise, noise); snr_a = _snr_of(0j, talk + noise, noise)
     assert 10 * np.log10(snr_out / snr_a) > 6.0, (tr.m, m_null)
+
+
+def test_memory_names_survive_a_restart_by_signature(tmp_path):
+    path = str(tmp_path / "names.json")
+    s1 = np.array([1.0, 0.6 * np.exp(1j * 0.4)]); s1 = s1 / np.linalg.norm(s1)
+    s2 = np.array([1.0, 0.6 * np.exp(1j * 2.5)]); s2 = s2 / np.linalg.norm(s2)
+    mem = TalkerMemory(names_path=path)
+    mem.store(s1, 0.3j, now=0.0); mem.store(s2, 0.1, now=1.0)
+    assert mem.name(1, "Bob")
+    # a new run: fresh ids, and Bob's label comes back with his signature
+    mem2 = TalkerMemory(names_path=path)
+    mem2.store(s2, 0.1, now=0.0)
+    mem2.store(s1 * np.exp(1j * 0.9), 0.3j, now=1.0)       # same bearing, other global phase
+    st = mem2.status(now=2.0)
+    assert [(e["id"], e["name"]) for e in st] == [(2, "Bob"), (1, None)]
+    assert mem2.name(2, "")                                 # clearing forgets it on disk too
+    mem3 = TalkerMemory(names_path=path)
+    mem3.store(s1, 0.3j, now=0.0)
+    assert mem3.entries[0]["name"] is None
+    # a missing or corrupt file is not an error
+    (tmp_path / "bad.json").write_text("{not json")
+    assert TalkerMemory(names_path=str(tmp_path / "bad.json"))._named == []
+    assert TalkerMemory(names_path=str(tmp_path / "none.json"))._named == []

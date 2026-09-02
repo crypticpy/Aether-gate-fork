@@ -49,3 +49,24 @@ def test_a_delay_between_antennas_shows_as_a_slope_and_lost_flatness():
     assert abs(s["phase_slope_deg_per_khz"]) == pytest.approx(57.6, abs=3.0)
     # phase spread of +-86 deg over the band: sin(1.5)/1.5
     assert 0.55 < s["flatness"] < 0.78, s
+
+
+def test_bins_show_where_the_phase_slopes():
+    rng = np.random.default_rng(5)
+    rate, n = 125_000.0, 4096
+    pb = PassbandPhase(rate)
+    f = np.fft.fftfreq(n, 1.0 / rate)
+    sel = (f >= 0) & (f < 3000)
+    for _ in range(20):
+        X = rng.normal(size=sel.sum()) + 1j * rng.normal(size=sel.sum())
+        # 20-sample delay on B: phase ramps across the band
+        Xb = X * np.exp(-2j * np.pi * f[sel] * 20 / rate)
+        pb.update(X, Xb, f[sel], n, True)
+    st = pb.status()
+    bins = st["bins"]
+    assert len(bins) == PassbandPhase.BINS
+    ph = [b["phase_deg"] for b in bins]
+    assert all(p is not None for p in ph)
+    assert ph[0] < 0 < ph[-1] and ph[-1] - ph[0] > 100      # monotone ramp, ~170 deg span
+    assert all(abs(p - q) < 40 for p, q in zip(ph, ph[1:]))
+    assert all(b["coherence"] > 0.95 for b in bins)

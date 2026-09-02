@@ -64,4 +64,25 @@ class PassbandPhase:
         coh = tot / max(float(np.sqrt(self.Pa * self.Pb).sum()), 1e-30)
         return {"flatness": round(float(flatness), 3),
                 "phase_slope_deg_per_khz": round(math.degrees(slope), 1),
-                "coherence": round(float(coh), 2)}
+                "coherence": round(float(coh), 2),
+                "bins": self._bins(ref)}
+
+    BINS = 16
+
+    def _bins(self, ref):
+        """The passband in BINS equal slices, low frequency first: phase
+        (degrees, relative to the mean) and coherence per slice, so a strip
+        can show *where* across the band the weight stops fitting."""
+        order = np.argsort(self.f)
+        S, Pa, Pb = self.S[order], self.Pa[order], self.Pb[order]
+        edges = np.linspace(0, len(S), self.BINS + 1).astype(int)
+        out = []
+        for a, b in zip(edges[:-1], edges[1:]):
+            if b <= a:
+                out.append({"phase_deg": None, "coherence": None})
+                continue
+            tot = S[a:b].sum()
+            den = float(np.sqrt(Pa[a:b] * Pb[a:b]).sum())
+            out.append({"phase_deg": round(float(np.degrees(np.angle(tot * np.conj(ref)))), 1),
+                        "coherence": round(float(abs(tot) / max(den, 1e-30)), 2)})
+        return out
