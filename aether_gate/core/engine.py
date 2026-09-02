@@ -3457,6 +3457,11 @@ function paintDivScopeText(s){{
     +' passband flat:'+(pb.flatness!=null?pb.flatness.toFixed(2):'—')
     +' slope:'+(pb.phase_slope_deg_per_khz!=null?pb.phase_slope_deg_per_khz.toFixed(1)+'°/kHz':'—')
     +' coh:'+(pb.coherence!=null?pb.coherence.toFixed(2):'—');
+  var fc=s.focus;
+  if(fc){{line3+=' focus:#'+fc.id+(fc.name?' '+fc.name:'')
+    +(fc.nulling?' <span style="color:#e94">NULLING</span>':fc.live?' <span style="color:#3c6">LIVE</span>':'');}}
+  var lp=s.loops||{{}};
+  if(lp.warning){{line3+='<br><span style="color:#e94">loops: '+lp.warning+'</span>';}}
   el.innerHTML=line1+'<br>'+line2+'<br>'+line3;
 }}
 function pollDiv(){{fetch('/diversity').then(r=>r.json()).then(paintDiv).catch(()=>{{

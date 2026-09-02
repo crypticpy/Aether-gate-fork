@@ -273,3 +273,30 @@ def test_focus_needs_a_known_talker_and_shows_in_status():
     assert set(f) == {"id", "name", "since_s", "live", "nulling", "overs", "nulled", "best_db"}
     assert f["id"] == tid and f["live"] is False and f["nulling"] is False
     assert st.set(focus="")["focus"] is None
+
+
+def test_loop_balance_warns_only_after_a_gap_has_held():
+    from aether_gate.core.balance import LoopBalance
+    lb = LoopBalance()
+    even = np.diag([1.0, 1.0]).astype(complex)
+    sick = np.diag([1.0, 10 ** (-0.8)]).astype(complex)        # B 8 dB down
+    for k in range(10):
+        lb.update(even, float(k))
+    assert lb.status(10.0)["warning"] is None
+    assert abs(lb.status(10.0)["b_minus_a_db"]) < 0.5
+    for k in range(10, 200):                                    # 190 s: not yet
+        lb.update(sick, float(k))
+    st = lb.status(200.0)
+    assert st["warning"] is None and st["b_minus_a_db"] < -7.0
+    for k in range(200, 900):
+        lb.update(sick, float(k))
+    w = lb.status(900.0)["warning"]
+    assert w and w.startswith("B is 8 dB down for 1") and "loop" in w, w
+    for k in range(900, 1100):                                  # recovers: warning clears
+        lb.update(even, float(k))
+    assert lb.status(1100.0)["warning"] is None
+
+
+def test_status_carries_the_loop_balance():
+    st = _aligned_state()
+    assert st.status()["loops"] == {"b_minus_a_db": None, "warning": None}

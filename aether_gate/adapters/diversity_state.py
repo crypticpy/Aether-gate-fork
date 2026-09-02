@@ -44,6 +44,11 @@ def _sp():
     return spatial
 
 
+def _balance():
+    from ..core import balance
+    return balance
+
+
 def _is_fm(mode):
     return (mode or "").upper() in ("FM", "NFM", "DFM")
 
@@ -85,6 +90,7 @@ class _DiversityState:
         self.last_align = {"lag": 0, "peak": 0.0, "ok": False, "why": None}
         # noise blanker
         self.nb_on = False
+        self.balance = _balance().LoopBalance()   # G7: a sick loop, said out loud
         self.nb_db = self.NB_DEFAULT_DB
         self.blanked_pct = 0.0
         # spatial map: rebuilt whenever the hardware centre or rate moves,
@@ -249,6 +255,8 @@ class _DiversityState:
             idx_in, idx_g = self._bands(n, rate, getattr(self.a, "_mode", "USB"))
             rc = _sp().region_covariance
             t.update(rc(X, idx_in), rc(X, idx_g, trim=True), n, self.mode)
+            if t.Rn is not None:
+                self.balance.update(t.Rn, time.monotonic())
             pb = self.passband.get(sid)
             if pb is None:
                 from ..core.passband import PassbandPhase
@@ -359,6 +367,7 @@ class _DiversityState:
             "sources": self._sources(),
             "memory": self.memory.status(time.monotonic()),
             "talker": self.memory.talker(time.monotonic()),
+            "loops": self.balance.status(time.monotonic()),
             "focus": self.memory.focus_status(time.monotonic(),
                                               nulling=bool(t.interferer) if t is not None else False),
             "capture": {"active": cap is not None,
