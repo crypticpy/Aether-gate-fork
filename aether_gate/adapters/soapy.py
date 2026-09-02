@@ -318,6 +318,8 @@ class SoapyAdapter(RadioAdapter):
         self._audio_dropped = 0             # blocks discarded to keep the demod current
         self._audio_drop_logged = 0.0       # monotonic stamp of the last drop log line
         self._channels = [0]                # stream channels; [0, 1] in dual-tuner mode
+        self._streams = []                  # one Soapy stream PER channel (see _start_stream)
+        self._b_tmp = None                  # scratch for channel B reads
         self.diversity_available = False    # True once two channels flow (see _open_hw)
         self._div = None                    # _DiversityState, dual-tuner only
         self._stage_firs_b = []             # channel B's own copy of the decimation state
@@ -503,7 +505,7 @@ class SoapyAdapter(RadioAdapter):
         if len(self._channels) == 2:
             self._div = _DiversityState(self)
             self.diversity_available = True
-            print("[soapy] dual tuner: two channels on one stream — diversity available "
+            print("[soapy] dual tuner: one stream per tuner — diversity available "
                   "(mode off until asked)", flush=True)
         self._start_stream()
 
@@ -520,9 +522,18 @@ class SoapyAdapter(RadioAdapter):
             stream_args["bufflen"] = ua.get("bufflen") or str(rtl_bufflen(self.samp_rate))
             if "buffers" in ua:
                 stream_args["buffers"] = ua["buffers"]
-        self._stream = self._sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, self._channels,
-                                             stream_args)
-        self._sdr.activateStream(self._stream)
+        # ONE STREAM PER TUNER. SoapySDRPlay3 refuses a multi-channel stream
+        # ("setupStream invalid channel selection", Streaming.cpp:240 — measured
+        # 2026-09-01); in dual-tuner mode each channel is its own stream with
+        # its own ring, both fed by the single sdrplay_api_Init() that the
+        # first activateStream() performs. The second activate only registers
+        # its ring, so the two rings start a few thousand samples apart —
+        # which is exactly what the alignment measurement is for.
+        self._streams = [self._sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, [ch], stream_args)
+                         for ch in self._channels]
+        self._stream = self._streams[0]
+        for st in self._streams:
+            self._sdr.activateStream(st)
         if self._div is not None:
             # The driver's per-channel buffering restarts with the stream, so
             # the offset between the tuners must be measured afresh.
@@ -530,13 +541,14 @@ class SoapyAdapter(RadioAdapter):
 
     def _stop_stream(self):
         """Deactivate and close the stream, tolerating a driver that is upset."""
-        if self._stream is not None:
+        for st in (self._streams or ([self._stream] if self._stream is not None else [])):
             for fn in ("deactivateStream", "closeStream"):
                 try:
-                    getattr(self._sdr, fn)(self._stream)
+                    getattr(self._sdr, fn)(st)
                 except Exception:
                     pass
-            self._stream = None
+        self._streams = []
+        self._stream = None
 
     def _verify_stream(self, timeout_s=2.0):
         """Prove the stream is alive by actually reading IQ out of it.
@@ -554,11 +566,11 @@ class SoapyAdapter(RadioAdapter):
         driver gives is data.
         """
         np = self._np
-        bufs = [np.empty(4096, dtype=np.complex64) for _ in self._channels]
+        buf = np.empty(4096, dtype=np.complex64)
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             try:
-                sr = self._sdr.readStream(self._stream, bufs, 4096, timeoutUs=200000)
+                sr = self._sdr.readStream(self._stream, [buf], 4096, timeoutUs=200000)
             except Exception:
                 return False
             n = sr.ret if hasattr(sr, "ret") else (sr[0] if isinstance(sr, tuple) else 0)
@@ -928,20 +940,36 @@ class SoapyAdapter(RadioAdapter):
         self._run = False
         if self._reader:
             self._reader.join(timeout=2)
-        try:
-            if self._stream is not None:
-                self._sdr.deactivateStream(self._stream)
-                self._sdr.closeStream(self._stream)
-        except Exception:
-            pass
+        self._stop_stream()
         self._sdr = self._stream = None
+
+    def _read_exact_b(self, n):
+        """Exactly n samples from channel B's stream, or None if it failed.
+
+        Channel B has its own ring, so a read may come back short at a ring
+        boundary (MORE_FRAGMENTS). The pair only stays aligned if BOTH
+        channels advance by the same count every block, so keep reading
+        until B has given the same n that A did.
+        """
+        np = self._np
+        if self._b_tmp is None or len(self._b_tmp) < n:
+            self._b_tmp = np.empty(max(n, 4096), dtype=np.complex64)
+        out = np.empty(n, dtype=np.complex64)
+        have = 0
+        while have < n:
+            sr = self._sdr.readStream(self._streams[1], [self._b_tmp], n - have, timeoutUs=200000)
+            k = sr.ret if hasattr(sr, "ret") else (sr[0] if isinstance(sr, tuple) else 0)
+            if k <= 0:
+                return None
+            out[have:have + k] = self._b_tmp[:k]
+            have += k
+        return out
 
     # --- the persistent reader (this is what kills the per-frame PLL re-lock) --
     def _read_loop(self):
         np = self._np
         CHUNK = 4096
-        bufs = [np.empty(CHUNK, dtype=np.complex64) for _ in self._channels]
-        buf = bufs[0]
+        buf = np.empty(CHUNK, dtype=np.complex64)
         # Optional read-loop instrumentation (AETHER_GATE_PROFILE=1): how often
         # does readStream actually hand us a block? The panadapter can only be as
         # fresh as this — a 20 fps engine loop re-FFTs stale IQ if this is slower.
@@ -1124,7 +1152,7 @@ class SoapyAdapter(RadioAdapter):
                         "the SDR stopped responding and its stream could not be "
                         "restarted")
             _t0 = _time.perf_counter() if _prof else 0.0
-            sr = self._sdr.readStream(self._stream, bufs, CHUNK, timeoutUs=200000)
+            sr = self._sdr.readStream(self._stream, [buf], CHUNK, timeoutUs=200000)
             n = sr.ret if hasattr(sr, "ret") else (sr[0] if isinstance(sr, tuple) else 0)
             if _prof:
                 _t_read += _time.perf_counter() - _t0
@@ -1158,14 +1186,22 @@ class SoapyAdapter(RadioAdapter):
                 block = buf[:n].copy()
                 audio = block
                 if self._div is not None:
-                    # dual tuner: align, then the pan sees the combined block
-                    # and the demod gets the aligned pair to weight per slice
-                    block, audio = self._div.ingest(block, bufs[1][:n].copy())
+                    # dual tuner: the same count from B, then align; the pan
+                    # sees the combined block and the demod the aligned pair
+                    b = self._read_exact_b(n)
+                    if b is None:
+                        # B lost samples that A did not: the pair is no longer
+                        # a pair. Drop this block of A too and re-measure.
+                        self._div.request_realign("channel B read failed")
+                        continue
+                    block, audio = self._div.ingest(block, b)
                 with self._lock:
                     self._latest = block        # for the meters (latest is fine)
                     self._pan_ring.append(block)
                 self._queue_audio(audio)        # for the demod (continuous — every block consumed)
             elif n < 0:
+                if self._div is not None and n == -4:   # SOAPY_SDR_OVERFLOW: A's ring was flushed
+                    self._div.request_realign("overflow on channel A")
                 # BACK OFF ON A PERSISTENT ERROR, AND GIVE UP ON A DEAD DEVICE.
                 #
                 # A 1 ms retry is right for a transient overflow/timeout, which
