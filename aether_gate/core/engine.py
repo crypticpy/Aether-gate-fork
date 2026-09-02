@@ -3072,7 +3072,7 @@ h2{{color:#5cf}} label{{display:block;margin:16px 0 4px}} select,input[type=rang
   <div style="margin-top:10px">
     <label style="margin:0 0 3px;font-size:12px;color:#9ab">Diversity scope</label>
     <canvas id=divscope width=386 height=140 style="display:block;background:#0d1620;border:1px solid #234;border-radius:3px"></canvas>
-    <div id=divscopetxt style="font-family:monospace;font-size:11px;color:#9ab;height:34px;line-height:17px;overflow:hidden;white-space:nowrap;margin-top:4px">&nbsp;</div>
+    <div id=divscopetxt style="font-family:monospace;font-size:11px;color:#9ab;height:51px;line-height:17px;overflow:hidden;white-space:nowrap;margin-top:4px">&nbsp;</div>
   </div>
   <label style="margin:10px 0 3px;font-size:12px;color:#9ab">Phase: <span class=v id=divphasev style="display:inline-block;width:32px;text-align:right;font-family:monospace">0</span>&deg;</label>
   <input type=range id=divphase min=0 max=360 step=1 value=0 oninput=divPhaseInput()>
@@ -3448,7 +3448,12 @@ function paintDivScopeText(s){{
     +' peak:'+(s.corr_peak!=null?s.corr_peak.toFixed(2):'—')
     +' nb:'+(nb.blanked_pct!=null?nb.blanked_pct.toFixed(1)+'%':'—')
     +' mem:'+(s.memory||[]).length+' cap:'+(cap.active?'REC':'off');
-  el.innerHTML=line1+'<br>'+line2;
+  var pb=s.passband||{{}};
+  var line3='qrm:'+(s.steady_qrm?'<span style="color:#e94">STEADY</span>':'none  ')
+    +' passband flat:'+(pb.flatness!=null?pb.flatness.toFixed(2):'—')
+    +' slope:'+(pb.phase_slope_deg_per_khz!=null?pb.phase_slope_deg_per_khz.toFixed(1)+'°/kHz':'—')
+    +' coh:'+(pb.coherence!=null?pb.coherence.toFixed(2):'—');
+  el.innerHTML=line1+'<br>'+line2+'<br>'+line3;
 }}
 function pollDiv(){{fetch('/diversity').then(r=>r.json()).then(paintDiv).catch(()=>{{
   document.getElementById('divbox').style.display='none';}});}}
