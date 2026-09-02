@@ -121,6 +121,138 @@ SSB_PASS_HZ = 3000.0
 FM_PASS_HZ = 8000.0
 
 
+def _dv():
+    """core.diversity, imported on first use: it needs numpy, this module must not."""
+    from ..core import diversity
+    return diversity
+
+
+class _DiversityState:
+    """The adapter's side of core/diversity for a dual-tuner RSPduo.
+
+    Lives only while two channels flow on one stream. Three threads touch it:
+    the READER (ingest: alignment measurement, the aligned pair for the audio
+    queue, the combined block for the panadapter and meters), the AUDIO
+    thread (observe: the per-slice tracker sees the demod passband and hands
+    back the weight to combine with), and the CONTROL port (set/status).
+    Every shared value is a Python scalar or a dict entry swapped whole, so
+    no lock is needed for a reader to see a consistent weight.
+
+    Weights are PER SLICE: the beam is arithmetic on the same two streams,
+    so the slice on a net can be steered at whoever is talking while a
+    second slice keeps its own weight. The panadapter and S-meter follow the
+    slice the audio is on (active_slice).
+    """
+
+    CAL_SECONDS = 0.5          # of raw IQ cross-correlated to find the lag
+    MODES = ("off", "manual", "null", "track")
+    SOURCES = ("combined", "a", "b")
+
+    def __init__(self, adapter):
+        self.a = adapter
+        self.aligner = _dv().Aligner()
+        self.mode = "off"
+        self.source = "combined"
+        self.manual = {}                    # slice_id -> complex weight m
+        self.trackers = {}                  # slice_id -> Tracker (rebuilt on a rate change)
+        self.active_slice = 0
+        self._cal_a, self._cal_b, self._cal_n = [], [], 0
+        self._realign = None                # why a measurement is owed, or None
+        self.last_align = {"lag": 0, "peak": 0.0, "ok": False, "why": None}
+
+    # --- reader thread -------------------------------------------------
+    def request_realign(self, why):
+        self._cal_a, self._cal_b, self._cal_n = [], [], 0
+        self._realign = str(why)
+
+    def weight_for(self, sid):
+        if self.mode == "off":
+            return 0j
+        if self.mode == "manual":
+            return self.manual.get(sid, 1 + 0j)
+        t = self.trackers.get(sid)
+        return t.m if t is not None else 0j
+
+    def ingest(self, a, b):
+        """One raw block pair -> (block for the pan/meters, pair for the demod)."""
+        np = self.a._np
+        if self._realign is not None:
+            self._cal_a.append(a); self._cal_b.append(b); self._cal_n += len(a)
+            if self._cal_n >= int(self.CAL_SECONDS * self.a.samp_rate):
+                A = np.concatenate(self._cal_a); B = np.concatenate(self._cal_b)
+                why = self._realign
+                self._cal_a, self._cal_b, self._cal_n = [], [], 0
+                self._realign = None
+                lag, peak, ok = self.aligner.calibrate(A, B, min(8192, len(A) // 4))
+                self.last_align = {"lag": int(lag), "peak": float(peak), "ok": bool(ok), "why": why}
+                print(f"[diversity] alignment ({why}): lag {lag:+d} samples, correlation "
+                      f"peak {peak:.1f}x the floor — "
+                      f"{'locked' if ok else 'NOT credible; holding lag 0'}", flush=True)
+        a, b = self.aligner.apply(a, b)
+        if self.source == "a":
+            pan = a
+        elif self.source == "b":
+            pan = b
+        else:
+            pan = _dv().combine(a, b, self.weight_for(self.active_slice))
+        return pan, (a, b)
+
+    # --- audio thread ----------------------------------------------------
+    def observe(self, sid, pa, pb):
+        """The demod passband of both channels for slice sid; returns its weight."""
+        t = self.trackers.get(sid)
+        if t is None:
+            t = self.trackers[sid] = _dv().Tracker(self.a._pd_rate)
+        t.update(pa, pb, self.mode)         # every mode: the SNR readout needs it
+        return self.weight_for(sid)
+
+    # --- control port ----------------------------------------------------
+    def status(self, sid=None):
+        sid = self.active_slice if sid is None else int(sid)
+        m = self.weight_for(sid)
+        ph, ra = _dv().weight_to_polar(m)
+        t = self.trackers.get(sid)
+        return {
+            "available": True, "channels": 2,
+            "mode": self.mode, "source": self.source,
+            "phase_deg": round(ph, 1), "ratio_db": round(ra, 1),
+            "weight": [round(m.real, 4), round(m.imag, 4)],
+            "lag_samples": int(self.aligner.lag), "aligned": bool(self.aligner.aligned),
+            "corr_peak": round(float(self.aligner.peak), 1),
+            "realigning": self._realign is not None,
+            "snr_db": t.snr_db() if t is not None else {"a": None, "b": None, "out": None},
+            "talking": bool(t.talking) if t is not None else False,
+            "updates": int(t.updates) if t is not None else 0,
+            "slice_id": sid,
+        }
+
+    def set(self, mode=None, phase_deg=None, ratio_db=None, source=None, sid=None):
+        sid = self.active_slice if sid is None else int(sid)
+        if mode is not None:
+            mode = str(mode).lower()
+            if mode not in self.MODES:
+                raise ValueError(f"mode must be one of {self.MODES}")
+            if mode == "manual" and self.mode in ("null", "track"):
+                # start the sliders where the automatic fit left off
+                t = self.trackers.get(sid)
+                if t is not None and t.m != 0:
+                    self.manual[sid] = t.m
+            self.mode = mode
+        if phase_deg is not None or ratio_db is not None:
+            ph, ra = _dv().weight_to_polar(self.manual.get(sid, 1 + 0j))
+            if phase_deg is not None:
+                ph = float(phase_deg)
+            if ratio_db is not None:
+                ra = float(ratio_db)
+            self.manual[sid] = _dv().weight_from_polar(ph, ra)
+        if source is not None:
+            source = str(source).lower()
+            if source not in self.SOURCES:
+                raise ValueError(f"source must be one of {self.SOURCES}")
+            self.source = source
+        return self.status(sid)
+
+
 def rtl_bufflen(samp_rate, target_s=0.030):
     """USB transfer size (BYTES) giving ~target_s of signal per transfer.
 
@@ -185,6 +317,12 @@ class SoapyAdapter(RadioAdapter):
         self._audio_q = collections.deque()  # raw IQ blocks for the demodulator; see _queue_audio
         self._audio_dropped = 0             # blocks discarded to keep the demod current
         self._audio_drop_logged = 0.0       # monotonic stamp of the last drop log line
+        self._channels = [0]                # stream channels; [0, 1] in dual-tuner mode
+        self.diversity_available = False    # True once two channels flow (see _open_hw)
+        self._div = None                    # _DiversityState, dual-tuner only
+        self._stage_firs_b = []             # channel B's own copy of the decimation state
+        self._ssb_state_b = None
+        self._fm_state_b = None
         self._nco_phase = 0.0               # persistent mixer phase (continuity across blocks)
         self._nco_ramp = None               # cached exp(1j*step*k); see _demod_block
         self._nco_ramp_n = 0                # block length the cached ramp was built for
@@ -264,7 +402,22 @@ class SoapyAdapter(RadioAdapter):
                 f"({len(found)} enumerated) — refusing to call Device(), which "
                 f"would deadlock the SDRplay API service")
         self._sdr = SoapySDR.Device(args)
-        self._sdr.setSampleRate(SOAPY_SDR_RX, 0, self.samp_rate)
+        # DUAL TUNER. An RSPduo enumerates once per mode; mode=DT in the
+        # device args is both tuners on one clock and one LO, delivered as two
+        # channels of one stream. Everything per-channel below is applied to
+        # each channel, and the reader keeps them tuned together: the pair is
+        # only coherent while they share a centre.
+        want_dual = str(wanted.get("mode", "")).upper() == "DT"
+        try:
+            nch = int(self._sdr.getNumChannels(SOAPY_SDR_RX))
+        except Exception:
+            nch = 1
+        self._channels = [0, 1] if (want_dual and nch >= 2) else [0]
+        if want_dual and nch < 2:
+            print(f"[soapy] mode=DT asked for but the driver offers {nch} channel(s) "
+                  f"— running single tuner", flush=True)
+        for ch in self._channels:
+            self._sdr.setSampleRate(SOAPY_SDR_RX, ch, self.samp_rate)
         # Never trust the requested rate: drivers snap to their own rate table
         # (SDRplay honours only its discrete rates; a mismatch here plays audio
         # pitch-shifted by actual/assumed and mis-scales every spectrum bin).
@@ -276,7 +429,8 @@ class SoapyAdapter(RadioAdapter):
             print(f"[soapy] device runs {actual:.0f} S/s (requested {self.samp_rate:.0f}) — using actual",
                   flush=True)
             self.samp_rate = actual
-        self._sdr.setFrequency(SOAPY_SDR_RX, 0, self.center_hz)
+        for ch in self._channels:
+            self._sdr.setFrequency(SOAPY_SDR_RX, ch, self.center_hz)
         # ⚠ SAY WHAT THE GAIN ACTUALLY ENDED UP AS, and never swallow a failure.
         #
         # Hardware AGC on an RSP swings the level by ~14 dB peak-to-peak on a
@@ -284,13 +438,14 @@ class SoapyAdapter(RadioAdapter):
         # with AGC on vs 0.52 dB with it off, on the raw IQ before any of our
         # DSP). That is audible as a warble and it makes the S-meter meaningless,
         # so whether it is on is not a detail worth hiding behind `except: pass`.
-        try:
-            self._sdr.setGainMode(SOAPY_SDR_RX, 0, bool(self.agc))   # AGC on/off
-        except Exception as e:
-            print(f"[soapy] could NOT set AGC mode: {e!r} — the device keeps its "
-                  f"default, which for SDRplay is AGC ON", flush=True)
-        if not self.agc:
-            self._sdr.setGain(SOAPY_SDR_RX, 0, self.gain_db)
+        for ch in self._channels:
+            try:
+                self._sdr.setGainMode(SOAPY_SDR_RX, ch, bool(self.agc))   # AGC on/off
+            except Exception as e:
+                print(f"[soapy] could NOT set AGC mode on channel {ch}: {e!r} — the "
+                      f"device keeps its default, which for SDRplay is AGC ON", flush=True)
+            if not self.agc:
+                self._sdr.setGain(SOAPY_SDR_RX, ch, self.gain_db)
         # ASK THE DEVICE ITS RANGE — do not guess one. AE sizes its RF Gain
         # slider from whatever we report to `display pan rfgain_info`, and an
         # RSPdx, an RTL dongle and an Airspy share no gain scale at all.
@@ -345,6 +500,11 @@ class SoapyAdapter(RadioAdapter):
         # ⚠ bufflen must go in the STREAM args (setupStream) — SoapyRTLSDR
         # ignores it in the Device args, which is how this hid from an earlier
         # test. Honour an explicit bufflen/buffers from --soapy-args either way.
+        if len(self._channels) == 2:
+            self._div = _DiversityState(self)
+            self.diversity_available = True
+            print("[soapy] dual tuner: two channels on one stream — diversity available "
+                  "(mode off until asked)", flush=True)
         self._start_stream()
 
     def _start_stream(self):
@@ -360,8 +520,13 @@ class SoapyAdapter(RadioAdapter):
             stream_args["bufflen"] = ua.get("bufflen") or str(rtl_bufflen(self.samp_rate))
             if "buffers" in ua:
                 stream_args["buffers"] = ua["buffers"]
-        self._stream = self._sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, [], stream_args)
+        self._stream = self._sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, self._channels,
+                                             stream_args)
         self._sdr.activateStream(self._stream)
+        if self._div is not None:
+            # The driver's per-channel buffering restarts with the stream, so
+            # the offset between the tuners must be measured afresh.
+            self._div.request_realign("stream start")
 
     def _stop_stream(self):
         """Deactivate and close the stream, tolerating a driver that is upset."""
@@ -389,11 +554,11 @@ class SoapyAdapter(RadioAdapter):
         driver gives is data.
         """
         np = self._np
-        buf = np.empty(4096, dtype=np.complex64)
+        bufs = [np.empty(4096, dtype=np.complex64) for _ in self._channels]
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             try:
-                sr = self._sdr.readStream(self._stream, [buf], 4096, timeoutUs=200000)
+                sr = self._sdr.readStream(self._stream, bufs, 4096, timeoutUs=200000)
             except Exception:
                 return False
             n = sr.ret if hasattr(sr, "ret") else (sr[0] if isinstance(sr, tuple) else 0)
@@ -455,7 +620,8 @@ class SoapyAdapter(RadioAdapter):
         prev = self.samp_rate
         self._stop_stream()
         try:
-            self._sdr.setSampleRate(self._SOAPY_SDR_RX, 0, want)
+            for ch in self._channels:
+                self._sdr.setSampleRate(self._SOAPY_SDR_RX, ch, want)
             got = float(self._sdr.getSampleRate(self._SOAPY_SDR_RX, 0))
         except Exception as e:
             print(f"[soapy] SET RATE FAILED at {want:.0f} S/s: {e!r} "
@@ -505,7 +671,12 @@ class SoapyAdapter(RadioAdapter):
             h = (np.sinc(2 * cutoff * idx) * np.hamming(ntaps))
             h = (h / h.sum()).astype(np.float64)
             self._stage_firs.append([h, np.zeros(ntaps - 1, dtype=np.complex128), M, 0])
+        # Channel B (dual tuner) runs the same taps with its own overlap state.
+        self._stage_firs_b = [[h, np.zeros(len(h) - 1, dtype=np.complex128), M, 0]
+                              for h, _s, M, _o in self._stage_firs]
         self._pd_rate = self.samp_rate / self._decim       # post-decimation rate, >= AUDIO_RATE
+        if self._div is not None:
+            self._div.trackers = {}                        # they were built for the old rate
         self._rs_ratio = self._pd_rate / AUDIO_RATE        # input samples per output sample (>= 1)
         self._rs_phase = 0.0                               # fractional read position carry-over
         self._ar_buf = np.zeros(0, dtype=np.float64)       # demodulated audio at _pd_rate
@@ -523,6 +694,7 @@ class SoapyAdapter(RadioAdapter):
         self._ssb_usb = (lp * np.exp(2j * np.pi * (1500.0 / self._pd_rate) * k)).astype(np.complex128)
         self._ssb_lsb = np.conj(self._ssb_usb)
         self._ssb_state = np.zeros(ssb_ntaps - 1, dtype=np.complex128)
+        self._ssb_state_b = np.zeros(ssb_ntaps - 1, dtype=np.complex128)
 
         # --- NBFM: a REAL discriminator, not the SSB path ------------------
         # Everything that was not LSB used to fall through to the USB taps, so
@@ -544,6 +716,7 @@ class SoapyAdapter(RadioAdapter):
         fh = np.sinc(2 * fm_half * kf) * np.hamming(fm_ntaps)
         self._fm_taps = (fh / fh.sum()).astype(np.float64)
         self._fm_state = np.zeros(fm_ntaps - 1, dtype=np.complex128)
+        self._fm_state_b = np.zeros(fm_ntaps - 1, dtype=np.complex128)
         # Discriminator continuity: the last sample of the previous block, so
         # angle(x[n] * conj(x[n-1])) is unbroken across block boundaries. A
         # reset here would inject a phase glitch every block — an audible tick
@@ -555,38 +728,70 @@ class SoapyAdapter(RadioAdapter):
         # would skew the very tone ratio the demodulator downstream measures.
         self._fm_deemph = None
 
-    def _demod_block(self, block):
+    def _demod_block(self, block, slice_id=0):
         """One raw IQ block -> demodulated audio at _pd_rate (NCO + stages + SSB).
-        Stride offsets carried per stage keep the [::M] comb aligned across
-        arbitrary block boundaries."""
+
+        A TUPLE is a dual-tuner pair (a, b): both channels go through the same
+        mixer rotation and their own decimation state, the slice's tracker
+        sees both passbands, and the weighted sum is detected. The SSB and FM
+        channel filters are linear, so combining after them equals combining
+        before — and the tracker gets exactly the band the operator hears.
+        """
         np = self._np
-        iq = block.astype(np.complex128)
+        if isinstance(block, tuple):
+            a, b = block
+            rot = self._nco_rotation(len(a))
+            pa = self._passband(a.astype(np.complex128) * rot, 0)
+            pb = self._passband(b.astype(np.complex128) * rot, 1)
+            m = self._div.observe(slice_id, pa, pb)
+            y = _dv().combine(pa, pb, m)
+        else:
+            rot = self._nco_rotation(len(block))
+            y = self._passband(block.astype(np.complex128) * rot, 0)
+        if self._is_fm_mode(self._mode):
+            return self._discriminate(y)
+        return 2.0 * np.real(y)                            # x2: real() halves the one-sided energy
+
+    def _nco_rotation(self, n_iq):
+        """The mixer's rotation for the next n_iq samples; advances the phase.
+
+        NCO BY CACHED RAMP, NOT PER-SAMPLE TRANSCENDENTAL. The mixer runs at
+        the FULL sample rate - 4096 samples per block, ~500 blocks/s - and
+        np.exp(1j*ph) over that measured 1.15 ms/block on a Pi 4: the single
+        largest item in get_audio, ~3 ms of a 5.33 ms real-time budget.
+
+        For a FIXED offset the phase ramp is arithmetic:
+          exp(j*(p0 + k*step)) == exp(j*p0) * exp(j*step)**k
+        so cache the unit-step ramp and rotate it by the start phase of the
+        block: one exp() per block instead of 4096, plus one multiply. The
+        ramp is rebuilt only when the offset or block length changes (i.e. on
+        retune), so a steady slice pays nothing. Measured 4.0x on the NCO.
+
+        Phase continuity is UNCHANGED: _nco_phase still advances by exactly
+        n_iq*step, so consecutive blocks still join seamlessly.
+        """
+        np = self._np
         f_off = self._slice_hz - self.center_hz
         step = 2.0 * np.pi * (-f_off) / self.samp_rate
-        # NCO BY CACHED RAMP, NOT PER-SAMPLE TRANSCENDENTAL. The mixer runs at
-        # the FULL sample rate - 4096 samples per block, ~500 blocks/s - and
-        # np.exp(1j*ph) over that measured 1.15 ms/block on a Pi 4: the single
-        # largest item in get_audio, ~3 ms of a 5.33 ms real-time budget.
-        #
-        # For a FIXED offset the phase ramp is arithmetic:
-        #   exp(j*(p0 + k*step)) == exp(j*p0) * exp(j*step)**k
-        # so cache the unit-step ramp and rotate it by the start phase of the
-        # block: one exp() per block instead of 4096, plus one multiply. The
-        # ramp is rebuilt only when the offset or block length changes (i.e. on
-        # retune), so a steady slice pays nothing. Measured 4.0x on the NCO.
-        #
-        # Phase continuity is UNCHANGED: _nco_phase still advances by exactly
-        # len(iq)*step, so consecutive blocks still join seamlessly.
-        n_iq = len(iq)
         if (self._nco_ramp is None or self._nco_ramp_n != n_iq
                 or self._nco_ramp_step != step):
             self._nco_ramp = np.exp(1j * step * np.arange(n_iq))
             self._nco_ramp_n = n_iq
             self._nco_ramp_step = step
-        iq = iq * (np.exp(1j * self._nco_phase) * self._nco_ramp)
+        rot = np.exp(1j * self._nco_phase) * self._nco_ramp
         self._nco_phase = (self._nco_phase + step * n_iq) % (2.0 * np.pi)
-        sig = iq
-        for fir in self._stage_firs:
+        return rot
+
+    def _passband(self, sig, ch=0):
+        """Mixed IQ of one channel -> its demod passband at _pd_rate.
+
+        Staged decimation with per-channel overlap state, then the SSB
+        one-sided filter (or the FM channel filter). Stride offsets carried
+        per stage keep the [::M] comb aligned across arbitrary block
+        boundaries.
+        """
+        np = self._np
+        for fir in (self._stage_firs if ch == 0 else self._stage_firs_b):
             taps, state, M, offs = fir
             x = np.concatenate([state, sig])
             # DECIMATE IN PLACE: compute ONLY the outputs that survive [::M].
@@ -615,12 +820,26 @@ class SoapyAdapter(RadioAdapter):
             fir[3] = (offs - n_out) % M                    # comb phase into the next block
             sig = sig_next
         if self._is_fm_mode(self._mode):
-            return self._demod_fm(sig)
+            # channel filter first (see _init_demod: FM is non-linear)
+            state = self._fm_state if ch == 0 else self._fm_state_b
+            x = np.concatenate([state, sig])
+            z = np.convolve(x, self._fm_taps, mode="valid")
+            tail = x[len(x) - (len(self._fm_taps) - 1):]
+            if ch == 0:
+                self._fm_state = tail
+            else:
+                self._fm_state_b = tail
+            return z
         taps = self._ssb_lsb if self._mode.startswith("LSB") else self._ssb_usb
-        x = np.concatenate([self._ssb_state, sig])
+        state = self._ssb_state if ch == 0 else self._ssb_state_b
+        x = np.concatenate([state, sig])
         y = np.convolve(x, taps, mode="valid")
-        self._ssb_state = x[len(x) - (len(taps) - 1):]
-        return 2.0 * np.real(y)                            # x2: real() halves the one-sided energy
+        tail = x[len(x) - (len(taps) - 1):]
+        if ch == 0:
+            self._ssb_state = tail
+        else:
+            self._ssb_state_b = tail
+        return y
 
     @staticmethod
     def _is_fm_mode(mode):
@@ -650,18 +869,23 @@ class SoapyAdapter(RadioAdapter):
         return (0.0, SSB_PASS_HZ)
 
     def _demod_fm(self, sig):
+        """Channel filter + discriminator for one channel (the single-tuner path
+        in one call; kept as the seam the FM tests drive)."""
+        x = self._np.concatenate([self._fm_state, sig])
+        z = self._np.convolve(x, self._fm_taps, mode="valid")
+        self._fm_state = x[len(x) - (len(self._fm_taps) - 1):]
+        return self._discriminate(z)
+
+    def _discriminate(self, z):
         """NBFM quadrature discriminator: angle(x[n] * conj(x[n-1])).
 
         The instantaneous frequency IS the phase advance between consecutive
         samples, so the product with the previous sample's conjugate gives the
         deviation directly. Carrying _fm_prev across blocks keeps that
-        difference unbroken — see _init_demod for why that matters.
+        difference unbroken — see _init_demod for why that matters. The
+        channel filter runs before this, in _passband.
         """
         np = self._np
-        # channel filter first (see _init_demod: FM is non-linear)
-        x = np.concatenate([self._fm_state, sig])
-        z = np.convolve(x, self._fm_taps, mode="valid")
-        self._fm_state = x[len(x) - (len(self._fm_taps) - 1):]
         if len(z) == 0:
             return np.zeros(0, dtype=np.float64)
         prev = np.concatenate([[self._fm_prev], z[:-1]])
@@ -716,7 +940,8 @@ class SoapyAdapter(RadioAdapter):
     def _read_loop(self):
         np = self._np
         CHUNK = 4096
-        buf = np.empty(CHUNK, dtype=np.complex64)
+        bufs = [np.empty(CHUNK, dtype=np.complex64) for _ in self._channels]
+        buf = bufs[0]
         # Optional read-loop instrumentation (AETHER_GATE_PROFILE=1): how often
         # does readStream actually hand us a block? The panadapter can only be as
         # fresh as this — a 20 fps engine loop re-FFTs stale IQ if this is slower.
@@ -738,7 +963,8 @@ class SoapyAdapter(RadioAdapter):
             if self._retune_to is not None:
                 want = float(self._retune_to)
                 try:
-                    self._sdr.setFrequency(self._SOAPY_SDR_RX, 0, want)
+                    for ch in self._channels:      # together, or the pair is not coherent
+                        self._sdr.setFrequency(self._SOAPY_SDR_RX, ch, want)
                     # READ IT BACK. A silent 'except: pass' here left the tuner
                     # wherever it was while every layer above believed the retune
                     # had happened — the panadapter, the slice and AE all showed
@@ -764,7 +990,8 @@ class SoapyAdapter(RadioAdapter):
                 want = float(self._gain_to)
                 self._gain_to = None
                 try:
-                    self._sdr.setGain(self._SOAPY_SDR_RX, 0, want)
+                    for ch in self._channels:
+                        self._sdr.setGain(self._SOAPY_SDR_RX, ch, want)
                     # Read it back — this driver's setters lie (see _verify_stream).
                     got = float(self._sdr.getGain(self._SOAPY_SDR_RX, 0))
                     self.gain_db = got          # keeps read_meters' gain term honest
@@ -792,9 +1019,18 @@ class SoapyAdapter(RadioAdapter):
                 want = self._antenna_to
                 self._antenna_to = None
                 try:
-                    self._sdr.setAntenna(self._SOAPY_SDR_RX, 0, want)
-                    got = str(self._sdr.getAntenna(self._SOAPY_SDR_RX, 0))
-                    print(f"[soapy] antenna -> {got} (asked {want})", flush=True)
+                    # Each channel owns its own ports (dual tuner: Tuner 1 on
+                    # channel 0, Tuner 2 on channel 1); apply where it is offered.
+                    took = []
+                    for ch in self._channels:
+                        offered = [str(x) for x in self._sdr.listAntennas(self._SOAPY_SDR_RX, ch)]
+                        if want in offered or len(self._channels) == 1:
+                            self._sdr.setAntenna(self._SOAPY_SDR_RX, ch, want)
+                            took.append(f"ch{ch}={self._sdr.getAntenna(self._SOAPY_SDR_RX, ch)}")
+                    if took:
+                        print(f"[soapy] antenna -> {' '.join(took)} (asked {want})", flush=True)
+                    else:
+                        print(f"[soapy] no channel offers antenna {want!r}", flush=True)
                 except Exception as e:
                     print(f"[soapy] SET ANTENNA FAILED to {want}: {e!r}", flush=True)
             while self._setting_to:
@@ -888,7 +1124,7 @@ class SoapyAdapter(RadioAdapter):
                         "the SDR stopped responding and its stream could not be "
                         "restarted")
             _t0 = _time.perf_counter() if _prof else 0.0
-            sr = self._sdr.readStream(self._stream, [buf], CHUNK, timeoutUs=200000)
+            sr = self._sdr.readStream(self._stream, bufs, CHUNK, timeoutUs=200000)
             n = sr.ret if hasattr(sr, "ret") else (sr[0] if isinstance(sr, tuple) else 0)
             if _prof:
                 _t_read += _time.perf_counter() - _t0
@@ -920,10 +1156,15 @@ class SoapyAdapter(RadioAdapter):
                           flush=True)
                     fresh_at = _now         # don't re-fire on every block
                 block = buf[:n].copy()
+                audio = block
+                if self._div is not None:
+                    # dual tuner: align, then the pan sees the combined block
+                    # and the demod gets the aligned pair to weight per slice
+                    block, audio = self._div.ingest(block, bufs[1][:n].copy())
                 with self._lock:
                     self._latest = block        # for the meters (latest is fine)
                     self._pan_ring.append(block)
-                self._queue_audio(block)        # for the demod (continuous — every block consumed)
+                self._queue_audio(audio)        # for the demod (continuous — every block consumed)
             elif n < 0:
                 # BACK OFF ON A PERSISTENT ERROR, AND GIVE UP ON A DEAD DEVICE.
                 #
@@ -1179,7 +1420,27 @@ class SoapyAdapter(RadioAdapter):
         controls = self.device_controls()
         if controls:
             d["device"] = controls
+        if self._div is not None:
+            d["diversity"] = self._div.status()
         return d
+
+    # --- diversity (dual tuner) -------------------------------------------
+    def diversity_status(self, slice_id=None):
+        if self._div is None:
+            return {"available": False}
+        return self._div.status(slice_id)
+
+    def set_diversity(self, mode=None, phase_deg=None, ratio_db=None, source=None,
+                      slice_id=None):
+        if self._div is None:
+            return {"available": False}
+        return self._div.set(mode, phase_deg, ratio_db, source, slice_id)
+
+    def diversity_realign(self):
+        if self._div is None:
+            return {"available": False}
+        self._div.request_realign("operator request")
+        return self._div.status()
 
     def set_mode(self, mode):
         self._mode = (mode or "USB").upper()
@@ -1379,7 +1640,7 @@ class SoapyAdapter(RadioAdapter):
     def _queue_audio(self, block):
         """Hand one IQ block to the demodulator, keeping the queue no deeper
         than _AUDIO_BACKLOG_S of signal (see the note at the constant)."""
-        n = max(1, len(block))
+        n = max(1, len(block[0]) if isinstance(block, tuple) else len(block))
         keep = max(2, -(-int(_AUDIO_BACKLOG_S * self.samp_rate) // n))   # ceil, blocks
         dropped = 0
         with self._lock:
@@ -1399,16 +1660,20 @@ class SoapyAdapter(RadioAdapter):
     def audio_backlog_ms(self):
         """How far behind the antenna the demodulator's input currently is."""
         with self._lock:
-            queued = sum(len(b) for b in self._audio_q)
+            queued = sum(len(b[0]) if isinstance(b, tuple) else len(b) for b in self._audio_q)
         return 1000.0 * queued / self.samp_rate if self.samp_rate else 0.0
 
     # --- the AUDIO source (SSB demod; numpy only) -----------------------
-    def get_audio(self, n_samples, slice_hz=None, mode=None):
+    def get_audio(self, n_samples, slice_hz=None, mode=None, slice_id=None):
         """Return n_samples of 24 kHz mono audio (float, ~[-1,1]) demodulated from
-        the live IQ at the slice frequency. None if not enough IQ buffered yet."""
+        the live IQ at the slice frequency. None if not enough IQ buffered yet.
+        slice_id keys the diversity weight (dual tuner); ignored otherwise."""
         np = self._np
         if np is None or not self._stage_firs:
             return None
+        sid = 0 if slice_id is None else int(slice_id)
+        if self._div is not None:
+            self._div.active_slice = sid
         if slice_hz is not None:
             self.set_slice(slice_hz)        # sets demod target + hardware retune if off-window
         if mode is not None:
@@ -1421,7 +1686,7 @@ class SoapyAdapter(RadioAdapter):
                 blk = self._audio_q.popleft() if self._audio_q else None
             if blk is None:
                 break
-            self._ar_buf = np.concatenate([self._ar_buf, self._demod_block(blk)])
+            self._ar_buf = np.concatenate([self._ar_buf, self._demod_block(blk, sid)])
         if len(self._ar_buf) < need_r:
             return None                      # not enough IQ yet (stream still filling)
 
@@ -1445,7 +1710,7 @@ class SoapyAdapter(RadioAdapter):
             # envelope across a packet moves that decision threshold mid-frame.
             # A fixed trim only.
             #
-            # NO TRIM. _demod_fm normalises against the discriminator's full
+            # NO TRIM. _discriminate normalises against the discriminator's full
             # +/-pi range, which already puts the output in the right place:
             # broadband noise lands at 1/sqrt(3) = 0.58 RMS and a 3 kHz-deviation
             # signal at 0.18. Those numbers look "quiet", and the temptation is
