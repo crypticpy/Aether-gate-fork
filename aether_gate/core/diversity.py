@@ -417,6 +417,7 @@ class Tracker:
         self._quiet_s = 0.0
         self._onset_done = False
         self._rs_n = 0
+        self._rs_half = [None, None]        # Rs from even / odd blocks (see refit)
         self._over_fits = 0                 # refits adopted during this over
         self._memorised = False             # this over has been stored
         self._hist = []                     # (t, p_in) over the last MOD_WINDOW_S
@@ -467,6 +468,7 @@ class Tracker:
                     # seen, so the beam can settle within a few syllables.
                     self._onset_done = True
                     self._rs_n = 0
+                    self._rs_half = [None, None]
                     self._over_fits = 0
                     self._memorised = False
                     self.Rs = None
@@ -474,6 +476,14 @@ class Tracker:
                 self._rs_n += 1
                 al = max(self._alpha(n, self.signal_tc_s), 1.0 / self._rs_n)
                 self.Rs = R_in if self.Rs is None else (1 - al) * self.Rs + al * R_in
+                # the same estimate split by block parity: two independent
+                # views of the over, so a fit can be judged on data it did
+                # not see
+                h = self._rs_n % 2
+                k = (self._rs_n + 1) // 2
+                al_h = max(self._alpha(2 * n, self.signal_tc_s), 1.0 / k)
+                old = self._rs_half[h]
+                self._rs_half[h] = R_in if old is None else (1 - al_h) * old + al_h * R_in
         else:
             self._quiet_s += dt
             if self._quiet_s >= (TALK_HANG_S if self._onset_done else TALK_ONSET_HANG_S):
@@ -523,13 +533,28 @@ class Tracker:
                     _snr_of(cand, self.Rs, Rn) < _snr_of(self.m, self.Rs, Rn):
                 return False                    # quieter, but at the signal's expense
         elif mode == "track":
-            if self.Rs is None:
+            if self.Rs is None or any(h is None for h in self._rs_half):
                 return False
             if self._over_fits == 0 and self._talk_s < FIRST_FIT_MIN_TALK_S:
                 return False
-            cand = fit_max_snr(self.Rs, Rn)
-            s_new = _snr_of(cand, self.Rs, Rn)
-            s_cur = _snr_of(self.m, self.Rs, Rn)
+            # HELD-OUT SCORING. A max-SNR fit scored on the covariance it was
+            # fitted to always looks better than the weight in use, because
+            # it has also fitted that covariance's noise; at 3 dB SNR that
+            # optimism is several dB, and the beam re-steers on nothing (seen
+            # live: six re-steers in 30 s, none of which moved the output
+            # SNR). So fit on one parity's estimate and score on the other,
+            # alternating; and score each antenna alone the same way, so the
+            # output is never left worse than the better antenna.
+            fit_on, score_on = (self._rs_half if self.updates % 2 == 0
+                                else self._rs_half[::-1])
+            cand = fit_max_snr(fit_on, Rn)
+            best, s_new = cand, _snr_of(cand, score_on, Rn)
+            for alone in (0j, complex(WEIGHT_MAX_ABS)):
+                s_alone = _snr_of(alone, score_on, Rn)
+                if s_alone > s_new:
+                    best, s_new = alone, s_alone
+            cand = best
+            s_cur = _snr_of(self.m, score_on, Rn)
             gain_db = 10.0 * math.log10(max(s_new, 1e-30) / max(s_cur, 1e-30))
         else:
             return False
