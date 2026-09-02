@@ -1480,6 +1480,11 @@ class SoapyAdapter(RadioAdapter):
             return {"available": False}
         return self._div.spatial_json()
 
+    def diversity_beacons(self):
+        if self._div is None:
+            return {"available": False}
+        return self._div.beacons_json()
+
     def diversity_finder(self):
         if self._div is None:
             return {"available": False}

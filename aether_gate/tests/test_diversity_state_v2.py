@@ -394,3 +394,20 @@ def test_noise_profile_rides_in_status_and_sees_impulses_before_the_blanker():
     # ~30 impulses/s at 125 kS/s in 4096-sample blocks, counted despite the blanker
     assert 20.0 <= prof["impulses_per_s"] <= 40.0, prof
     assert prof["impulse_db"] >= 20.0 and prof["mains_hz"] is None, prof
+
+
+# --- the beacon watch -----------------------------------------------------------
+def test_beacon_watch_rides_along_once_aligned_and_answers_its_route():
+    rng = np.random.default_rng(13)
+    st = _DiversityState(_FakeAdapter(center_hz=14_120_000.0))
+    assert st.beacons_json() == {"available": False}
+    st.aligner.set_lag(0, 20.0, True)
+    st.ingest(_white(rng, BLOCK), _white(rng, BLOCK))
+    out = st.beacons_json()
+    assert out["available"] and out["band_hz"] == 14_100_000.0
+    assert out["now"]["call"] and 0.0 <= out["now"]["seconds_left"] <= 10.0
+    assert out["results"] == []
+    # off 20 m: the watch idles (no band in span)
+    st.a.center_hz = 7_200_000.0
+    st.ingest(_white(rng, BLOCK), _white(rng, BLOCK))
+    assert st.beacons_json()["band_hz"] is None

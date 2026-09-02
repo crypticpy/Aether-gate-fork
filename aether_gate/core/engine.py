@@ -3847,6 +3847,7 @@ def start_control_server(radio, port):
             # GET /diversity/map                        -> coherence/level sweep for the panel
             # GET /diversity/spatial                    -> live per-bin phase/coherence/level rows
             # GET /diversity/finder                     -> where people are talking (ranked)
+            # GET /diversity/beacons                    -> NCDXF beacon slots heard on the pair
             # GET /diversity/capture?seconds=            -> start a diagnostic IQ capture
             # GET /diversity/memory/clear                -> forget remembered talker positions
             # GET /diversity/memory/name?id=&name=       -> label a remembered talker ('' clears)
@@ -3945,11 +3946,12 @@ def start_control_server(radio, port):
                 if fn is None:
                     return self._json({"error": "not supported"})
                 return self._json(fn())
-            if u.path in ("/diversity/spatial", "/diversity/finder"):
+            if u.path in ("/diversity/spatial", "/diversity/finder", "/diversity/beacons"):
                 # live per-bin phase/coherence rows for the spatial waterfall,
-                # and the conversation finder's ranked candidates
+                # the conversation finder's ranked candidates, and what the
+                # NCDXF beacons say about the pair
                 a = radio.adapter
-                name = "diversity_spatial" if u.path.endswith("spatial") else "diversity_finder"
+                name = "diversity_" + u.path.rsplit("/", 1)[1]
                 fn = (getattr(a, name, None)
                       if getattr(a, "diversity_available", False) else None)
                 if fn is None:

@@ -104,6 +104,14 @@ class FakeDiversityAdapter:
                 "phase_deg": [0.0, 90.0, -120.0, 10.0], "coherence": [0.1, 0.9, 0.8, 0.2],
                 "level_db": [-90.0, -70.0, -72.0, -88.0], "passband_hz": None}
 
+    def diversity_beacons(self):
+        self.calls.append(("beacons", {}))
+        return {"available": True, "band_hz": 14100000.0, "slot": 3,
+                "now": {"call": "KH6RS", "location": "Maui, Hawaii", "seconds_left": 4.0},
+                "results": [{"call": "W6WX", "band_hz": 14100000.0, "heard": True,
+                             "snr_db": 21.0, "steps_heard": 3, "lowest_w": 1.0}],
+                "last": None}
+
     def diversity_finder(self):
         self.calls.append(("finder", {}))
         return {"available": True, "span_hz": [3500000.0, 3504000.0], "history_s": 42.0,
@@ -158,6 +166,7 @@ class FakeDiversityAdapterNoV2(FakeDiversityAdapter):
     diversity_map = None
     diversity_spatial = None
     diversity_finder = None
+    diversity_beacons = None
     diversity_capture = None
     diversity_memory_clear = None
     diversity_memory_name = None
@@ -625,6 +634,16 @@ def test_spatial_and_finder_answer_not_supported_on_a_v1_adapter():
     _, port = _start(FakeDiversityAdapterNoV2())
     assert _get(port, "/diversity/spatial") == {"error": "not supported"}
     assert _get(port, "/diversity/finder") == {"error": "not supported"}
+    assert _get(port, "/diversity/beacons") == {"error": "not supported"}
+
+
+def test_beacons_route_passes_the_adapter_answer_through():
+    a = FakeDiversityAdapter()
+    _, port = _start(a)
+    bc = _get(port, "/diversity/beacons")
+    assert bc["available"] and bc["now"]["call"] == "KH6RS"
+    assert bc["results"][0]["call"] == "W6WX" and bc["results"][0]["lowest_w"] == 1.0
+    assert ("beacons", {}) in a.calls
 
 
 def test_bad_subband_value_is_an_error():

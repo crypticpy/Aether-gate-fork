@@ -59,6 +59,11 @@ def _npf():
     return noiseprofile
 
 
+def _bc():
+    from ..core import beacons
+    return beacons
+
+
 def _balance():
     from ..core import balance
     return balance
@@ -112,6 +117,7 @@ class _DiversityState:
         self.subband_on = True
         self.subbands = {}                  # sid -> SubbandCombiner
         self.profile = None                 # what kind of noise this is (core.noiseprofile)
+        self.beacons = None                 # the NCDXF beacons on the pair (core.beacons)
         # spatial map: rebuilt whenever the hardware centre or rate moves,
         # since its bins are absolute frequencies
         self.map = None
@@ -194,6 +200,9 @@ class _DiversityState:
             if self.profile is None or self.profile.rate_hz != float(self.a.samp_rate):
                 self.profile = _npf().NoiseProfile(self.a.samp_rate)
             self.profile.update(a, b)
+            if self.beacons is None or self.beacons.rate_hz != float(self.a.samp_rate):
+                self.beacons = _bc().BeaconWatch(self.a.samp_rate)
+            self.beacons.update(a, b, float(self.a.center_hz), time.time())
         if self.nb_on:
             a, b, frac = _dv().blank_impulses(a, b, self.nb_db)
             self.blanked_pct = 0.9 * self.blanked_pct + 0.1 * 100.0 * frac
@@ -374,6 +383,11 @@ class _DiversityState:
         rows["available"] = True
         rows["passband_hz"] = self._passband_hz()
         return rows
+
+    def beacons_json(self):
+        if self.beacons is None:
+            return {"available": False}
+        return self.beacons.status(time.time())
 
     def finder_json(self):
         if self.finder is None:
