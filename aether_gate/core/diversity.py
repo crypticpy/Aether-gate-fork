@@ -99,9 +99,18 @@ NOISE_MAX_RATIO = 1.15              # ~ +0.6 dB
 # A static crash is many dB above the floor for a few milliseconds; booking
 # it would steer the beam at the lightning instead of the operator.
 TALK_HOLD_S = 0.05
-# ...and a dip shorter than this (the trough between two syllables) does not
-# end an over: the hold is not restarted, and the talker is not "new" again.
-TALK_HANG_S = 0.15
+# ...and, once an over is established, a dip shorter than this (the gap
+# between words, up to half a second in unhurried speech) does not end it:
+# the hold is not restarted and the talker is not "new" again. A net's
+# turnaround between two operators is comfortably longer. Before an over is
+# established the gap allowed is only the hold itself, so a train of static
+# crashes 200 ms apart never adds up to one (each is 10 ms above the floor).
+TALK_HANG_S = 0.6
+TALK_ONSET_HANG_S = TALK_HOLD_S
+# The first fit of an over waits for this much voiced time: on a weak
+# signal a quarter-second covariance steers somewhere random (seen live),
+# and the memory recall at onset already covers the known talkers.
+FIRST_FIT_MIN_TALK_S = 0.4
 
 
 def find_lag(a, b, max_lag):
@@ -467,7 +476,7 @@ class Tracker:
                 self.Rs = R_in if self.Rs is None else (1 - al) * self.Rs + al * R_in
         else:
             self._quiet_s += dt
-            if self._quiet_s >= TALK_HANG_S:
+            if self._quiet_s >= (TALK_HANG_S if self._onset_done else TALK_ONSET_HANG_S):
                 self._talk_s = 0.0
                 self._onset_done = False
                 self.talk_mod = None
@@ -515,6 +524,8 @@ class Tracker:
                 return False                    # quieter, but at the signal's expense
         elif mode == "track":
             if self.Rs is None:
+                return False
+            if self._over_fits == 0 and self._talk_s < FIRST_FIT_MIN_TALK_S:
                 return False
             cand = fit_max_snr(self.Rs, Rn)
             s_new = _snr_of(cand, self.Rs, Rn)

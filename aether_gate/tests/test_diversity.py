@@ -310,7 +310,7 @@ def test_memory_steers_a_known_talker_in_one_block():
     assert len(mem.entries) >= 2, mem.status(tr.t)
     # talker 1 keys up again: the weight must jump back within TALK_HOLD_S + 2 blocks
     block = 1024
-    for _ in range(5):                                     # a pause > TALK_HANG_S
+    for _ in range(16):                                    # a pause > TALK_HANG_S (0.66 s)
         R_in, R_g = _scene(rng, block, None, 0.5)
         tr.update(R_in, R_g, block, "track")
     n0 = tr.updates
