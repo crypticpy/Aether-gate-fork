@@ -11,7 +11,8 @@ side by side and one summary so they can be compared in numbers:
   b          loop B alone
   wideband   the tracker's weight (mode track), one weight for the passband
   subband    the same, refined per bin (core.subband)
-  filtered   subband through the slice filter and the AGC (core.filter):
+  post       subband with the coherence post-filter (core.postfilter)
+  filtered   post through the slice filter and the AGC (core.filter):
              what the operator hears, so a filter or AGC change can be
              judged on the same over as the combiner
 
@@ -42,7 +43,8 @@ from .core.filter import SliceFilter
 
 BLOCK = 4096
 PD_RATE_TARGET = 25_000.0
-CONFIGS = ("a", "b", "wideband", "subband", "filtered")
+CONFIGS = ("a", "b", "wideband", "subband", "post", "filtered")
+TRACE_S = 0.1
 
 
 class _Adapter:
@@ -128,8 +130,11 @@ def _parse_filter(text):
     return kw
 
 
-def run(cap, config, slice_hz, mode, seconds=None, progress=None, filter_kw=None):
-    """One configuration over the capture -> (audio at pd_rate, pd_rate, overs, status)."""
+def run(cap, config, slice_hz, mode, seconds=None, progress=None, filter_kw=None,
+        post_floor_db=None):
+    """One configuration over the capture -> (audio at pd_rate, pd_rate, overs,
+    status, trace). The trace is one row per TRACE_S: [t, a_db, b_db, out_db],
+    block powers of the two loops' passbands and the output."""
     rate = float(cap["rate_hz"]); center = float(cap["center_hz"])
     a_all = cap["a"]; b_all = cap["b"]
     if seconds is not None:
@@ -137,7 +142,8 @@ def run(cap, config, slice_hz, mode, seconds=None, progress=None, filter_kw=None
         a_all = a_all[:n]; b_all = b_all[:n]
     st = _DiversityState(_Adapter(rate, center, mode))
     st.aligner.set_lag(0, 99.0, True)            # a capture is the aligned pair
-    st.set(mode="track", subband=(config in ("subband", "filtered")))
+    st.set(mode="track", subband=(config in ("subband", "post", "filtered")),
+           post=(config in ("post", "filtered")), post_floor_db=post_floor_db)
     st.active_slice = 0
     ca = _Chain(rate, slice_hz - center, mode)
     cb = _Chain(rate, slice_hz - center, mode)
@@ -153,6 +159,8 @@ def run(cap, config, slice_hz, mode, seconds=None, progress=None, filter_kw=None
     lsb = mode == "LSB"
     out = []
     overs = []
+    trace = []
+    acc = [0.0, 0.0, 0.0, 0]
     talking = False
     t_block = BLOCK / rate
     nblocks = (len(a_all) - BLOCK) // BLOCK + 1
@@ -177,6 +185,14 @@ def run(cap, config, slice_hz, mode, seconds=None, progress=None, filter_kw=None
         if filt is not None:
             y = filt.agc.process(y)
         out.append(y)
+        acc[0] += float(np.mean(np.abs(pa) ** 2)) if len(pa) else 0.0
+        acc[1] += float(np.mean(np.abs(pb) ** 2)) if len(pb) else 0.0
+        acc[2] += float(np.mean(y ** 2)) * 2.0 if len(y) else 0.0     # real: half the power
+        acc[3] += 1
+        if (i + 1) * t_block >= (len(trace) + 1) * TRACE_S:
+            db = [round(10 * np.log10(max(v / max(acc[3], 1), 1e-30)), 1) for v in acc[:3]]
+            trace.append([round((i + 1) * t_block, 2)] + db)
+            acc = [0.0, 0.0, 0.0, 0]
         t = st.trackers.get(0)
         now = bool(t.talking and not t.steady) if t is not None else False
         if now and not talking:
@@ -192,7 +208,32 @@ def run(cap, config, slice_hz, mode, seconds=None, progress=None, filter_kw=None
     status = st.status()
     if filt is not None:
         status["filter"] = filt.status()
-    return audio, ca.pd_rate, overs, status
+    return audio, ca.pd_rate, overs, status, trace
+
+
+def find(cap):
+    """The finder's candidates over the whole capture: where to point --slice-hz."""
+    rate = float(cap["rate_hz"]); center = float(cap["center_hz"])
+    st = _DiversityState(_Adapter(rate, center, "LSB" if center < 10e6 else "USB"))
+    st.aligner.set_lag(0, 99.0, True)
+    a_all = cap["a"]; b_all = cap["b"]
+    for i in range((len(a_all) - BLOCK) // BLOCK + 1):
+        st.ingest(a_all[i * BLOCK:(i + 1) * BLOCK], b_all[i * BLOCK:(i + 1) * BLOCK])
+    return st.finder_json()
+
+
+def _fading(trace, overs):
+    """How far the output sits below the better loop while someone talks:
+    the median and the worst tenth, in dB. With two loops fading against
+    each other this is what the combiner leaves on the table."""
+    if not trace:
+        return {}
+    rows = [r for r in trace if any(t0 <= r[0] <= (t1 or 1e9) for t0, t1 in overs)]
+    if not rows:
+        return {}
+    below = np.array([max(r[1], r[2]) - r[3] for r in rows])
+    return {"below_best_median_db": round(float(np.median(below)), 1),
+            "below_best_p90_db": round(float(np.percentile(below, 90)), 1)}
 
 
 def _frame_powers(x, rate, frame_s=0.1):
@@ -215,10 +256,15 @@ def main(argv=None):
     ap.add_argument("capture")
     ap.add_argument("--slice-hz", type=float, default=None,
                     help="dial frequency (default: the capture's centre)")
-    ap.add_argument("--mode", default="USB", choices=("USB", "LSB"))
+    ap.add_argument("--mode", default=None, choices=("USB", "LSB"),
+                    help="default: the capture's slice mode, else LSB below 10 MHz")
     ap.add_argument("--seconds", type=float, default=None)
     ap.add_argument("--out", default=None, help="output directory (default: beside the capture)")
     ap.add_argument("--configs", default=",".join(CONFIGS))
+    ap.add_argument("--post-floor-db", type=float, default=None,
+                    help="the coherence post-filter's floor (default: the module's)")
+    ap.add_argument("--find", action="store_true",
+                    help="run the finder over the capture, print where people are talking, stop")
     ap.add_argument("--filter", default="",
                     help="settings for the filtered configuration, as /filter/set takes them: "
                          "low=300,high=2700,shape=soft,auto=1,auto_eq=1,agc=med,threshold_db=20,...")
@@ -228,7 +274,17 @@ def main(argv=None):
     except ValueError as e:
         sys.exit(str(e))
     cap = np.load(args.capture)
-    slice_hz = args.slice_hz if args.slice_hz is not None else float(cap["center_hz"])
+    if args.find:
+        for c in find(cap)["candidates"][:8]:
+            print(f"  {c['hz'] / 1e6:.4f} MHz {c['mode']}  score {c['score']:.2f}  "
+                  f"snr {c['snr_db']:.1f} dB  active {c['active_s']:.1f} s  (estimate {c['hz_raw'] / 1e6:.5f})")
+        return 0
+    slice_hz = args.slice_hz
+    if slice_hz is None:                     # the dial the operator had, if the capture knows it
+        slice_hz = float(cap["slice_hz"]) if "slice_hz" in cap.files else float(cap["center_hz"])
+    if args.mode is None:
+        args.mode = str(cap["slice_mode"]) if "slice_mode" in cap.files and str(cap["slice_mode"]) \
+            in ("USB", "LSB") else ("LSB" if slice_hz < 10e6 else "USB")
     out_dir = args.out or os.path.splitext(args.capture)[0] + "-replay"
     os.makedirs(out_dir, exist_ok=True)
     configs = [c.strip() for c in args.configs.split(",") if c.strip()]
@@ -244,8 +300,9 @@ def main(argv=None):
     for c in configs:
         t0 = time.time()
         tick = (lambda i, n: print(f"  {c}: {i}/{n}", end="\r", flush=True)) if sys.stdout.isatty() else None
-        audio, pd_rate, overs, status = run(cap, c, slice_hz, args.mode, args.seconds,
-                                            progress=tick, filter_kw=filter_kw)
+        audio, pd_rate, overs, status, trace = run(cap, c, slice_hz, args.mode, args.seconds,
+                                                   progress=tick, filter_kw=filter_kw,
+                                                   post_floor_db=args.post_floor_db)
         fp = _frame_powers(audio, pd_rate)
         loud = float(np.percentile(fp, 90)); quiet = float(np.percentile(fp, 10))
         results[c] = {
@@ -254,14 +311,39 @@ def main(argv=None):
             "loud_over_quiet_db": round(10 * np.log10(max(loud, 1e-30) / max(quiet, 1e-30)), 1),
             "overs": overs,
             "tracker": {k: status.get(k) for k in ("snr_db", "weight", "phase_deg", "ratio_db",
-                                                    "noise_coherence", "subband", "noise_profile")},
+                                                    "noise_coherence", "subband", "post",
+                                                    "noise_profile")},
+            "trace": trace,
             "took_s": round(time.time() - t0, 1),
         }
+        results[c].update(_fading(trace, overs))
         if "filter" in status:
             results[c]["filter"] = status["filter"]
         audios[c] = (audio, pd_rate)
         print(f"  {c}: {results[c]['seconds']} s, loud/quiet {results[c]['loud_over_quiet_db']} dB, "
               f"{len(overs)} overs, {results[c]['took_s']} s        ")
+    # the post-filter is judged against the per-bin combiner it sits on:
+    # what it takes off the quiet frames, and how much of the loud ones it
+    # keeps (correlation over the loud tenth)
+    if "subband" in audios and "post" in audios:
+        ref, _r = audios["subband"]; pst, _p = audios["post"]
+        n = min(len(ref), len(pst))
+        fr = _frame_powers(ref[:n], pd_rate); fpo = _frame_powers(pst[:n], pd_rate)
+        m = min(len(fr), len(fpo))
+        loud = fr[:m] >= np.percentile(fr[:m], 90)
+        hop = int(0.1 * pd_rate)
+        keep = np.concatenate([np.repeat(loud, hop), np.zeros(n - m * hop, dtype=bool)])[:n]
+        r = ref[:n][keep]; q = pst[:n][keep]
+        corr = float(np.dot(r, q) / max(np.sqrt(np.dot(r, r) * np.dot(q, q)), 1e-30))
+        results["post"]["vs_subband"] = {
+            "quiet_db": round(10 * np.log10(max(np.percentile(fpo[:m], 10), 1e-30)
+                                            / max(np.percentile(fr[:m], 10), 1e-30)), 1),
+            "loud_db": round(10 * np.log10(max(np.percentile(fpo[:m], 90), 1e-30)
+                                           / max(np.percentile(fr[:m], 90), 1e-30)), 1),
+            "loud_corr": round(corr, 3)}
+        print(f"  post vs subband: quiet {results['post']['vs_subband']['quiet_db']:+.1f} dB, "
+              f"loud {results['post']['vs_subband']['loud_db']:+.1f} dB, "
+              f"loud corr {corr:.3f}")
     # the per-bin path holds up to half a frame at the end (it emits late,
     # it does not shift): pad every file to the longest so sample k is the
     # same instant in each

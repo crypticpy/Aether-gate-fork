@@ -34,6 +34,7 @@ import math
 import numpy as np
 
 from .diversity import WEIGHT_MAX_ABS
+from .postfilter import PostFilter
 
 NFFT = 512
 MIN_COHERENCE = 0.4        # a bin's noise needs this much to earn its own weight
@@ -68,6 +69,14 @@ class SubbandCombiner:
         self._frames = 0                   # noise frames learned so far
         self.refined_bins = 0
         self.extra_db = 0.0               # noise the per-bin weights remove beyond the wideband one
+        self.post = None                  # PostFilter, when the coherence post-filter is on
+
+    def set_post(self, on, floor_db=None):
+        if not on:
+            self.post = None
+        elif self.post is None or (floor_db is not None and self.post.floor_db != floor_db):
+            self.post = PostFilter(self.rate_hz, self.n, self.h,
+                                   **({} if floor_db is None else {"floor_db": floor_db}))
 
     # --- the noise model -------------------------------------------------------
     def _learn(self, Xa, Xb):
@@ -117,10 +126,12 @@ class SubbandCombiner:
         return v, int(use.sum()), extra
 
     # --- the audio path --------------------------------------------------------
-    def process(self, pa, pb, m, s, talking):
+    def process(self, pa, pb, m, s, talking, profile_db=None):
         """One block of the passband pair -> the combined block, delayed by
         half a frame. m: the tracker's wideband weight for this block; s: the
-        talker's steering vector (2,); talking: the tracker's VAD."""
+        talker's steering vector (2,); talking: the tracker's VAD; profile_db:
+        the talker's print (100 Hz bands, dB re peak) for the post-filter's
+        floor, if there is one."""
         pa = np.asarray(pa, dtype=np.complex128)
         pb = np.asarray(pb, dtype=np.complex128)
         n_in = min(len(pa), len(pb))
@@ -147,6 +158,8 @@ class SubbandCombiner:
                 al = 1.0 - math.exp(-self.h / self.rate_hz / WEIGHT_TC_S)
                 self.v += al * (v - self.v)
             Y = scale * (self.v[:, 0] * Xa + self.v[:, 1] * Xb)
+            if self.post is not None:
+                Y = Y * self.post.gain(Xa, Xb, s, profile_db)
             y = np.fft.ifft(Y) * self.win
             self._ola += y
             out.append(self._ola[:self.h].copy())

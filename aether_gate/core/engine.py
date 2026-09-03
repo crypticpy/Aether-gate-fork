@@ -4012,6 +4012,13 @@ def start_control_server(radio, port):
                         if sb not in ("on", "off"):
                             raise ValueError(f"subband={sb!r}")
                         kwargs["subband"] = sb == "on"
+                    if "post" in q:
+                        pf = q["post"][0]
+                        if pf not in ("on", "off"):
+                            raise ValueError(f"post={pf!r}")
+                        kwargs["post"] = pf == "on"
+                    if "post_floor_db" in q:
+                        kwargs["post_floor_db"] = float(q["post_floor_db"][0])
                     if "grid" in q:
                         # the station's Maidenhead locator ('' or off forgets);
                         # validated by the beacon watch (ValueError -> error reply)

@@ -64,6 +64,11 @@ def _vp():
     return voiceprint
 
 
+def _pf():
+    from ..core import postfilter
+    return postfilter
+
+
 def _bc():
     from ..core import beacons
     return beacons
@@ -124,6 +129,8 @@ class _DiversityState:
         # per-bin refinement of the tracker's weight in the demod passband
         self.subband_on = True
         self.subbands = {}                  # sid -> SubbandCombiner
+        self.post_on = True                 # the coherence post-filter (core.postfilter)
+        self.post_floor_db = None           # None = the module's default
         self.prints = {}                    # sid -> VoicePrint (per talker voice/rig prints)
         self._voice_checked = False         # the running over has been judged against its print
         self.voice_splits = 0               # overs moved off a recalled talker by their voice
@@ -334,7 +341,9 @@ class _DiversityState:
             path = os.path.join(d, time.strftime("%Y%m%d-%H%M%S")
                                 + f"_{int(self.a.center_hz)}Hz_{int(self.a.samp_rate)}sps.npz")
             self._capture = {"want": int(seconds * self.a.samp_rate), "n": 0,
-                             "a": [], "b": [], "path": path, "seconds": seconds}
+                             "a": [], "b": [], "path": path, "seconds": seconds,
+                             "slice_hz": getattr(self.a, "_slice_hz", None),
+                             "slice_mode": getattr(self.a, "_mode", None)}
         return path
 
     def _capture_ingest(self, a, b):
@@ -350,6 +359,9 @@ class _DiversityState:
         meta = {"rate_hz": float(self.a.samp_rate), "center_hz": float(self.a.center_hz),
                 "lag_samples": int(self.aligner.lag), "aligned": bool(self.aligner.aligned),
                 "seconds": c["seconds"]}
+        if c.get("slice_hz") is not None:
+            meta["slice_hz"] = float(c["slice_hz"])          # what the operator was listening to
+            meta["slice_mode"] = str(c.get("slice_mode") or "")
 
         def _write():
             np.savez(c["path"], a=np.concatenate(c["a"])[:c["want"]],
@@ -446,6 +458,7 @@ class _DiversityState:
             "subband": {"enabled": self.subband_on,
                         **(self.subbands[sid].status() if sid in self.subbands
                            else {"bins": 0, "extra_db": 0.0})},
+            "post": self._post_status(sid),
             "sources": self._sources(),
             "noise_profile": self._noise_profile(t),
             "memory": self._memory_status(sid),
@@ -597,6 +610,23 @@ class _DiversityState:
         n = min(len(pa), len(pb))
         return self.a._np.stack([pa[:n], pb[:n]], axis=1)
 
+    def _post_status(self, sid):
+        sb = self.subbands.get(sid)
+        pf = sb.post if sb is not None else None
+        if pf is None:
+            return {"enabled": self.post_on and self.subband_on,
+                    "floor_db": _pf().FLOOR_DB if self.post_floor_db is None else self.post_floor_db,
+                    "mean_db": 0.0}
+        return {"enabled": True, **pf.status()}
+
+    def _talker_profile(self, sid):
+        """The live talker's print bands, for the post-filter's floor."""
+        vp = self.prints.get(sid)
+        if vp is None or self.memory.active is None:
+            return None
+        s = vp.summary(self.memory.active)
+        return None if s is None else s.get("bands_db")
+
     def combine_passband(self, sid, pa, pb, m0, m1, rate_hz):
         y = self._combine(sid, pa, pb, m0, m1, rate_hz)
         self._print_feed(sid, y, pa, rate_hz)
@@ -626,6 +656,7 @@ class _DiversityState:
         sb = self.subbands.get(sid)
         if sb is None or sb.rate_hz != float(rate_hz):
             sb = self.subbands[sid] = _sb().SubbandCombiner(rate_hz)
+        sb.set_post(self.post_on, self.post_floor_db)
         s = None
         if t.Rs is not None and t.Rn is not None:
             S = t.Rs - t.Rn
@@ -636,12 +667,17 @@ class _DiversityState:
         # a steady carrier is "talking" to the VAD but noise to the listener:
         # the tracker learns it into Rn_in, and so does the per-bin model
         talking = bool(t.talking) and not bool(t.steady)
-        return sb.process(pa, pb, m1, s, talking)
+        return sb.process(pa, pb, m1, s, talking,
+                          self._talker_profile(sid) if self.post_on else None)
 
     def set(self, mode=None, phase_deg=None, ratio_db=None, source=None, sid=None,
             nb=None, nb_db=None, pan=None, null_source=None, focus=None, subband=None,
-            grid=None):
+            grid=None, post=None, post_floor_db=None):
         sid = self.active_slice if sid is None else int(sid)
+        if post is not None:
+            self.post_on = bool(post)
+        if post_floor_db is not None:
+            self.post_floor_db = max(-20.0, min(0.0, float(post_floor_db)))
         if grid is not None:
             if self.beacons is None:
                 self.beacons = self._beacon_watch()
