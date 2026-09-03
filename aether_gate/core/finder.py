@@ -70,6 +70,39 @@ def _clip01(x):
     return np.clip(x, 0.0, 1.0)
 
 
+def _shift_bins(arr, shift, fill, axis=-1):
+    """arr's `axis`, in ASCENDING (low-to-high frequency) order, translated
+    by `shift` positions: new[i] = old[i + shift]. Positions that would come
+    from off the end (the span moved past what was ever measured there) get
+    `fill` instead. shift == 0 is a no-op; |shift| >= the axis length is
+    nothing but fill. Used to retune Finder's point/window history, which
+    is already decimated into ascending order on the way in."""
+    arr = np.asarray(arr)
+    n = arr.shape[axis]
+    if shift == 0:
+        return arr
+    if abs(shift) >= n:
+        out = np.empty_like(arr)
+        out[...] = fill
+        return out
+    rolled = np.roll(arr, -shift, axis=axis)
+    idx = [slice(None)] * arr.ndim
+    idx[axis] = slice(n - shift, n) if shift > 0 else slice(0, -shift)
+    rolled[tuple(idx)] = fill
+    return rolled
+
+
+def _shift_natural(arr, shift, fill, axis=0):
+    """As _shift_bins, but `axis` is in NATURAL FFT order (bin 0 = DC, the
+    upper half negative frequency): used for LiveSpatial's cross-spectrum,
+    which — unlike Finder's decimated history — is kept in the FFT's own
+    order."""
+    if shift == 0:
+        return arr
+    s = np.fft.fftshift(arr, axes=axis)
+    return np.fft.ifftshift(_shift_bins(s, shift, fill, axis=axis), axes=axis)
+
+
 class LiveSpatial:
     def __init__(self, nbins, rate_hz, tc_s=SPATIAL_TC_S):
         self.nbins = int(nbins)
@@ -80,6 +113,26 @@ class LiveSpatial:
         self._order = np.fft.fftshift(np.arange(self.nbins))
 
     # --- reader thread -----------------------------------------------------
+    def retune(self, delta_hz):
+        """The hardware centre moved by delta_hz at the same sample rate:
+        slide the cross-spectrum estimate along frequency so it stays with
+        the bins it was measured on. There is no staleness gate here (update
+        always accepts), so bins entering from off-span just start at zero
+        (no power, no coherence) and pick back up on the next frame."""
+        if self.Saa is None:
+            return
+        bin_hz = self.rate_hz / self.nbins
+        shift = int(round(float(delta_hz) / bin_hz))
+        if shift == 0:
+            return
+        if abs(shift) >= self.nbins:
+            self.Saa = self.Sbb = self.Sab = None
+            self.frames = 0
+            return
+        self.Saa = _shift_natural(self.Saa, shift, 0.0, axis=0)
+        self.Sbb = _shift_natural(self.Sbb, shift, 0.0, axis=0)
+        self.Sab = _shift_natural(self.Sab, shift, 0j, axis=0)
+
     def update(self, X, frame_s):
         Xa, Xb = np.asarray(X[0]), np.asarray(X[1])
         saa = np.abs(Xa) ** 2
@@ -132,6 +185,12 @@ class Finder:
         self.win = max(3, int(round(VOICE_WIDTH_HZ / self.step_hz)))
         self.nwin = max(1, (self.points - self.win) // WINDOW_STEP_POINTS + 1)
         self._order = np.fft.fftshift(np.arange(self.nbins))
+        self._reset_history()
+
+    def _reset_history(self):
+        """The fast ring and the ten-minute score history, empty: what a
+        fresh Finder starts with, and what retune() collapses to when the
+        centre has moved past the whole span."""
         self.fast = np.zeros((FAST_FRAMES, 2, self.points), dtype=np.float32)
         self.fast_i = 0
         self.fast_n = 0
@@ -151,6 +210,49 @@ class Finder:
         self._last = None            # the latest per-window analysis
 
     # --- reader thread -----------------------------------------------------
+    def retune(self, delta_hz):
+        """The hardware centre moved by delta_hz at the same sample rate:
+        slide the fast ring and the ten-minute score history along frequency
+        so a candidate found before the retune is still found at the same
+        absolute frequency after it, without waiting for new frames.
+
+        A point or window that enters from off-span gets exactly what a
+        fresh Finder starts with there (zero power, zero score, a 'noise'
+        verdict at zero confidence) — it must be scored again, not inherit
+        whatever used to sit at that index. slow_t (when each ROW was
+        scored, not which window) is per-row time, not per-bin, and is
+        left alone. A shift past the whole span is nothing left to slide,
+        so it resets."""
+        if self.fast_n == 0 and self.slow_n == 0 and self._last is None:
+            return
+        point_shift = int(round(float(delta_hz) / self.step_hz))
+        window_shift = int(round(float(delta_hz) / (self.step_hz * WINDOW_STEP_POINTS)))
+        if point_shift == 0 and window_shift == 0:
+            return
+        if abs(point_shift) >= self.points or abs(window_shift) >= self.nwin:
+            self._reset_history()
+            return
+        self.fast = _shift_bins(self.fast, point_shift, 0.0)
+        self.slow = _shift_bins(self.slow, window_shift, 0.0)
+        self.slow_terms = _shift_bins(self.slow_terms, window_shift, 0.0)
+        self.slow_kind = _shift_bins(self.slow_kind, window_shift, kinds.NOISE)
+        self.slow_kconf = _shift_bins(self.slow_kconf, window_shift, 0.0)
+        if self._last is not None:
+            last = self._last
+            self._last = {
+                "score": _shift_bins(last["score"], window_shift, 0.0),
+                "snr_db": _shift_bins(last["snr_db"], window_shift, 0.0),
+                "depth": _shift_bins(last["depth"], window_shift, 0.0),
+                "syllabic": _shift_bins(last["syllabic"], window_shift, 0.0),
+                "pa": _shift_bins(last["pa"], window_shift, 0.0),
+                "pb": _shift_bins(last["pb"], window_shift, 0.0),
+                "na": last["na"], "nb": last["nb"],
+                "kind": _shift_bins(last["kind"], window_shift, kinds.NOISE),
+                "kind_conf": _shift_bins(last["kind_conf"], window_shift, 0.0),
+                "mean_points": _shift_bins(last["mean_points"], point_shift, 0.0),
+                "floor": last["floor"],
+            }
+
     def update(self, X, frame_s):
         pa = _decimate(np.abs(np.asarray(X[0])) ** 2, self._order, self.points)
         pb = _decimate(np.abs(np.asarray(X[1])) ** 2, self._order, self.points)

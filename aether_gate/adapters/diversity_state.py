@@ -59,6 +59,11 @@ def _npf():
     return noiseprofile
 
 
+def _npk():
+    from . import noise_kinds
+    return noise_kinds
+
+
 def _vp():
     from ..core import voiceprint
     return voiceprint
@@ -283,12 +288,23 @@ class _DiversityState:
         n = self.MAP_BINS
         if len(a) < n or len(b) < n:
             return
-        key = (float(self.a.center_hz), float(self.a.samp_rate))
-        if self.map is None or self._map_key != key:
-            self.map = _sp().SpatialMap(n, self.a.samp_rate)
-            self.live = _fd().LiveSpatial(n, self.a.samp_rate)
-            self.finder = _fd().Finder(n, self.a.samp_rate)
-            self._map_key = key
+        center = float(self.a.center_hz)
+        rate = float(self.a.samp_rate)
+        key = (center, rate)
+        if self.map is None or self._map_key[1] != rate:
+            # no map yet, or the rate moved: every bin's meaning changed,
+            # nothing to slide
+            self.map = _sp().SpatialMap(n, rate)
+            self.live = _fd().LiveSpatial(n, rate)
+            self.finder = _fd().Finder(n, rate)
+        elif self._map_key[0] != center:
+            # same span, different centre: the bins are still THIS wide, just
+            # sitting somewhere else -- slide the history rather than lose it
+            delta = center - self._map_key[0]
+            self.map.retune(delta)
+            self.live.retune(delta)
+            self.finder.retune(delta)
+        self._map_key = key
         w = self._window(n)
         X = np.fft.fft(np.stack([a[:n], b[:n]]) * w, axis=1)
         frame_s = len(a) / self.a.samp_rate
@@ -516,79 +532,17 @@ class _DiversityState:
     def _noise_profile(self, t):
         """The profile's numbers plus `kinds`: one row per thing found, each
         naming what it is, how long it was measured over, and the one
-        control-port call that does something about it (or why nothing can)."""
+        control-port call that does something about it (or why nothing can).
+        The kinds themselves are built in noise_kinds.py (see there)."""
         if self.profile is None:
             return None
         st = self.profile.status()
         coh = (float(_dv()._coherence(t.Rn))
                if t is not None and t.Rn is not None else None)
-        directional = coh is not None and coh >= self.NULLABLE_COHERENCE
-        kinds = []
-
-        def null_action(active_ok=True):
-            if self.mode == "null":
-                return {"label": "NULLED", "route": "/diversity/set", "query": "mode=track"}, None, True
-            if directional:
-                return {"label": "NULL", "route": "/diversity/set", "query": "mode=null"}, None, False
-            if coh is None:
-                return None, "no noise estimate yet", False
-            return None, f"not directional enough to null (coherence {coh:.2f})", False
-
-        if st["mains_hz"]:
-            act, why, active = null_action()
-            f2 = int(2 * st["mains_hz"])
-            kinds.append({
-                "kind": "mains", "label": f"Mains hum · {int(st['mains_hz'])} Hz grid",
-                "detail": f"{f2} Hz comb, {st['harmonics']} harmonic{'s' if st['harmonics'] != 1 else ''}",
-                "db": st["hum_db"], "window_s": st["window_s"],
-                "action": act, "why": why, "active": active,
-            })
-        if st["impulse_db"] is not None and st["impulses_per_s"] >= 1.0:
-            rec = min(30.0, max(6.0, round((st["impulse_db"] - 3.0) * 2) / 2))
-            if self.nb_on:
-                act = {"label": "UNBLANK", "route": "/diversity/set", "query": "nb=off"}
-            else:
-                act = {"label": "BLANK", "route": "/diversity/set", "query": f"nb=on&nb_db={rec:g}"}
-            kinds.append({
-                "kind": "impulse", "label": f"Impulses · {st['impulses_per_s']:g}/s",
-                "detail": (f"{st['impulse_db']:g} dB over the floor"
-                           + (f", blanking {self.blanked_pct:.1f} %" if self.nb_on else "")),
-                "db": st["impulse_db"], "window_s": st["impulse_window_s"],
-                "action": act, "why": None, "active": bool(self.nb_on),
-            })
-        for line in st["periodic"]:
-            kinds.append({
-                "kind": "periodic", "label": f"Periodic · {line['hz']:g} Hz",
-                "detail": "a modulation rate of the noise, not a tone in the audio",
-                "db": line["db"], "window_s": st["window_s"],
-                "action": None, "why": "nothing to notch; ANF handles tones in the passband",
-                "active": False,
-            })
         filt = getattr(self.a, "_filt", None)
-        if filt is not None:
-            fs = filt.status()
-            have = [n["hz"] for n in fs["notches"]]
-            for hz, db in zip(fs["anf"]["found_hz"], fs["anf"]["depth_db"]):
-                pinned = any(abs(hz - h) <= 30 for h in have)
-                kinds.append({
-                    "kind": "tone", "label": f"Tone · {hz:g} Hz",
-                    "detail": f"ANF is holding it {abs(db):g} dB down",
-                    "db": db, "window_s": 1.0,
-                    "action": (None if pinned else
-                               {"label": "NOTCH", "route": "/filter/notch",
-                                "query": f"add={hz:g}&width=160"}),
-                    "why": "already a fixed notch" if pinned else None, "active": pinned,
-                })
-        if not kinds:
-            act, why, active = null_action()
-            kinds.append({
-                "kind": "floor", "label": "Broadband floor",
-                "detail": ("nothing mains-locked, impulsive or periodic"
-                           + (f"; coherence {coh:.2f}" if coh is not None else "")),
-                "db": None, "window_s": st["window_s"],
-                "action": act, "why": why, "active": active,
-            })
-        st["kinds"] = kinds
+        st["kinds"] = _npk().noise_kinds(
+            st, coh, self.mode, self.nb_on, self.blanked_pct,
+            self.NULLABLE_COHERENCE, filt.status() if filt is not None else None)
         return st
 
     def _memory_status(self, sid):

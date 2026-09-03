@@ -122,6 +122,35 @@ def test_map_is_decimated_and_ordered_low_to_high():
     assert d["sources"] and abs(d["sources"][0]["lo_hz"] - 7_040_000) < 2_000
 
 
+def test_a_source_survives_a_retune_at_its_absolute_frequency_with_no_new_frames():
+    rng = np.random.default_rng(20)
+    sm = SpatialMap(NB, RATE)
+    _feed(sm, rng, 200, [(10_000, 20_000, 1.2, 0.8, 30.0)])
+    before = sm.sources(center_hz=3_700_000.0)
+    assert len(before) == 1, before
+    lo_before, hi_before = before[0]["lo_hz"], before[0]["hi_hz"]
+    bin_hz = RATE / NB
+    delta_hz = 15 * bin_hz                                  # a modest, same-span retune
+    sm.retune(delta_hz)
+    after = sm.sources(center_hz=3_700_000.0 + delta_hz)    # no new frames fed
+    assert len(after) == 1, "the source must still be listed without new frames"
+    assert after[0]["lo_hz"] == pytest.approx(lo_before, abs=bin_hz)
+    assert after[0]["hi_hz"] == pytest.approx(hi_before, abs=bin_hz)
+    assert after[0]["coherence"] == pytest.approx(before[0]["coherence"], abs=0.05)
+
+
+def test_a_retune_bigger_than_the_span_resets_the_map():
+    rng = np.random.default_rng(21)
+    sm = SpatialMap(NB, RATE)
+    _feed(sm, rng, 200, [(10_000, 20_000, 1.2, 0.8, 30.0)])
+    assert sm.sources() != []
+    huge = 2.0 * RATE                                       # far more than one span
+    sm.retune(huge)
+    assert sm.R is None and sm.frames == 0
+    assert sm.sources() == []
+    assert np.all(sm.coherence() == 0.0)
+
+
 def test_region_covariance_trims_a_station_out_of_a_guard_band():
     rng = np.random.default_rng(8)
     X = _frame(rng, [(5_000, 6_000, 1.0, 1.0, 100.0)], white=1.0)

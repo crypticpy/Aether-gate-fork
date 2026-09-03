@@ -92,6 +92,46 @@ FLOOR_MAX_RATIO = 2.0
 WARMUP_S = 1.0
 # A bin refused for this long is updated regardless (the band got noisier).
 STALE_S = 30.0
+# A bin that has just entered the span on a retune (see SpatialMap.retune):
+# large enough that _stale * any real frame_s clears STALE_S, so it is
+# accepted unconditionally on the very next frame rather than waiting 30 s.
+RETUNE_FRESH_STALE = 1_000_000
+# What a retune-fresh bin's covariance starts at: small enough to be noise
+# next to any real signal, isotropic (a multiple of I) so _analyse reads it
+# as incoherent rather than the divide-by-near-zero of an exact 0 matrix.
+RETUNE_FRESH_EPS = 1e-6
+
+
+def _shift_bins(arr, shift, fill, axis=0):
+    """arr's `axis`, in ASCENDING (low-to-high frequency) order, translated
+    by `shift` positions: new[i] = old[i + shift]. Positions that would come
+    from off the end (the span moved past what was ever measured there) are
+    set to `fill` instead. shift == 0 is a no-op; |shift| >= the axis length
+    is nothing but fill."""
+    arr = np.asarray(arr)
+    n = arr.shape[axis]
+    if shift == 0:
+        return arr
+    if abs(shift) >= n:
+        out = np.empty_like(arr)
+        out[...] = fill
+        return out
+    rolled = np.roll(arr, -shift, axis=axis)
+    idx = [slice(None)] * arr.ndim
+    idx[axis] = slice(n - shift, n) if shift > 0 else slice(0, -shift)
+    rolled[tuple(idx)] = fill
+    return rolled
+
+
+def _shift_natural(arr, shift, fill, axis=0):
+    """As _shift_bins, but `axis` is in NATURAL FFT order (bin 0 = DC, the
+    upper half negative frequency) rather than ascending: the covariance
+    R and the staleness counter are both kept that way, matching the FFT
+    the reader hands in."""
+    if shift == 0:
+        return arr
+    s = np.fft.fftshift(arr, axes=axis)
+    return np.fft.ifftshift(_shift_bins(s, shift, fill, axis=axis), axes=axis)
 
 
 def region_covariance(X, idx, trim=False):
@@ -148,6 +188,34 @@ class SpatialMap:
         self._cache = None
 
     # --- reader thread -----------------------------------------------------
+    def retune(self, delta_hz):
+        """The hardware centre moved by delta_hz at the same sample rate:
+        slide the floor covariance along frequency so each bin's learned
+        history stays with its own absolute frequency instead of being
+        thrown away. Bins that enter from off-span start at a tiny ISOTROPIC
+        covariance (RETUNE_FRESH_EPS * I) rather than an exact zero matrix:
+        an exact zero makes _analyse's eigenvalue ratio degenerate (0/0) and
+        reads as perfectly coherent, which would paint a phantom source right
+        on the fresh boundary. A staleness flag forces acceptance on the very
+        next frame (see RETUNE_FRESH_STALE) rather than sitting out STALE_S;
+        a shift past the whole span is nothing left to slide, so it resets."""
+        if self.R is None:
+            return
+        bin_hz = self.rate_hz / self.nbins
+        shift = int(round(float(delta_hz) / bin_hz))
+        if shift == 0:
+            return
+        if abs(shift) >= self.nbins:
+            self.R = None
+            self._stale = None
+            self.frames = 0
+            self._cache = None
+            return
+        fresh = RETUNE_FRESH_EPS * np.eye(self.n, dtype=self.R.dtype)
+        self.R = _shift_natural(self.R, shift, fresh, axis=0)
+        self._stale = _shift_natural(self._stale, shift, RETUNE_FRESH_STALE, axis=0)
+        self._cache = None
+
     def update(self, X, frame_s):
         """One frame of spectra X (N, nbins), which took frame_s of signal."""
         X = np.asarray(X, dtype=np.complex128)

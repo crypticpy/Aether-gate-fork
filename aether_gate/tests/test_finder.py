@@ -16,7 +16,7 @@ import pytest
 
 from aether_gate.core.kinds import KINDS
 from aether_gate.core.finder import (Finder, LiveSpatial, VOICE_SCORE, FAST_FRAMES,
-                                     SLOW_PERIOD_S)
+                                     SLOW_PERIOD_S, WINDOW_STEP_POINTS)
 
 NBINS = 2048
 RATE = 125_000.0
@@ -147,3 +147,54 @@ def test_a_conversation_that_stopped_is_still_listed_with_its_age():
     assert top["snr_db"] >= 5.0 and top["syllabic"] >= 0.6 and top["depth"] >= 0.4, top
     # including what it was: silence is noise-shaped, the conversation was not
     assert top["kind"] == "voice" and top["kind_conf"] >= 0.5, top
+
+
+# --- retune: a centre move at the same rate must not lose history -----------
+
+def test_a_candidate_survives_a_retune_at_its_absolute_frequency_with_no_new_frames():
+    rng = np.random.default_rng(30)
+    live, fd = _run(rng, 400, voice=(20_000.0, 22_600.0))
+    before = fd.candidates(CENTER, live)["candidates"]
+    assert before, "the voice patch was not found before retuning"
+    hz_before, kind_before = before[0]["hz"], before[0]["kind"]
+    window_steps = 20                           # a modest, same-span retune
+    delta_hz = window_steps * WINDOW_STEP_POINTS * fd.step_hz
+    fd.retune(delta_hz)
+    live.retune(delta_hz)
+    out = fd.candidates(CENTER + delta_hz, live)          # no new frames fed
+    assert out["available"]
+    after = out["candidates"]
+    assert after, "the candidate must still be reported without new frames"
+    assert after[0]["hz"] == pytest.approx(hz_before, abs=fd.step_hz)
+    assert after[0]["kind"] == kind_before
+
+
+def test_activity_history_moves_with_a_retune():
+    rng = np.random.default_rng(31)
+    live, fd = _run(rng, 400, voice=(20_000.0, 22_600.0))
+    act_before = np.asarray(fd.candidates(CENTER, live)["activity"])
+    peak_before = int(np.argmax(act_before))
+    assert act_before[peak_before] >= 0.5
+    window_steps = 20
+    delta_hz = window_steps * WINDOW_STEP_POINTS * fd.step_hz
+    point_shift = round(delta_hz / fd.step_hz)
+    fd.retune(delta_hz)
+    live.retune(delta_hz)
+    act_after = np.asarray(fd.candidates(CENTER + delta_hz, live)["activity"])
+    peak_after = int(np.argmax(act_after))
+    # the activity moved by exactly the retune, in bins of the points grid
+    assert peak_after == peak_before - point_shift
+    assert act_after[peak_after] >= 0.5
+
+
+def test_a_retune_bigger_than_the_span_resets_the_finder_and_the_live_rows():
+    rng = np.random.default_rng(32)
+    live, fd = _run(rng, 400, voice=(20_000.0, 22_600.0))
+    assert fd.candidates(CENTER, live)["available"]
+    assert live.rows(CENTER) is not None
+    huge = 2.0 * fd.rate_hz                     # far more than one span
+    fd.retune(huge)
+    live.retune(huge)
+    assert fd.candidates(CENTER + huge, live) == {"available": False}
+    assert live.rows(CENTER + huge) is None
+    assert fd.fast_n == 0 and fd.slow_n == 0

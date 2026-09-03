@@ -93,7 +93,7 @@ def test_blanker_threshold_is_validated():
 
 # --- spatial map, sources, nulled pan ----------------------------------------
 
-def test_map_is_built_only_once_aligned_and_rebuilt_on_retune():
+def test_map_is_built_only_once_aligned_then_retuned_in_place_on_a_centre_move():
     rng = np.random.default_rng(2)
     st = _DiversityState(_FakeAdapter())
     _feed_scene(st, rng, 3, [])
@@ -102,9 +102,23 @@ def test_map_is_built_only_once_aligned_and_rebuilt_on_retune():
     _feed_scene(st, rng, 3, [])
     first = st.map
     assert first is not None and first.frames == 3
-    st.a.center_hz += 50_000.0                               # the bins are absolute frequencies
+    st.a.center_hz += 50_000.0            # same span, just moved: retune in place
     _feed_scene(st, rng, 1, [])
-    assert st.map is not first and st.map.frames == 1
+    assert st.map is first and st.map.frames == 4          # no reset -- one more frame accepted
+
+
+def test_a_rate_change_still_rebuilds_the_map_the_live_rows_and_the_finder():
+    rng = np.random.default_rng(13)
+    st = _aligned_state()
+    _feed_scene(st, rng, 3, [])
+    first_map, first_live, first_finder = st.map, st.live, st.finder
+    assert first_map is not None and first_map.frames == 3
+    assert first_finder.fast_n == 3
+    st.a.samp_rate = RATE * 2                                # every bin's meaning changed
+    _feed_scene(st, rng, 1, [])
+    assert st.map is not first_map and st.map.frames == 1
+    assert st.live is not first_live
+    assert st.finder is not first_finder and st.finder.fast_n == 1
 
 
 def test_sources_list_a_coherent_noise_source_at_its_frequency():
@@ -382,10 +396,11 @@ def test_spatial_and_finder_follow_the_map_and_carry_the_passband():
     fj = st.finder_json()
     assert fj["available"] and len(fj["activity"]) == 512
     assert fj["candidates"] == [], "plain noise must never be a conversation"
-    live = st.live
-    st.a.center_hz += 50_000.0                             # retune rebuilds all three
+    live, finder = st.live, st.finder
+    assert finder.fast_n == 256                            # the ring was already full
+    st.a.center_hz += 50_000.0                # same span, just moved: retuned, not rebuilt
     _feed_scene(st, rng, 1, [])
-    assert st.live is not live and st.finder.fast_n == 1
+    assert st.live is live and st.finder is finder and st.finder.fast_n == 256
 
 
 # --- the per-bin passband combiner ------------------------------------------
