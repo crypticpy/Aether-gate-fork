@@ -224,3 +224,18 @@ def test_a_scored_slot_carries_its_complex_ratio_and_floors_into_the_log(tmp_pat
     assert rec["mrc_gain_db"] == res["gain_db"] and rec["steps_heard"] == 4
     assert 285 <= rec["bearing_deg"] <= 305 and 2200 <= rec["distance_km"] <= 2600
     assert log.beacon_result(None) is None
+
+
+def test_the_antenna_note_is_stamped_on_every_line_and_is_its_own_verdict(tmp_path):
+    t = [T0]
+    log = SiteLog(tmp_path / "site.jsonl", clock=lambda: t[0])
+    assert log.noise(**_noise_fields())["antenna"] is None
+    log.antenna = "K-480WLA HF, gain HIGH"
+    t[0] += 6.0                                 # same verdict, but a new note
+    assert log.noise(**_noise_fields())["antenna"] == "K-480WLA HF, gain HIGH"
+    assert log.beacon(band_hz=14.1e6, callsign="W6WX")["antenna"] == "K-480WLA HF, gain HIGH"
+    assert log.status()["antenna"] == "K-480WLA HF, gain HIGH"
+    log.antenna = ""
+    assert log.status()["antenna"] is None
+    assert [r.get("antenna") for r in log.read()] == [None, "K-480WLA HF, gain HIGH",
+                                                     "K-480WLA HF, gain HIGH"]

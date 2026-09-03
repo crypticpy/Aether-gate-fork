@@ -15,15 +15,11 @@ this module wires them to the adapter's three threads:
            (previous, new) weight pair the demod ramps between.
   CONTROL  status()/set()/map()/capture()/memory_clear().
 
-Every shared value is a Python scalar, a small dict swapped whole, or an
-object replaced atomically, so no lock is needed for a reader to see a
-consistent weight; the two accumulations two threads share (calibration,
-capture) take a lock. The optional stages live in diversity_enhance.
-
-Weights are PER SLICE: the beam is arithmetic on the same two streams, so
-the slice on a net can be steered at whoever is talking while a second slice
-keeps its own weight. The panadapter and S-meter follow the slice the audio
-is on (active_slice).
+Every shared value is a scalar, a small dict swapped whole, or an object
+replaced atomically, so readers need no lock; the two accumulations two
+threads share (calibration, capture) take one. The optional stages live in
+diversity_enhance. Weights are PER SLICE (the beam is arithmetic on the same
+two streams); the panadapter and S-meter follow active_slice.
 """
 import os
 import threading
@@ -545,6 +541,7 @@ class _DiversityState:
             "focus": self.memory.focus_status(time.monotonic(),
                                               nulling=bool(t.interferer) if t is not None else False),
             "capture": self._cap.status(),
+            "sitelog": self.sitelog.status(),
             "slice_id": sid,
         }
 
@@ -715,8 +712,10 @@ class _DiversityState:
     def set(self, mode=None, phase_deg=None, ratio_db=None, source=None, sid=None,
             nb=None, nb_db=None, pan=None, null_source=None, focus=None, subband=None,
             grid=None, post=None, post_floor_db=None, mrc=None, assume_hz=None,
-            assume_call=None):
+            assume_call=None, antenna=None):
         sid = self.active_slice if sid is None else int(sid)
+        if antenna is not None:            # free text, e.g. 'K-480WLA HF, gain HIGH'
+            self.sitelog.antenna = str(antenna).strip()[:80]
         if post is not None:
             v2 = post == "v2"
             self.post_on = True if v2 else bool(post)

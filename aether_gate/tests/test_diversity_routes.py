@@ -69,12 +69,13 @@ class FakeDiversityAdapter:
     def set_diversity(self, mode=None, phase_deg=None, ratio_db=None, source=None, slice_id=None,
                        nb=None, nb_db=None, pan=None, null_source=None, focus=None,
                        subband=None, grid=None, post=None, mrc=None, assume_hz=None,
-                       assume_call=None):
+                       assume_call=None, antenna=None):
         self.calls.append(("set", {"mode": mode, "phase_deg": phase_deg,
                                     "ratio_db": ratio_db, "source": source, "slice_id": slice_id,
                                     "nb": nb, "nb_db": nb_db, "pan": pan, "null_source": null_source,
                                     "focus": focus, "subband": subband, "grid": grid, "post": post,
-                                    "mrc": mrc, "assume_hz": assume_hz, "assume_call": assume_call}))
+                                    "mrc": mrc, "assume_hz": assume_hz, "assume_call": assume_call,
+                                    "antenna": antenna}))
         if assume_call not in (None, "WWVH"):
             raise ValueError(f"{assume_call} is not on that frequency")
         if focus not in (None, "") and focus != 7:
@@ -255,7 +256,7 @@ def test_set_forwards_every_given_param():
                        "source": "b", "slice_id": 1,
                        "nb": True, "nb_db": 18.5, "pan": "nulled", "null_source": 2,
                        "focus": None, "subband": False, "grid": None, "post": None,
-                       "mrc": None, "assume_hz": None, "assume_call": None}
+                       "mrc": None, "assume_hz": None, "assume_call": None, "antenna": None}
     assert out["mode"] == "track" and out["source"] == "b"
 
 
@@ -279,7 +280,7 @@ def test_set_with_only_one_param_leaves_the_rest_unset():
                        "source": None, "slice_id": None,
                        "nb": None, "nb_db": None, "pan": None, "null_source": None, "focus": None,
                        "subband": None, "grid": None, "post": None, "mrc": None,
-                       "assume_hz": None, "assume_call": None}
+                       "assume_hz": None, "assume_call": None, "antenna": None}
 
 
 # ---- v2 /diversity/set params: nb, nb_db, pan, null_source ------------------
@@ -725,6 +726,16 @@ def test_post_v2_mrc_and_an_assumed_time_signal_reach_the_adapter():
     assert "error" not in _get(port, "/diversity/set?assume_hz=10000000&assume_call=off")
     assert [c for c in a.calls if c[0] == "set"][-1][1]["assume_call"] is None
     assert "error" in _get(port, "/diversity/set?assume_hz=10000000&assume_call=CHU")
+
+
+def test_the_antenna_note_reaches_the_adapter_and_off_clears_it():
+    a = FakeDiversityAdapter()
+    _, port = _start(a)
+    assert "error" not in _get(port, "/diversity/set?antenna=K-480WLA+HF%2C+gain+HIGH")
+    last = [c for c in a.calls if c[0] == "set"][-1][1]
+    assert last["antenna"] == "K-480WLA HF, gain HIGH"
+    assert "error" not in _get(port, "/diversity/set?antenna=off")
+    assert [c for c in a.calls if c[0] == "set"][-1][1]["antenna"] == ""
 
 
 def test_timesignals_route_passes_the_adapter_answer_through():

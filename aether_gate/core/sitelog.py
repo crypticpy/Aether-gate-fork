@@ -134,6 +134,7 @@ class SiteLog:
         self._noise_at = None
         self._noise_verdict = None
         self.written = 0
+        self.antenna = ""            # the operator's note on the antenna switches
         self.skipped = 0             # noise verdicts the rate limit swallowed
         self.error = None            # the first write failure, kept for status
 
@@ -144,7 +145,7 @@ class SiteLog:
                mrc_gain_db=None):
         """One scored beacon slot. Returns the line written, or None."""
         return self._append({
-            "t": _iso(self._clock()), "kind": "beacon",
+            "t": _iso(self._clock()), "kind": "beacon", "antenna": self.antenna or None,
             "band_hz": _num(band_hz, 0), "callsign": str(callsign),
             "bearing_deg": _num(bearing_deg, 1), "distance_km": _num(distance_km, 0),
             "snr_a_db": _num(snr_a_db), "snr_b_db": _num(snr_b_db),
@@ -175,7 +176,7 @@ class SiteLog:
         """The profile's verdict, rate-limited. Returns the line written, or
         None when this second said nothing the last line did not."""
         rec = {
-            "t": _iso(self._clock()), "kind": "noise",
+            "t": _iso(self._clock()), "kind": "noise", "antenna": self.antenna or None,
             "samp_rate": _num(samp_rate, 0), "center_hz": _num(center_hz, 0),
             "mains_hz": _num(mains_hz, 0), "hum_db": _num(hum_db),
             "harmonics": None if harmonics is None else int(harmonics),
@@ -253,14 +254,16 @@ class SiteLog:
 
     def status(self):
         return {"path": self.path, "written": int(self.written),
-                "skipped": int(self.skipped), "error": self.error}
+                "skipped": int(self.skipped), "error": self.error,
+                "antenna": self.antenna or None}
 
 
 def _verdict(rec):
     """What makes this second a DIFFERENT verdict from the last one. Coarse
     on purpose: levels in 3 dB steps, rates in half decades, lines to 10 Hz,
     the centre to the nearest MHz (a band change is a new verdict; nudging
-    the VFO inside one is not)."""
+    the VFO inside one is not). A new antenna note is always a new verdict:
+    the switch positions are what the line is for."""
     lines = rec.get("lines") or []
     hz = []
     for ln in lines:
@@ -274,4 +277,5 @@ def _verdict(rec):
             _bucket(rec.get("impulse_db"), HUM_STEP_DB),
             _bucket(rec.get("noise_coherence"), COH_STEP),
             tuple(sorted(hz)),
-            _bucket(rec.get("center_hz"), 1e6), rec.get("samp_rate"))
+            _bucket(rec.get("center_hz"), 1e6), rec.get("samp_rate"),
+            rec.get("antenna"))

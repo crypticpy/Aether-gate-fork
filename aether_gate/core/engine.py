@@ -4039,6 +4039,12 @@ def start_control_server(radio, port):
                         kwargs["assume_call"] = None if call.lower() in ("", "off", "none") else call
                     if "post_floor_db" in q:
                         kwargs["post_floor_db"] = float(q["post_floor_db"][0])
+                    if "antenna" in q:
+                        # antenna=<free text> is stamped on every site-log line
+                        # from now on (which loop, which switch positions);
+                        # antenna=off clears it
+                        ant = q["antenna"][0].strip()
+                        kwargs["antenna"] = "" if ant.lower() in ("off", "none") else ant
                     if "grid" in q:
                         # the station's Maidenhead locator ('' or off forgets);
                         # validated by the beacon watch (ValueError -> error reply)
