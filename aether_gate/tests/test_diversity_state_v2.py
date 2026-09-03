@@ -368,7 +368,7 @@ def test_spatial_and_finder_follow_the_map_and_carry_the_passband():
     rng = np.random.default_rng(21)
     st = _DiversityState(_FakeAdapter())
     assert st.spatial_json() == {"available": False}
-    assert st.finder_json() == {"available": False}
+    assert st.finder_json()["available"] is False
     st.aligner.set_lag(0, 20.0, True)
     _feed_scene(st, rng, 3, [(10_000.0, 14_000.0, 1.1, 0.9, 30.0)])
     sj = st.spatial_json()

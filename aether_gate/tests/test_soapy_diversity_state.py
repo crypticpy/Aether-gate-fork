@@ -250,3 +250,38 @@ def test_concurrent_realign_and_ingest_do_not_raise():
         t.join(timeout=2)
 
     assert errors == [], f"ingest()/request_realign() raced: {errors}"
+
+
+# --- the lag window is a time: the ring offset does not shrink with the rate
+
+def test_the_lag_window_is_a_time_so_the_offset_is_found_at_250k():
+    """The offset between the tuners' rings is ~33 ms whatever the rate:
+    -63 samples one start at 125 kS/s, -8316 at 250 kS/s -- past the old
+    +-8192-sample window, so after a span change nothing ever locked,
+    REALIGN included (found on the air 2026-09-03)."""
+    rng = np.random.default_rng(9)
+    state = _DiversityState(_FakeAdapter(250_000.0))
+    state.request_realign("stream start")
+    _feed_window(state, rng, lag=8316)
+    assert state.aligner.aligned and state.aligner.lag == 8316
+    assert state.last_align["peak"] >= state.ALIGN_STRONG_PEAK
+    assert state._realign is None
+
+
+@pytest.mark.parametrize("rate,lag", [(62_500.0, 2_079), (500_000.0, 16_632),
+                                      (1_000_000.0, 33_265), (2_040_000.0, 67_861)])
+def test_the_offset_is_found_exactly_at_every_span(rate, lag):
+    """62.5 kHz to 2 MHz of span, the same 33 ms offset each time: the
+    decimated search finds it and the full-rate refine lands on the exact
+    sample (the lag here is deliberately not a multiple of the decimation)."""
+    rng = np.random.default_rng(int(rate) % 97)
+    state = _DiversityState(_FakeAdapter(rate))
+    state.request_realign("stream start")
+    _feed_window(state, rng, lag=lag)
+    assert state.aligner.aligned and state.aligner.lag == lag
+    assert state.last_align["peak"] >= state.ALIGN_STRONG_PEAK
+
+
+def test_finder_json_says_why_there_is_nothing_to_find():
+    state = _DiversityState(_FakeAdapter(125_000.0))
+    assert state.finder_json() == {"available": False, "reason": "not aligned"}

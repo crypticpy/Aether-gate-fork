@@ -100,11 +100,9 @@ class _DiversityState:
     # best; a peak past ALIGN_STRONG_PEAK ends the search early.
     ALIGN_TRIES = 8
     ALIGN_STRONG_PEAK = 30.0
-    CAL_SAMPLES_MAX = 1 << 17  # 131072 — caps the FFT at 2.04 MS/s to ~64 ms of
-                                # reader-thread stall instead of the 103 ms a
-                                # full 0.5 s (2^21-point FFT) costs, which was
-                                # long enough to overflow the driver and trigger
-                                # another realign under its own stall
+    # How the lag is searched -- over a time, at every span -- is core/alignsearch.py.
+    CAL_SAMPLES_MAX = 1_000_000  # 0.49 s at 2.04 MS/s: the window is a TIME (the
+                                # offset is ~33 ms); alignsearch bounds the FFT
     MODES = ("off", "manual", "null", "track")
     SOURCES = ("combined", "a", "b", "stereo")   # HEAR: what reaches the audio
     PANS = ("combined", "a", "b", "nulled")      # what the panadapter shows
@@ -209,7 +207,8 @@ class _DiversityState:
         """One calibration window measured: adopt the best lag so far when
         it is credible, and keep measuring while it is not yet strong."""
         dv = _dv()
-        lag, peak = dv.find_lag(A, B, min(8192, len(A) // 4))
+        from ..core.alignsearch import measure_lag      # numpy: first use only
+        lag, peak = measure_lag(A, B, self.a.samp_rate)
         self._align_try += 1
         best = self._align_best
         if best is None or peak > best[1]:
@@ -459,8 +458,11 @@ class _DiversityState:
         return self.beacons.status(time.time())
 
     def finder_json(self):
+        # Fed only while aligned (_map_update): say which it is, not just "no".
+        if not self.aligner.aligned:
+            return {"available": False, "reason": "not aligned"}
         if self.finder is None:
-            return {"available": False}
+            return {"available": False, "reason": "no frames yet"}
         return self.finder.candidates(float(self.a.center_hz), self.live)
 
     def status(self, sid=None):
