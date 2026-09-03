@@ -16,6 +16,7 @@ Run:  .venv/bin/python -m pytest aether_gate/tests/test_governor.py -q
 """
 from aether_gate.adapters import diversity_governor as adapt
 from aether_gate.core import governor as G
+from aether_gate.core import governor_proxy as P
 
 
 def snap(t=0.0, **kw):
@@ -29,7 +30,11 @@ def snap(t=0.0, **kw):
         "impulses_per_s": 0.0, "impulse_db": None,
         "mains_hz": None, "harmonics": 0, "carriers": [],
         "frontend_available": True, "guard": False, "headroom_db": 30.0,
-        "dig_running": False, "dig_gain_db": None,
+        "clips_1s": 0, "blanked_pct": 0.0, "floor_db": -100.0,
+        "slice_hz": 7185000.0, "talker": None,
+        "dig_running": False, "dig_gain_db": None, "dig_note": None,
+        "dig_unsteady": False, "dig_verdict": None, "dig_cancelled": False,
+        "dig_age_s": None,
     }
     for k, v in kw.items():
         if isinstance(v, dict) and isinstance(s.get(k), dict):
@@ -306,11 +311,12 @@ def test_the_events_list_is_capped_at_fifty():
     assert st["events"][0]["t"] == 30.0
 
 
-def test_nothing_is_proposed_before_there_is_an_objective_to_score_against():
+def test_no_objective_no_longer_means_no_move_but_still_means_no_stream():
     g = gov()
-    assert g.tick(snap(objective=None, impulses_per_s=9.0, impulse_db=14.0)) == []
-    assert g.status()["state"] == "measuring"
-    assert g.tick({"t": 0.0, "available": False}) == []
+    acts = g.tick(snap(objective=None, impulses_per_s=9.0, impulse_db=14.0))
+    assert acts[0]["tool"] == "nb" and acts[0]["scorer"] == "proxy:blanking"
+    assert g.status()["objective_source"] == "none"
+    assert gov().tick({"t": 0.0, "available": False}) == []
 
 
 def test_a_write_that_threw_backs_the_pair_off_and_says_so():
@@ -326,9 +332,269 @@ def test_the_status_shape_the_app_reads():
     g = gov()
     st = g.status()
     assert set(st) == {"auto", "state", "why", "settle_s", "margin_db",
-                       "spread_db", "holding", "pending", "events", "backoff"}
+                       "spread_db", "objective_source", "holding", "pending",
+                       "events", "backoff"}
+    assert st["objective_source"] == "snr"
     assert st["auto"] is True and st["pending"] is None
     assert isinstance(st["why"], str) and st["why"]
+
+
+# --- no talker: the proxy objectives -----------------------------------------
+
+def test_the_proxy_thresholds_are_borrowed_from_the_same_places_too():
+    from aether_gate.core.digout import BLANK_FREE_PCT
+    from aether_gate.core.squeeze import MIN_LEVEL_DB
+    assert P.NULL_DEPTH_KEEP_DB == MIN_LEVEL_DB
+    assert P.BLANKED_MAX_PCT == BLANK_FREE_PCT
+    assert P.NOTCH_DEPTH_KEEP_DB > P.NULL_DEPTH_KEEP_DB
+    assert P.HEADROOM_LOW_DB == G.HEADROOM_LOW_DB
+
+
+def _squeeze_move(g, depth_db, tool="null", floor_after=-100.2):
+    """Propose a squeeze with nobody talking, then settle it at `depth_db`."""
+    run(g, snap(0.0, objective=None, coherence=0.6,
+                carriers=[{"hz": 1200.0, "db": 20.0}]))
+    held = {"held": True, "tool": tool, "depth_db": depth_db, "configured": True,
+            "hz": 1200.0}
+    return g.tick(snap(3.0, objective=None, coherence=0.6, squeeze=held,
+                       floor_db=floor_after))
+
+
+def test_a_squeeze_with_no_talker_is_kept_on_its_own_measured_depth():
+    g = gov()
+    assert _squeeze_move(g, 14.2) == []
+    assert list(g.holding) == ["squeeze"]
+    e = g.events[-1]
+    assert e["result"] == "kept" and e["scorer"] == "proxy:depth"
+    assert "14.2 dB of null depth" in e["why"] and "no talker to score by" in e["why"]
+    assert g.status()["holding"][0]["scorer"] == "proxy:depth"
+
+
+def test_a_shallow_null_is_put_back_and_a_notch_is_asked_for_more():
+    g = gov()
+    acts = _squeeze_move(g, 3.1)                     # under NULL_DEPTH_KEEP_DB
+    assert acts[0]["revert"] is True and acts[0]["params"] == {"squeeze": ""}
+    assert g.holding == {} and g.events[-1]["result"] == "undone"
+    assert "3.1 dB of null depth" in g.events[-1]["why"]
+    # 8 dB holds a null but not a notch: a designed response is asked for more
+    assert _squeeze_move(gov(), 8.0, tool="null") == []
+    assert _squeeze_move(gov(), 8.0, tool="notch")[0]["revert"] is True
+    assert _squeeze_move(gov(), 12.0, tool="notch") == []
+
+
+def test_a_deep_null_that_lifted_the_passband_floor_still_goes_back():
+    g = gov()
+    acts = _squeeze_move(g, 14.2, floor_after=-98.5)   # the floor rose 1.5 dB
+    assert acts[0]["revert"] is True
+    assert "floor rose 1.5 dB" in g.events[-1]["why"]
+    assert _squeeze_move(gov(), 14.2, floor_after=-99.2) == []      # 0.8 dB is free
+
+
+def test_the_blanker_with_no_talker_is_scored_on_what_it_eats():
+    g = gov()
+    run(g, snap(0.0, objective=None, impulses_per_s=4.0, impulse_db=12.7))
+    assert g.pending["scorer"] == "proxy:blanking"
+    assert g.tick(snap(3.0, objective=None, nb={"on": True}, blanked_pct=3.0,
+                       impulses_per_s=0.4, floor_db=-100.1)) == []
+    assert g.events[-1]["result"] == "kept"
+    assert "impulses -3.6/s" in g.events[-1]["why"]
+    # over BLANKED_MAX_PCT it is gating the signal, not the noise
+    g2 = gov()
+    run(g2, snap(0.0, objective=None, impulses_per_s=4.0, impulse_db=12.7))
+    acts = g2.tick(snap(3.0, objective=None, nb={"on": True}, blanked_pct=9.0))
+    assert acts[0]["revert"] is True and acts[0]["params"] == {"nb": False, "nb_db": 9.5}
+
+
+def test_an_idle_null_with_no_talker_has_to_take_a_decibel_off_the_floor():
+    g = gov()
+    run(g, snap(0.0, objective=None, mode="manual", coherence=0.6))
+    assert g.pending["scorer"] == "proxy:floor"
+    assert g.tick(snap(3.0, objective=None, mode="null", coherence=0.6,
+                       floor_db=-101.6)) == []
+    assert g.events[-1]["result"] == "kept"
+    assert "1.6 dB off the passband floor" in g.events[-1]["why"]
+    g2 = gov()
+    run(g2, snap(0.0, objective=None, mode="manual", coherence=0.6))
+    acts = g2.tick(snap(3.0, objective=None, mode="null", coherence=0.6,
+                        floor_db=-100.4))            # only 0.4 dB: not worth a mode
+    assert acts[0]["revert"] is True and acts[0]["params"] == {"mode": "manual"}
+
+
+def _guard_move(g, clips_after, hr_after, clips_before=14, hr_before=1.5):
+    """Propose the guard with nobody talking, then settle it. The guard steps
+    the LNA on its own loop, so it gets GUARD_SETTLE_S and not SETTLE_S."""
+    run(g, snap(0.0, objective=None, headroom_db=hr_before, clips_1s=clips_before))
+    assert g.pending["scorer"] == "proxy:clips"
+    assert g.tick(snap(9.9, objective=None, guard=True, headroom_db=hr_after,
+                       clips_1s=clips_after)) == []          # still settling at 9.9 s
+    assert g.state == "settling"
+    return g.tick(snap(10.1, objective=None, guard=True, headroom_db=hr_after,
+                       clips_1s=clips_after))
+
+
+def test_the_guard_gets_ten_seconds_because_it_steps_the_lna_itself():
+    assert G.GUARD_SETTLE_S == 10.0
+    g = gov()
+    assert _guard_move(g, 0, 8.0) == []
+    assert g.events[-1]["result"] == "kept"
+    assert "clips 14/s -> 0" in g.events[-1]["why"]
+
+
+def test_the_guard_is_kept_when_either_of_its_numbers_moved_the_right_way():
+    # the clips fell but the headroom did not come back
+    g = gov()
+    assert _guard_move(g, 3, 1.5) == []
+    assert "clips 14/s -> 3" in g.events[-1]["why"]
+    # the clips held but the headroom did
+    g2 = gov()
+    assert _guard_move(g2, 14, 5.7) == []
+    assert "headroom +4.2 dB" in g2.events[-1]["why"]
+    # no clipping at all after the step, whatever the headroom says
+    g3 = gov()
+    assert _guard_move(g3, 0, 1.4) == []
+    assert g3.events[-1]["result"] == "kept"
+
+
+def test_the_guard_goes_back_only_when_neither_number_moved():
+    g = gov()
+    acts = _guard_move(g, 18, 1.4)          # more clips, less headroom
+    assert acts[0]["revert"] is True and acts[0]["params"] == {"guard": False}
+    assert "clips 14/s -> 18" in g.events[-1]["why"]
+    assert "headroom -0.1 dB" in g.events[-1]["why"]
+
+
+def test_a_talker_turning_up_switches_the_scorer_back_and_re_litigates_nothing():
+    g = gov()
+    run(g, snap(0.0, objective=None, headroom_db=1.5, clips_1s=40))
+    g.tick(snap(10.1, objective=None, guard=True, headroom_db=8.0, clips_1s=0))
+    assert g.status()["objective_source"] == "none"
+    assert g.status()["holding"][0]["scorer"] == "proxy:clips"
+    acts = run(g, snap(20.0, objective=2.0, guard=True, headroom_db=8.0,
+                       impulses_per_s=4.0, impulse_db=12.7))
+    assert g.status()["objective_source"] == "snr"
+    assert acts[0]["tool"] == "nb" and acts[0]["scorer"] == "snr"
+    # the guard kept under a proxy is still held, still says what kept it, and
+    # was never re-scored against the objective that has just turned up
+    held = [h for h in g.status()["holding"] if h["tool"] == "guard"][0]
+    assert held["scorer"] == "proxy:clips" and held["delta_db"] is None
+
+
+def test_every_event_and_holding_row_names_the_scorer_that_judged_it():
+    g = gov()
+    run(g, snap(0.0, impulses_per_s=4.0, impulse_db=12.7))       # objective present
+    g.tick(snap(3.0, objective=9.8, nb={"on": True}))
+    assert [e["scorer"] for e in g.status()["events"]] == ["snr"]
+    assert g.status()["holding"][0]["scorer"] == "snr"
+
+
+# --- the dig: once per talker, and only on what the dig stands behind --------
+
+def test_the_dig_is_never_started_without_a_talker_to_score_it():
+    g = gov()
+    for i in range(G.SPREAD_N):
+        g.tick(snap(i * 0.01, objective=None))
+    assert g.tick(snap(1.0, objective=None, talking=False)) == []
+    assert g.tick(snap(2.0, objective=None, talking=True)) == []   # no objective
+    assert g.status()["objective_source"] == "none"
+
+
+def test_a_dig_hand_off_happens_once_for_a_frequency_and_talker():
+    g = gov()
+    _objective_ring(g, 0.0, 3.0)
+    acts = run(g, snap(1.0, objective=3.0, talking=True))
+    assert acts[0]["tool"] == "dig" and acts[0]["key"] == (7185000, None)
+    g.tick(snap(70.0, objective=3.0, talking=True, dig_gain_db=1.2))
+    assert g.holding["dig"]["delta_db"] == 1.2
+    _objective_ring(g, 3000.0, 3.0)                  # the backoff is long gone
+    assert g.tick(snap(3600.0, objective=3.0, talking=True)) == []
+    # a different talker, or a different frequency, is a different question
+    assert g.tick(snap(3601.0, objective=3.0, talking=True,
+                       talker="G0ABC"))[0]["tool"] == "dig"
+    assert g.tick(snap(3602.0, objective=3.0, talking=True,
+                       slice_hz=14074000.0))[0]["tool"] == "dig"
+
+
+def test_the_dig_backs_off_for_half_an_hour_not_ten_minutes():
+    assert G.DIG_BACKOFF_S == 1800.0
+    g = gov()
+    _objective_ring(g, 0.0, 3.0)
+    run(g, snap(1.0, objective=3.0, talking=True))
+    assert g.backoff[("weak", "dig")] == 1.0 + G.DIG_BACKOFF_S
+
+
+def test_a_tentative_dig_scores_nothing_and_backs_the_pair_off_again():
+    tentative = "the band swung 5.4 dB while sampling; results are tentative"
+    g = gov()
+    _objective_ring(g, 0.0, 3.0)
+    run(g, snap(1.0, objective=3.0, talking=True))
+    g.tick(snap(70.0, objective=3.0, talking=True, dig_gain_db=28.61,
+                dig_unsteady=True, dig_note=tentative))
+    e = g.events[-1]
+    assert e["result"] == "kept" and e["delta_db"] == 0.0    # 28.61 was the artefact
+    assert "tentative" in e["why"] and "not +28.6 dB" in e["why"]
+    assert g.backoff[("weak", "dig")] == 70.0 + G.DIG_BACKOFF_S
+    # ...and while the dig's own last word is that, nothing else is handed over
+    _objective_ring(g, 4000.0, 3.0)
+    assert g.tick(snap(4200.0, objective=3.0, talking=True, talker="G0ABC",
+                       dig_note=tentative, dig_age_s=60.0)) == []
+    assert g.tick(snap(4201.0, objective=3.0, talking=True, talker="G0ABC",
+                       dig_unsteady=True, dig_age_s=60.0)) == []
+
+
+def test_the_tentative_block_runs_out_on_the_digs_own_clock():
+    """The gate keeps the last run's note for ever, so an hour-old "tentative"
+    must not be a permanent lockout -- it is DIG_BACKOFF_S from the dig's own
+    end, which the adapter hands over as an AGE because the two clocks differ."""
+    tentative = "the band swung 5.4 dB while sampling; results are tentative"
+    inside = dict(objective=3.0, talking=True, talker="G0ABC",
+                  dig_note=tentative, dig_unsteady=True)
+    g = gov()
+    _objective_ring(g, 0.0, 3.0)
+    # one second short of the window: still blocked
+    assert g.tick(snap(1.0, dig_age_s=G.DIG_BACKOFF_S - 1.0, **inside)) == []
+    # ...and one second past it, the same note no longer blocks anything
+    assert g.tick(snap(2.0, dig_age_s=G.DIG_BACKOFF_S + 1.0,
+                       **inside))[0]["tool"] == "dig"
+
+
+def test_an_untimestamped_note_is_aged_from_when_the_governor_first_saw_it():
+    """No `ends` in the dig status (it was cancelled before it ever ran, say):
+    the clock starts at the tick that first saw this note, not at zero."""
+    inside = dict(objective=3.0, talking=True, talker="G0ABC",
+                  dig_note="results are tentative", dig_age_s=None)
+    g = gov()
+    _objective_ring(g, 0.0, 3.0)
+    assert g.tick(snap(100.0, **inside)) == []              # first sight: t = 100
+    assert g._note_at[1] == 100.0
+    assert g.tick(snap(100.0 + G.DIG_BACKOFF_S - 1.0, **inside)) == []
+    assert g.tick(snap(100.0 + G.DIG_BACKOFF_S + 1.0, **inside))[0]["tool"] == "dig"
+    # a NEW note restarts the window rather than inheriting the old one's age
+    g2 = gov()
+    _objective_ring(g2, 0.0, 3.0)
+    g2.tick(snap(100.0, **inside))
+    assert g2.tick(snap(5000.0, **dict(inside, dig_note="also tentative"))) == []
+
+
+def test_a_dig_that_found_nothing_counts_as_tried_and_says_so():
+    g = gov()
+    _objective_ring(g, 0.0, 3.0)
+    run(g, snap(1.0, objective=3.0, talking=True))
+    g.tick(snap(70.0, objective=3.0, talking=True, dig_gain_db=0.0))
+    e = g.events[-1]
+    assert e["delta_db"] == 0.0 and "found nothing here" in e["why"]
+    _objective_ring(g, 4000.0, 3.0)
+    assert g.tick(snap(4200.0, objective=3.0, talking=True)) == []
+
+
+def test_a_cancelled_or_worse_dig_banks_nothing_either():
+    for over, want in ((dict(dig_cancelled=True), "cancelled"),
+                       (dict(dig_verdict="worse"), "worse")):
+        g = gov()
+        _objective_ring(g, 0.0, 3.0)
+        run(g, snap(1.0, objective=3.0, talking=True))
+        g.tick(snap(70.0, objective=3.0, talking=True, dig_gain_db=4.0, **over))
+        assert g.events[-1]["delta_db"] == 0.0
+        assert want in g.events[-1]["why"]
 
 
 # --- the adapter half --------------------------------------------------------
@@ -369,12 +635,21 @@ class FakeAdapter:
         ]}
 
     def frontend_status(self):
-        return {"available": True, "guard": False, "headroom_db": 28.8}
+        return {"available": True, "guard": False, "headroom_db": 28.8,
+                "clips_1s": 0}
+
+    def diversity_spatial(self):
+        return {"available": True, "start_hz": 7184000.0, "step_hz": 500.0,
+                "passband_hz": [7185000.0, 7186000.0],
+                # bins 2..4 are the passband; the loud one outside it must not
+                # move the median, and neither must the carrier inside it
+                "level_db": [-40.0, -41.0, -99.0, -98.0, -97.0, -20.0]}
 
     def diversity_dig(self, **kw):
         if kw:
             self.writes.append(("dig", kw))
-        return {"running": False, "gain_db": 0.0}
+        return {"running": False, "gain_db": 0.0,
+                "ends": getattr(self, "dig_ends", None)}
 
     def set_diversity(self, **kw):
         self.writes.append(("diversity", kw))
@@ -390,6 +665,50 @@ def test_the_snapshot_reads_the_gates_own_shapes():
     assert s["squeeze"]["configured"] is False
     assert s["carriers"] == [{"hz": -1000.0, "db": 18.0}]     # the out-of-band one is gone
     assert s["frontend_available"] and s["headroom_db"] == 28.8
+
+
+def test_the_snapshot_carries_what_the_proxies_score_by():
+    s = adapt.GovernorRunner(FakeAdapter(), clock=lambda: 0.0).snapshot()
+    assert s["floor_db"] == -98.0          # median of the three passband bins
+    assert s["blanked_pct"] == 0.2 and s["clips_1s"] == 0
+    assert s["slice_hz"] == 7185000.0 and s["talker"] is None
+    assert s["dig_unsteady"] is False and s["dig_note"] is None
+    assert s["dig_verdict"] is None and s["dig_cancelled"] is False
+    assert s["dig_age_s"] is None            # this fake has never run one
+
+
+def test_the_snapshot_turns_the_digs_wall_clock_stamp_into_an_age():
+    import time as _t
+    a = FakeAdapter()
+    a.dig_ends = _t.time() - 90.0
+    s = adapt.GovernorRunner(a, clock=lambda: 0.0).snapshot()
+    assert 89.0 < s["dig_age_s"] < 95.0       # a duration, not either clock
+
+
+def test_the_floor_is_the_median_of_the_passband_bins_and_nothing_else():
+    strip = {"start_hz": 0.0, "step_hz": 100.0,
+             "level_db": [-10.0, -90.0, -91.0, -92.0, -10.0]}
+    assert P.inband_floor_db(dict(strip, passband_hz=[100.0, 300.0])) == -91.0
+    assert P.inband_floor_db(strip) == -90.0            # no passband: the whole strip
+    assert P.inband_floor_db({}) is None
+    assert P.inband_floor_db({"level_db": [], "start_hz": 0.0, "step_hz": 1.0}) is None
+
+
+def test_auto_off_stops_a_dig_the_governor_itself_started():
+    a = FakeAdapter()
+    r = adapt.GovernorRunner(a, clock=lambda: 0.0)
+    r.gov.auto = True
+    r.gov.pending = {"tool": "dig", "kind": "weak", "t": 0.0, "why": "",
+                     "params": {"seconds": 60}, "undo": None, "before": None,
+                     "result": "pending", "delta_db": None, "scorer": "snr"}
+    r.stop()
+    assert a.writes == [("dig", {"cancel": True})]
+    # a dig the OPERATOR started is not ours to stop
+    a2 = FakeAdapter()
+    r2 = adapt.GovernorRunner(a2, clock=lambda: 0.0)
+    r2.gov.auto = True
+    r2.stop()
+    assert a2.writes == []
 
 
 def test_a_configured_comb_target_reads_as_the_operators():

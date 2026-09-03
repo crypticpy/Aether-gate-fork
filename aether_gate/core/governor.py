@@ -37,25 +37,40 @@ route knowing this file exists; and a tool already where a rule wants it is left
 `auto` starts False and holds nothing. Turning it off releases everything on the
 next tick and leaves the settings where they stand: releasing is not reverting,
 and what the governor kept it kept because it measured better.
+
+NO TALKER IS NOT NO DECISION. With no speech-band objective the move is still
+made and still scored, by the PROXY its tool carries its own measurement for
+(core/governor_proxy.py): the squeeze's depth, the blanker's blanked_pct, the
+passband floor, the ADC's clips. Every event and holding row names its `scorer`
+("snr" or "proxy:<name>") and the status carries `objective_source`, so nothing
+is kept without saying what kept it; a proxy-kept move is NOT re-litigated when
+a talker turns up. The dig is the exception: it needs a talker and is never
+started without one. The guard gets its own GUARD_SETTLE_S: it steps the LNA.
+
+ONCE PER TALKER. A dig hand-off costs a minute of knob-turning, so it happens
+once for a (slice frequency, talker) pair and never again, and not at all for
+DIG_BACKOFF_S after a run the dig itself called tentative: that concluded nothing.
 """
 import collections
 
+from . import governor_proxy as proxy
 from .digout import MARGIN_MAX_DB, MIN_MARGIN_DB
+from .governor_proxy import (CARRIER_MIN_DB, HEADROOM_LOW_DB, IMPULSE_RATE_ON,
+                             NULLABLE_COHERENCE, NULL_COHERENCE,
+                             blank_threshold_db, tool_state)
+
+_num = proxy._num                       # the adapter reads it through this name
 
 SETTLE_S = 2.0                  # after a move, before the objective is read again
+GUARD_SETTLE_S = 10.0           # ...but the guard steps the LNA on its own loop
 OPERATOR_GRACE_S = 60.0         # a knob the operator moved is theirs for this long
 BACKOFF_S = 300.0               # a (kind, tool) that hurt is not retried for this
-DIG_BACKOFF_S = 600.0           # ...and the dig is expensive, so longer
+DIG_BACKOFF_S = 1800.0          # ...and a dig is a minute of knob-turning: half
+                                # an hour, after eight in eighty minutes on air
 MAX_EVENTS = 50
 SPREAD_N = 6                    # objective reads the margin's spread is taken over
 
-# Quoted from whichever module owns each; test_governor.py asserts they match.
-NULL_COHERENCE = 0.5            # core.squeeze.NULL_ENTER_COHERENCE
-NULLABLE_COHERENCE = 0.4        # _DiversityState.NULLABLE_COHERENCE
-CARRIER_MIN_DB = 6.0            # core.squeeze.MIN_LEVEL_DB
-HEADROOM_LOW_DB = 3.0           # adapters.frontend_guard.HEADROOM_LOW_DB
-IMPULSE_RATE_ON = 1.0           # adapters.noise_kinds' own "is this impulsive"
-IMPULSE_CLEAR_S = 30.0          # ...and how long it must be gone before unblanking
+IMPULSE_CLEAR_S = 30.0          # how long the impulses must be gone before unblanking
 HUM_COVERED_DB = 6.0            # a null this deep already has the hum
 WEAK_OBJECTIVE_DB = 6.0         # under this a talker is worth a dig
 STEADY_SPREAD_DB = 1.5          # ...on a band no jumpier than this
@@ -64,39 +79,12 @@ DIG_SECONDS = 60
 RULES = ("guard", "nb", "mode", "squeeze", "dig")     # the chain's own order
 # "released"/"error": not measurement outcomes, but how a move stops being ours.
 RESULTS = ("pending", "kept", "undone", "released", "error")
-_HELD = ("tool", "params", "kind", "why", "since", "delta_db")   # a holding row
+_HELD = ("tool", "params", "kind", "why", "since", "delta_db", "scorer")  # a row
 
 
 def _act(tool, params, undo, kind, why, revert=False):
     return {"tool": tool, "params": params, "undo": undo, "kind": kind,
-            "why": why, "revert": bool(revert)}
-
-
-def _num(x, default=None):
-    try:
-        f = float(x)
-    except (TypeError, ValueError):
-        return default
-    return f if f == f and abs(f) != float("inf") else default
-
-
-def blank_threshold_db(impulse_db):
-    """noise_kinds.py's own recommendation: 6..30 dB to the half-decibel, so the
-    governor and the SITE page's BLANK button ask for the same number."""
-    return min(30.0, max(6.0, round((_num(impulse_db, 12.0) - 3.0) * 2) / 2))
-
-
-def tool_state(snap):
-    """The tools' settings, one comparable value each: the whole of the drift
-    detection -- what moves here that we did not write is somebody's hand."""
-    sq, nb = snap.get("squeeze") or {}, snap.get("nb") or {}
-    return {
-        "squeeze": (sq.get("target") if sq.get("configured") else None,
-                    _num(sq.get("hz"))),
-        "nb": (bool(nb.get("on")), _num(nb.get("db")), nb.get("auto")),
-        "mode": snap.get("mode"),
-        "guard": bool(snap.get("guard")),
-    }
+            "why": why, "revert": bool(revert), "scorer": "snr"}
 
 
 class Governor:
@@ -117,6 +105,10 @@ class Governor:
         self._operator_at = {}          # tool -> when the operator last moved it
         self._clear_since = None        # impulses last went quiet at
         self._seeded = False
+        self._source = "snr"            # is there an objective to score by?
+        self._before = {}               # the proxy readings the pending is judged from
+        self._dug = set()               # (slice hz, talker) pairs already handed over
+        self._note_at = None            # (the dig's last note, when we first saw it)
 
     def tick(self, snap):
         """One snapshot in, zero or one actions out."""
@@ -129,9 +121,7 @@ class Governor:
             self.state, self.why = "measuring", "no dual-tuner stream to govern"
             return []
         self._observe(snap, now)
-        if snap.get("objective") is None:
-            self.state, self.why = "measuring", "no combined SNR to score against yet"
-            return []
+        self._source = "snr" if _num(snap.get("objective")) is not None else "none"
         if self.pending is not None:
             return self._resolve(snap, now)
         return self._propose(snap, now)
@@ -147,6 +137,7 @@ class Governor:
             return
         if tool == "dig":
             self.backoff[(action["kind"], tool)] = now + DIG_BACKOFF_S
+            self._dug.add(action.get("key"))     # this pair has now had its minute
         # the same dict goes into events: result/delta update it in place
         self.pending = self._event(now, action, "pending", action["why"], before)
         self.state = "settling"
@@ -163,7 +154,8 @@ class Governor:
     def _event(self, now, action, result, why, before=None):
         e = {"t": now, "tool": action["tool"], "kind": action["kind"],
              "params": action["params"], "undo": action.get("undo"), "why": why,
-             "before": _num(before), "result": result, "delta_db": None}
+             "before": _num(before), "result": result, "delta_db": None,
+             "scorer": action.get("scorer", "snr")}
         self.events.append(e)
         return e
 
@@ -201,42 +193,54 @@ class Governor:
         p = self.pending
         if p["tool"] == "dig":
             return self._resolve_dig(snap, now)
-        if now - p["t"] < self.settle_s:
+        if now - p["t"] < (GUARD_SETTLE_S if p["tool"] == "guard" else self.settle_s):
             self.state, self.why = "settling", f"{p['tool']}: measuring what it did"
             return []
+        if p["scorer"] != "snr":                     # no talker: its own proxy scores it
+            keep, why = proxy.verdict(p["tool"], p["kind"], self._before, snap)
+            p["why"] = f"{p['why']}; {why}"
+            return self._keep(p, why) if keep else self._undo(p, now, why)
         before, after = p["before"], _num(snap.get("objective"))
         if before is None or after is None:
             return self._keep(p)                     # nothing to compare it against
         p["delta_db"] = round(after - before, 2)
         if p["delta_db"] >= -self.margin_db():
             return self._keep(p)
+        return self._undo(p, now, f"{p['tool']} cost {-p['delta_db']:.1f} dB "
+                                  f"on the {p['kind']}: put back")
+
+    def _undo(self, p, now, why):
         p["result"] = "undone"
         self.pending = None
         self.holding.pop(p["tool"], None)
         self.backoff[(p["kind"], p["tool"])] = now + BACKOFF_S
-        self.state = "backoff"
-        self.why = f"{p['tool']} cost {-p['delta_db']:.1f} dB on the {p['kind']}: put back"
+        self.state, self.why = "backoff", why
         if p["undo"] is None:
             return []
-        return [_act(p["tool"], p["undo"], p["params"], p["kind"], self.why, revert=True)]
+        return [_act(p["tool"], p["undo"], p["params"], p["kind"], why, revert=True)]
 
     def _resolve_dig(self, snap, now):
         """The dig owns its own A/B rule and its own revert, so this scores it
-        and never reverts it: what the dig kept, the dig measured."""
+        and never reverts it -- but it banks only what the dig itself stands
+        behind, and a run that concluded nothing backs the pair off again."""
         if snap.get("dig_running"):
             self.state, self.why = "settling", "dig-out is working on this talker"
             return []
-        self.pending["delta_db"] = _num(snap.get("dig_gain_db"), 0.0)
-        return self._keep(self.pending)
+        p = self.pending
+        p["delta_db"], note = proxy.dig_delta_db(snap)
+        if note:
+            p["why"] = f"{p['why']}; {note}"
+            self.backoff[(p["kind"], "dig")] = now + DIG_BACKOFF_S
+        return self._keep(p)
 
-    def _keep(self, p):
+    def _keep(self, p, why=None):
         p["result"] = "kept"
         self.pending = None
         self.holding[p["tool"]] = dict(p, since=p["t"])
         self.state = "idle"
         d = p["delta_db"]
-        self.why = (f"{p['tool']} on the {p['kind']}: kept"
-                    + (f", {d:+.1f} dB" if d is not None else ""))
+        self.why = why or (f"{p['tool']} on the {p['kind']}: kept"
+                           + (f", {d:+.1f} dB" if d is not None else ""))
         return []
 
     def _release_all(self, now):
@@ -264,6 +268,9 @@ class Governor:
                     continue
                 del self.backoff[key]
             self.state, self.why = "applying", act["why"]
+            if self._source != "snr":
+                act["scorer"] = proxy.scorer(act["tool"])
+            self._before = proxy.readings(snap)
             return [act]
         self.why = (("holding " + ", ".join(sorted(self.holding))
                      + "; nothing else on the band is asking for a tool") if self.holding
@@ -337,7 +344,7 @@ class Governor:
             return None                  # the operator's own target: leave it alone
         coh = _num(snap.get("coherence"))
         tool = "a null" if coh is not None and coh >= NULL_COHERENCE else "a notch"
-        car = self._strongest_carrier(snap)
+        car = proxy.strongest_carrier(snap)
         if car is not None:
             hz = int(round(car["hz"]))
             if sq.get("target") == "signal" and abs(_num(sq.get("hz"), 1e9) - hz) < 1.0:
@@ -360,37 +367,30 @@ class Governor:
 
     def _rule_dig(self, snap, now):
         """Last: the dig turns the same knobs and already scores every one, so this
-        hands over rather than duplicating the search. It wants a full ring of reads
-        (SPREAD_N) on a band no jumpier than STEADY_SPREAD_DB -- a run on a moving
-        band concludes nothing (see core/digout.py)."""
-        if snap.get("dig_running") or not snap.get("talking"):
+        hands over rather than duplicating the search. It needs a TALKER -- there is
+        no proxy for it, the dig's own A/B is the objective -- a full ring of reads
+        (SPREAD_N) on a band no jumpier than STEADY_SPREAD_DB, and a pair this
+        governor has not already spent a minute on (proxy.dig_key)."""
+        if not snap.get("talking"):
             return None
         j = _num(snap.get("objective"))
         if j is None or j >= WEAK_OBJECTIVE_DB:
             return None
         if len(self._obj) < SPREAD_N or self.spread_db() > STEADY_SPREAD_DB:
             return None
-        return _act("dig", {"seconds": DIG_SECONDS}, None, "weak",
-                    f"a talker at {j:.1f} dB on a band steady to "
-                    f"{self.spread_db():.1f} dB: handing it to dig-out")
-
-    @staticmethod
-    def _strongest_carrier(snap):
-        """The loudest carrier the finder named that is worth a tool at all."""
-        best = None
-        for c in (snap.get("carriers") or []):
-            hz, db = _num(c.get("hz")), _num(c.get("db"), 0.0)
-            if hz is None or db < CARRIER_MIN_DB:
-                continue
-            if best is None or db > best["db"]:
-                best = {"hz": hz, "db": db}
-        return best
+        key = proxy.dig_key(snap)
+        age, self._note_at = proxy.tentative_age_s(snap, self._note_at, now)
+        if key is None or key in self._dug or proxy.dig_blocked(snap, age, DIG_BACKOFF_S):
+            return None                  # done here already, or nothing to conclude on
+        return dict(_act("dig", {"seconds": DIG_SECONDS}, None, "weak",
+                         f"a talker at {j:.1f} dB on a band steady to "
+                         f"{self.spread_db():.1f} dB: handing it to dig-out"), key=key)
 
     def status(self):
         return {
             "auto": bool(self.auto), "state": self.state, "why": self.why,
             "settle_s": self.settle_s, "margin_db": self.margin_db(),
-            "spread_db": self.spread_db(),
+            "spread_db": self.spread_db(), "objective_source": self._source,
             "holding": [{k: h[k] for k in _HELD}
                         for h in sorted(self.holding.values(), key=lambda h: h["since"])],
             "pending": None if self.pending is None else dict(self.pending),

@@ -7,11 +7,12 @@ and never sees an adapter; this is the part that touches one.
 
 Same split and the same reach as adapters/diversity_dig.py, deliberately: the
 adapter's public surface and nothing else -- `diversity_status`,
-`filter_status`, `diversity_finder`, `frontend_status`, `diversity_dig` to
-read; `set_diversity`, `frontend.enabled` and `diversity_dig(seconds=)` to
-write, the same calls the control port already makes. Nothing here touches the
-DSP thread, and nothing here reaches into _DiversityState (which is at its own
-800-line budget) past the public `set()` that `set_diversity` forwards to.
+`filter_status`, `diversity_finder`, `diversity_spatial`, `frontend_status`,
+`diversity_dig` to read; `set_diversity`, `frontend.enabled` and
+`diversity_dig(seconds=)` / `diversity_dig(cancel=True)` to write, the same
+calls the control port already makes. Nothing here touches the DSP thread, and
+nothing here reaches into _DiversityState (which is at its own 800-line budget)
+past the public `set()` that `set_diversity` forwards to.
 
 ONE DAEMON THREAD, started by `auto=on` and stopped by `auto=off`, ticking once
 a second. It is not the read loop's: the read loop's job is to keep the stream
@@ -21,7 +22,7 @@ whole runner with no thread at all.
 
 THE SNAPSHOT is where the gate's shapes are turned into the flat dict the
 policy reads, and it is the only place in B25 that knows a status key by name.
-Two of its fields deserve a note:
+Three of its fields deserve a note:
 
   objective   core.digout.objective on the live diversity status, with the
               finder's verdict for the tuned frequency -- the same number, from
@@ -33,11 +34,17 @@ Two of its fields deserve a note:
               and filtered to the ones actually inside the filter's passband.
               A carrier outside the passband is not audible and not the
               governor's business, however loud it is.
+  floor_db    /diversity/spatial's level strip, median over the passband
+              (core.governor_proxy.inband_floor_db): a level with no talker.
+  dig_age_s   seconds since the last dig ended. A DURATION and not a stamp: the
+              dig times itself off the wall clock and the policy off a monotonic
+              one, so only the gap between the two survives the crossing.
 """
 import threading
 import time
 
 from ..core import digout, governor
+from ..core import governor_proxy as proxy
 
 TICK_S = 1.0
 JOIN_TIMEOUT_S = 5.0
@@ -128,8 +135,11 @@ class GovernorRunner:
         if t is not None and t.is_alive() and t is not threading.current_thread():
             t.join(timeout=JOIN_TIMEOUT_S)
         self._thread = None
+        ours = (self.gov.pending or {}).get("tool") == "dig"
         self.gov.auto = False
         self.gov.tick({"t": self._clock(), "available": False})
+        if ours:            # a dig WE started keeps turning knobs otherwise
+            _safe(getattr(self.a, "diversity_dig", None), cancel=True)
 
     # ----- the tick --------------------------------------------------------
 
@@ -180,18 +190,19 @@ class GovernorRunner:
         filt = _safe(getattr(self.a, "filter_status", None))
         fe = _safe(getattr(self.a, "frontend_status", None))
         dig = _safe(getattr(self.a, "diversity_dig", None))
+        spat = _safe(getattr(self.a, "diversity_spatial", None))
+        ends = governor._num(dig.get("ends"))        # wall clock: only the gap travels
         prof = div.get("noise_profile") or {}
         nb = div.get("nb") or {}
         sq = div.get("squeeze") or {}
-        focus = div.get("focus")
+        focus, talker = div.get("focus"), div.get("talker")
         slice_hz = getattr(self.a, "_slice_hz", None)
         return {
             "t": now, "available": True,
             "objective": digout.objective(div, self._kind(div, slice_hz)),
-            "mode": div.get("mode"),
+            "mode": div.get("mode"), "coherence": div.get("noise_coherence"),
             "focus": (focus or {}).get("id") if isinstance(focus, dict) else None,
             "talking": bool(div.get("talking")),
-            "coherence": div.get("noise_coherence"),
             "squeeze": {
                 "held": bool(sq.get("held")), "tool": sq.get("tool"),
                 "depth_db": sq.get("depth_db"), "target": sq.get("target"),
@@ -205,16 +216,19 @@ class GovernorRunner:
             "nb": {"on": bool(nb.get("enabled")), "db": nb.get("threshold_db"),
                    "auto": (nb.get("auto") or {}).get("mode")},
             "impulses_per_s": prof.get("impulses_per_s") or 0.0,
-            "impulse_db": prof.get("impulse_db"),
-            "mains_hz": prof.get("mains_hz"),
-            "harmonics": prof.get("harmonics") or 0,
+            "impulse_db": prof.get("impulse_db"), "mains_hz": prof.get("mains_hz"),
+            "harmonics": prof.get("harmonics") or 0, "blanked_pct": nb.get("blanked_pct"),
             "carriers": carriers(_safe(getattr(self.a, "diversity_finder", None)),
                                  filt, slice_hz),
-            "frontend_available": bool(fe.get("available")),
-            "guard": bool(fe.get("guard")),
-            "headroom_db": fe.get("headroom_db"),
-            "dig_running": bool(dig.get("running")),
-            "dig_gain_db": dig.get("gain_db"),
+            "frontend_available": bool(fe.get("available")), "guard": bool(fe.get("guard")),
+            "headroom_db": fe.get("headroom_db"), "clips_1s": fe.get("clips_1s"),
+            "slice_hz": slice_hz, "floor_db": proxy.inband_floor_db(spat),
+            "talker": talker.get("id") if isinstance(talker, dict) else None,
+            "dig_running": bool(dig.get("running")), "dig_note": dig.get("note"),
+            "dig_gain_db": dig.get("gain_db"), "dig_verdict": dig.get("verdict"),
+            "dig_unsteady": bool(dig.get("unsteady")),
+            "dig_cancelled": bool(dig.get("cancelled")),
+            "dig_age_s": None if ends is None else time.time() - ends,
         }
 
     def _kind(self, div, slice_hz):
