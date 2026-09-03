@@ -176,10 +176,30 @@ class LiveSpatial:
         }
 
 
+POINTS_REFERENCE_HZ = 500_000.0  # up to this span SPATIAL_POINTS already keeps a
+                                  # voice window near VOICE_WIDTH_HZ (measured
+                                  # 2026-09-03: 2686-2930 Hz from 62.5 k to 500 kS/s).
+                                  # Held fixed past it, the window would blow out to
+                                  # 5.9 kHz at 1.02 MS/s and 12 kHz at 2.04 MS/s --
+                                  # 2-4x VOICE_WIDTH_HZ, since step_hz = rate/512
+                                  # keeps growing with the span while the window
+                                  # floors at 3 points. Scaling points with the span
+                                  # above the reference (capped at nbins, the raw FFT's
+                                  # own resolution) keeps the window close to
+                                  # VOICE_WIDTH_HZ at every span the RSPduo offers.
+
+
+def _default_points(rate_hz, nbins):
+    scaled = int(round(SPATIAL_POINTS * float(rate_hz) / POINTS_REFERENCE_HZ))
+    return max(SPATIAL_POINTS, min(int(nbins), scaled))
+
+
 class Finder:
-    def __init__(self, nbins, rate_hz, points=SPATIAL_POINTS):
+    def __init__(self, nbins, rate_hz, points=None):
         self.nbins = int(nbins)
         self.rate_hz = float(rate_hz)
+        if points is None:
+            points = _default_points(self.rate_hz, self.nbins)
         self.points = max(8, min(int(points), self.nbins))
         self.step_hz = self.rate_hz / self.points
         self.win = max(3, int(round(VOICE_WIDTH_HZ / self.step_hz)))
