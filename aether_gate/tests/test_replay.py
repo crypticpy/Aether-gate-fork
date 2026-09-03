@@ -14,6 +14,7 @@ import os
 import wave
 
 import numpy as np
+import pytest
 
 from aether_gate import replay
 
@@ -66,3 +67,39 @@ def test_replay_writes_comparable_wavs_and_a_summary(tmp_path, capsys):
     assert r["subband"]["tracker"]["subband"]["enabled"] is True
     assert r["wideband"]["tracker"]["subband"]["enabled"] is False
     assert "wrote a.wav" in capsys.readouterr().out
+
+
+def test_replay_filtered_config_runs_the_slice_filter_and_agc(tmp_path):
+    cap = str(tmp_path / "cap.npz")
+    _capture(cap)
+    out = str(tmp_path / "out")
+    assert replay.main([cap, "--out", out, "--mode", "USB", "--configs", "a,filtered",
+                        "--filter", "low=250,high=2600,shape=soft,agc=slow,threshold_db=12"]) == 0
+    with open(os.path.join(out, "summary.json")) as fh:
+        r = json.load(fh)["results"]
+    assert set(r) == {"a", "filtered"}
+    f = r["filtered"]["filter"]
+    # the settings reached core.filter and are the ones in force
+    assert (f["set_low_hz"], f["set_high_hz"], f["shape"]) == (250.0, 2600.0, "soft")
+    assert f["agc"]["mode"] == "slow" and f["agc"]["threshold_db"] == 12.0
+    assert f["agc"]["gain_db"] is not None                  # the AGC ran
+    assert "filter" not in r["a"]
+    # the AGC put the audio near its target (0.25 -> -12 dB) whatever the
+    # raw passband level was, and the threshold kept the pauses down
+    assert -20.0 < r["filtered"]["rms_db"] < -6.0, r
+    assert r["filtered"]["loud_over_quiet_db"] >= r["a"]["loud_over_quiet_db"], r
+    assert r["filtered"]["tracker"]["subband"]["enabled"] is True
+    lengths = set()
+    for c in ("a", "filtered"):
+        with wave.open(os.path.join(out, f"{c}.wav")) as w:
+            lengths.add(w.getnframes())
+            frames = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2")
+        assert np.max(np.abs(frames)) > 20_000, c          # each normalised on its own
+    assert len(lengths) == 1, lengths
+
+
+def test_replay_rejects_a_malformed_filter_setting(tmp_path):
+    cap = str(tmp_path / "cap.npz")
+    _capture(cap, seconds=1.0)
+    with pytest.raises(SystemExit):
+        replay.main([cap, "--out", str(tmp_path / "o"), "--configs", "a", "--filter", "low"])

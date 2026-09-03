@@ -11,16 +11,21 @@ side by side and one summary so they can be compared in numbers:
   b          loop B alone
   wideband   the tracker's weight (mode track), one weight for the passband
   subband    the same, refined per bin (core.subband)
+  filtered   subband through the slice filter and the AGC (core.filter):
+             what the operator hears, so a filter or AGC change can be
+             judged on the same over as the combiner
 
 Every configuration hears the same seconds of the same over at the same
 gain, so a difference is the algorithm's and nothing else's. A change to
 the DSP is judged here on last night's capture before it is judged on the
-air.
+air. The one exception is `filtered`: its AGC sets its own level, so that
+file is normalised on its own and compared for shape, not loudness.
 
 Usage:
     python -m aether_gate.replay CAPTURE.npz [--slice-hz HZ] [--mode USB|LSB]
                                              [--seconds N] [--out DIR]
-                                             [--configs a,b,wideband,subband]
+                                             [--configs a,b,wideband,subband,filtered]
+                                             [--filter low=300,high=2700,threshold_db=20,...]
 """
 import argparse
 import json
@@ -33,10 +38,11 @@ import numpy as np
 
 from .adapters.diversity_state import _DiversityState
 from .core.diversity import combine_ramp
+from .core.filter import SliceFilter
 
 BLOCK = 4096
 PD_RATE_TARGET = 25_000.0
-CONFIGS = ("a", "b", "wideband", "subband")
+CONFIGS = ("a", "b", "wideband", "subband", "filtered")
 
 
 class _Adapter:
@@ -105,8 +111,25 @@ class _Chain:
         return self.ssb(self.dec(xm))
 
 
-def run(cap, config, slice_hz, mode, seconds=None, progress=None):
-    """One configuration over the capture -> (audio at pd_rate, pd_rate, overs)."""
+def _parse_filter(text):
+    """'low=300,high=2700,shape=soft' -> kwargs for SliceFilter.set (numbers as floats)."""
+    kw = {}
+    for item in (text or "").split(","):
+        if not item.strip():
+            continue
+        if "=" not in item:
+            raise ValueError(f"--filter wants KEY=VALUE, got {item!r}")
+        k, v = item.split("=", 1)
+        k = k.strip(); v = v.strip()
+        try:
+            kw[k] = float(v)
+        except ValueError:
+            kw[k] = v
+    return kw
+
+
+def run(cap, config, slice_hz, mode, seconds=None, progress=None, filter_kw=None):
+    """One configuration over the capture -> (audio at pd_rate, pd_rate, overs, status)."""
     rate = float(cap["rate_hz"]); center = float(cap["center_hz"])
     a_all = cap["a"]; b_all = cap["b"]
     if seconds is not None:
@@ -114,11 +137,20 @@ def run(cap, config, slice_hz, mode, seconds=None, progress=None):
         a_all = a_all[:n]; b_all = b_all[:n]
     st = _DiversityState(_Adapter(rate, center, mode))
     st.aligner.set_lag(0, 99.0, True)            # a capture is the aligned pair
-    st.set(mode="track", subband=(config == "subband"))
+    st.set(mode="track", subband=(config in ("subband", "filtered")))
     st.active_slice = 0
     ca = _Chain(rate, slice_hz - center, mode)
     cb = _Chain(rate, slice_hz - center, mode)
     cb.w = ca.w
+    filt = None
+    if config == "filtered":
+        # the live chain: the operator's filter on each loop's decimated IQ
+        # (channel 0 feeds its spectrum), the combiner, then one AGC on the
+        # audio — soapy._passband and get_audio, at pd_rate instead of 24 k
+        filt = SliceFilter(ca.pd_rate)
+        filt.agc.rate_hz = ca.pd_rate
+        filt.set(**(filter_kw or {}))
+    lsb = mode == "LSB"
     out = []
     overs = []
     talking = False
@@ -129,7 +161,10 @@ def run(cap, config, slice_hz, mode, seconds=None, progress=None):
         st.ingest(a, b)                          # the map, the profile, the blanker
         xa = ca.mix(a); xb = cb.mix(b)
         m0, m1 = st.observe(0, xa, xb)
-        pa = ca.passband(xa); pb = cb.passband(xb)
+        if filt is not None:
+            pa = filt.apply(ca.dec(xa), 0, lsb=lsb); pb = filt.apply(cb.dec(xb), 1, lsb=lsb)
+        else:
+            pa = ca.passband(xa); pb = cb.passband(xb)
         if config == "a":
             y = pa
         elif config == "b":
@@ -138,7 +173,10 @@ def run(cap, config, slice_hz, mode, seconds=None, progress=None):
             y = combine_ramp(pa, pb, m0, m1)
         else:
             y = st.combine_passband(0, pa, pb, m0, m1, ca.pd_rate)
-        out.append(np.real(y))
+        y = np.real(y)
+        if filt is not None:
+            y = filt.agc.process(y)
+        out.append(y)
         t = st.trackers.get(0)
         now = bool(t.talking and not t.steady) if t is not None else False
         if now and not talking:
@@ -151,7 +189,10 @@ def run(cap, config, slice_hz, mode, seconds=None, progress=None):
     if overs and overs[-1][1] is None:
         overs[-1][1] = round(nblocks * t_block, 2)
     audio = np.concatenate(out) if out else np.zeros(0)
-    return audio, ca.pd_rate, overs, st.status()
+    status = st.status()
+    if filt is not None:
+        status["filter"] = filt.status()
+    return audio, ca.pd_rate, overs, status
 
 
 def _frame_powers(x, rate, frame_s=0.1):
@@ -178,7 +219,14 @@ def main(argv=None):
     ap.add_argument("--seconds", type=float, default=None)
     ap.add_argument("--out", default=None, help="output directory (default: beside the capture)")
     ap.add_argument("--configs", default=",".join(CONFIGS))
+    ap.add_argument("--filter", default="",
+                    help="settings for the filtered configuration, as /filter/set takes them: "
+                         "low=300,high=2700,shape=soft,auto=1,auto_eq=1,agc=med,threshold_db=20,...")
     args = ap.parse_args(argv)
+    try:
+        filter_kw = _parse_filter(args.filter)
+    except ValueError as e:
+        sys.exit(str(e))
     cap = np.load(args.capture)
     slice_hz = args.slice_hz if args.slice_hz is not None else float(cap["center_hz"])
     out_dir = args.out or os.path.splitext(args.capture)[0] + "-replay"
@@ -196,7 +244,8 @@ def main(argv=None):
     for c in configs:
         t0 = time.time()
         tick = (lambda i, n: print(f"  {c}: {i}/{n}", end="\r", flush=True)) if sys.stdout.isatty() else None
-        audio, pd_rate, overs, status = run(cap, c, slice_hz, args.mode, args.seconds, progress=tick)
+        audio, pd_rate, overs, status = run(cap, c, slice_hz, args.mode, args.seconds,
+                                            progress=tick, filter_kw=filter_kw)
         fp = _frame_powers(audio, pd_rate)
         loud = float(np.percentile(fp, 90)); quiet = float(np.percentile(fp, 10))
         results[c] = {
@@ -208,6 +257,8 @@ def main(argv=None):
                                                     "noise_coherence", "subband", "noise_profile")},
             "took_s": round(time.time() - t0, 1),
         }
+        if "filter" in status:
+            results[c]["filter"] = status["filter"]
         audios[c] = (audio, pd_rate)
         print(f"  {c}: {results[c]['seconds']} s, loud/quiet {results[c]['loud_over_quiet_db']} dB, "
               f"{len(overs)} overs, {results[c]['took_s']} s        ")
@@ -216,11 +267,14 @@ def main(argv=None):
     # same instant in each
     longest = max(len(a) for a, _ in audios.values())
     audios = {c: (np.concatenate([a, np.zeros(longest - len(a))]), r) for c, (a, r) in audios.items()}
-    # one gain for all, so the files compare by ear
-    peak = max(float(np.max(np.abs(a))) for a, _ in audios.values()) or 1.0
+    # one gain for all, so the files compare by ear — except the filtered
+    # one, whose AGC has already chosen its level; it is normalised alone
+    raw = [a for c, (a, _) in audios.items() if c != "filtered"]
+    peak = max((float(np.max(np.abs(a))) for a in raw), default=0.0) or 1.0
     scale = 0.9 / peak
     for c, (audio, pd_rate) in audios.items():
-        _write_wav(os.path.join(out_dir, f"{c}.wav"), audio, pd_rate, scale)
+        s = scale if c != "filtered" else 0.9 / (float(np.max(np.abs(audio))) or 1.0)
+        _write_wav(os.path.join(out_dir, f"{c}.wav"), audio, pd_rate, s)
     summary = {"capture": os.path.abspath(args.capture), "slice_hz": slice_hz, "mode": args.mode,
                "results": results}
     with open(os.path.join(out_dir, "summary.json"), "w") as f:
