@@ -41,11 +41,24 @@ NOISE = KINDS.index("noise")
 # match, because the band does not sort itself into five bins for us.
 PRESENT_DB = (1.0, 4.0)        # SNR over the band floor: is anything here at all
 NARROW_HZ = (500.0, 1100.0)    # occupied width: a tone, not a conversation
-WIDE_HZ = (900.0, 1600.0)      # occupied width: a conversation, not a tone
+WIDE_HZ = (700.0, 1400.0)      # occupied width: a conversation, not a tone --
+                               # measured 1.2-2.4 kHz on off-air 80 m and 40 m
+                               # phone with BW_ENERGY_FRAC below
+NARROW_POINTS = (2.0, 3.0)     # ...and never below what a tone itself measures:
+WIDE_POINTS = (2.5, 4.0)       # the Hann window spreads one over two map points,
+                               # so on a coarse map (500 Hz points at 1 MS/s,
+                               # 1 kHz at 2.04) the absolute pair above would
+                               # call a tone wide. Widths come out of features()
+                               # in whole points, so the bounds sit BETWEEN
+                               # counts rather than on one.
 FILLED_FRAC = (0.85, 0.98)     # share of the window's own width that is occupied
 DEPTH_STEADY = (0.12, 0.40)    # envelope swing: below this it is a constant one
 DEPTH_SWUNG = (0.20, 0.50)     # envelope swing: above this something is keying it
 SYLLABIC_VOICE = (0.35, 0.60)  # syllabic share of the modulation spectrum
+SYLLABIC_KEYED = (0.45, 0.75)  # ...and the sharper reading of the same number that
+                               # stands in for width where there is no width to be
+                               # had: below it something is being keyed, above it
+                               # somebody is talking
 PEAKY = (0.45, 0.80)           # share of the excess energy in the strongest point
 BIMODAL = (0.35, 0.65)         # 1 - the share of frames caught between on and off
 DUTY_ON = (0.10, 0.25)         # keying that is never off, or never on, is not keying
@@ -54,7 +67,11 @@ CREST_IMPULSE = (4.0, 10.0)    # loudest frame over the average one: a crash, a 
 OCCUPANCY_HERE = (0.10, 0.30)  # how much of the window's time anything was there
 FLOOR_TRACK = (0.35, 0.70)     # correlation with the whole band's floor: weather
 
-BW_THRESHOLD = 0.25            # a point counts as occupied at a quarter of the peak
+RESOLVED_POINTS = (3.5, 5.0)   # map points across one window: fewer than this
+                               # and no width verdict has been earned at all
+
+BW_ENERGY_FRAC = 0.90          # the share of a window's excess energy its
+                               # occupied width has to account for
 
 
 def _ramp(x, bounds):
@@ -102,8 +119,18 @@ def features(W, floor, mean_points, snr_db, depth, syllabic, occupancy,
     fc = np.where(den > 1e-12, np.mean(a * f[:, None], axis=0) / np.maximum(den, 1e-12), 0.0)
 
     # Occupied width INSIDE the window, from the mean spectrum: how many of the
-    # window's own points carry a quarter of its strongest point's excess over
-    # the floor. A carrier is one point; phone is ten or eleven.
+    # window's own points, strongest first, it takes to account for
+    # BW_ENERGY_FRAC of the window's excess over the floor. A carrier is one
+    # point; phone is five or six.
+    #
+    # Counting instead the points within some decibels of the strongest one --
+    # which is what this did until 2026-09-03 -- measures a tone correctly and
+    # speech not at all: the long-term average spectrum of an SSB signal falls
+    # 15-20 dB from its strongest formant region to the top of the passband, so
+    # a -6 dB width of real phone comes out 500-1000 Hz, narrower than the
+    # NARROW_HZ a keyed tone is supposed to own, and every conversation on the
+    # band was called "cw". A share of the ENERGY is the same number for a tone
+    # (one point) and honest for a sloped spectrum (five or six).
     floor_level = float(np.mean(np.asarray(floor, dtype=np.float64)))
     p = np.asarray(mean_points, dtype=np.float64)
     seg = np.lib.stride_tricks.sliding_window_view(p, win)[::window_step]
@@ -113,13 +140,18 @@ def features(W, floor, mean_points, snr_db, depth, syllabic, occupancy,
     exc = np.maximum(seg - floor_level, 0.0)
     peak = np.max(exc, axis=1)
     total = np.sum(exc, axis=1)
-    occupied = np.sum(exc > BW_THRESHOLD * peak[:, None], axis=1)
-    bw_hz = np.where(peak > 0.0, occupied * step_hz, 0.0)
+    ranked = np.cumsum(np.sort(exc, axis=1)[:, ::-1], axis=1)
+    occupied = np.sum(ranked < BW_ENERGY_FRAC * total[:, None], axis=1) + 1
+    bw_hz = np.where(total > 0.0, occupied * step_hz, 0.0)
     peak_frac = np.where(total > 0.0, peak / np.maximum(total, 1e-30), 0.0)
 
     return {
         "bw_hz": bw_hz,
         "filled": bw_hz / max(win * step_hz, 1e-9),
+        # how much of a width verdict this map has earned here: a window only
+        # three points across cannot tell a tone from a conversation by shape
+        "resolved": float(_ramp(win, RESOLVED_POINTS)),
+        "step_hz": float(step_hz),
         "peak_frac": peak_frac,
         "depth": depth,
         "syllabic": np.asarray(syllabic, dtype=np.float64),
@@ -133,12 +165,23 @@ def scores(feat):
     """A 0..1 verdict per kind. They do not sum to one; the winner takes it."""
     present = _ramp(feat["snr_db"], PRESENT_DB)
     absent = 1.0 - present
-    narrow = 1.0 - _ramp(feat["bw_hz"], NARROW_HZ)
-    wide = _ramp(feat["bw_hz"], WIDE_HZ)
+    syl = _ramp(feat["syllabic"], SYLLABIC_VOICE)
+    # Where the map is fine enough, width says which of a tone and a
+    # conversation this is. Where it is not -- a 2 MHz span puts three
+    # kilohertz-wide points across the whole window, and a keyed tone and a
+    # phone signal both land on two of them -- the width terms stand aside
+    # and the envelope's own modulation carries the verdict instead, rather
+    # than a measurement that cannot separate them casting a vote anyway.
+    res = np.asarray(feat.get("resolved", 1.0), dtype=np.float64)
+    step = float(feat.get("step_hz", 0.0))
+    narrow_hz = tuple(max(a, b * step) for a, b in zip(NARROW_HZ, NARROW_POINTS))
+    wide_hz = tuple(max(a, b * step) for a, b in zip(WIDE_HZ, WIDE_POINTS))
+    spoken = _ramp(feat["syllabic"], SYLLABIC_KEYED)
+    narrow = res * (1.0 - _ramp(feat["bw_hz"], narrow_hz)) + (1.0 - res) * (1.0 - spoken)
+    wide = res * _ramp(feat["bw_hz"], wide_hz) + (1.0 - res) * spoken
     filled = _ramp(feat["filled"], FILLED_FRAC)
     steady = 1.0 - _ramp(feat["depth"], DEPTH_STEADY)
     swung = _ramp(feat["depth"], DEPTH_SWUNG)
-    syl = _ramp(feat["syllabic"], SYLLABIC_VOICE)
     peaky = _ramp(feat["peak_frac"], PEAKY)
     # keying is a swing that is nearly all on or all off, and that is sometimes
     # both: a tone left down for the whole window is a carrier, not a station
@@ -173,7 +216,9 @@ def classify(W, floor, mean_points, snr_db, depth, syllabic, occupancy,
     s = scores(features(W, floor, mean_points, snr_db, depth, syllabic, occupancy,
                         win, window_step, step_hz))
     S = np.stack([np.asarray(s[k], dtype=np.float64) for k in KINDS])
-    code = np.argmax(S, axis=0).astype(np.int8)
     ranked = np.sort(S, axis=0)
+    # a window nothing scored at all is not the first kind in KINDS, it is the
+    # last one: argmax has to answer something even when every verdict is zero
+    code = np.where(ranked[-1] > 0.0, np.argmax(S, axis=0), NOISE).astype(np.int8)
     conf = np.clip(ranked[-1] - 0.5 * ranked[-2], 0.0, 1.0)
     return code, conf.astype(np.float32)

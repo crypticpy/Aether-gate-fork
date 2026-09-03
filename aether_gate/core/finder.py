@@ -41,7 +41,19 @@ from . import kinds
 SPATIAL_TC_S = 0.25
 SPATIAL_POINTS = 512
 
-FAST_FRAMES = 256            # ~8.5 s of frames at the reader's ~30 frames/s
+FAST_FRAMES = 256            # slots of SLOT_S: ~8.5 s of modulation history
+SLOT_S = 0.030               # frames are averaged into slots at least this
+                             # long before the modulation analysis sees them.
+                             # The reader hands the finder one frame per raw
+                             # block, so frames arrive at rate/CHUNK a second
+                             # -- 30 a second at 125 kS/s, but 500 a second at
+                             # 2.04 MS/s, where 256 raw frames would be half a
+                             # second of history and SYLLABIC_HZ (2-8 Hz) would
+                             # have no resolution to be measured in at all. A
+                             # slot is a frame at 62.5 k and 125 kS/s (32.8 ms
+                             # and 65.5 ms, the spans this was calibrated on)
+                             # and a group of frames above that, so the ring is
+                             # ~8.5 s of syllables at every span.
 SLOW_ROWS = 600              # one scored row per second: ten minutes
 SLOW_PERIOD_S = 1.0
 VOICE_WIDTH_HZ = 2700.0
@@ -176,21 +188,25 @@ class LiveSpatial:
         }
 
 
-POINTS_REFERENCE_HZ = 500_000.0  # up to this span SPATIAL_POINTS already keeps a
-                                  # voice window near VOICE_WIDTH_HZ (measured
-                                  # 2026-09-03: 2686-2930 Hz from 62.5 k to 500 kS/s).
-                                  # Held fixed past it, the window would blow out to
-                                  # 5.9 kHz at 1.02 MS/s and 12 kHz at 2.04 MS/s --
-                                  # 2-4x VOICE_WIDTH_HZ, since step_hz = rate/512
-                                  # keeps growing with the span while the window
-                                  # floors at 3 points. Scaling points with the span
-                                  # above the reference (capped at nbins, the raw FFT's
-                                  # own resolution) keeps the window close to
-                                  # VOICE_WIDTH_HZ at every span the RSPduo offers.
+WINDOW_POINTS_TARGET = 11    # map points across one voice window: what 125 kS/s
+                             # (VOICE_WIDTH_HZ / (125e3 / 512)) gives, and what
+                             # every width threshold in kinds.py is calibrated
+                             # against. Holding SPATIAL_POINTS = 512 fixed instead
+                             # let step_hz grow with the span: the window blew out
+                             # to 5.9 kHz at 1.02 MS/s and 12 kHz at 2.04 MS/s, and
+                             # even where its total width was right (250-500 kS/s)
+                             # it was only 3-6 points across -- too coarse to tell a
+                             # keyed tone from a conversation by shape. Points are
+                             # therefore scaled to hold the spacing near
+                             # VOICE_WIDTH_HZ / WINDOW_POINTS_TARGET, floored at
+                             # SPATIAL_POINTS and capped at nbins: the raw FFT's own
+                             # resolution, which is what runs out at 1.02 and
+                             # 2.04 MS/s and cannot be bought back here.
+POINT_HZ_TARGET = VOICE_WIDTH_HZ / WINDOW_POINTS_TARGET
 
 
 def _default_points(rate_hz, nbins):
-    scaled = int(round(SPATIAL_POINTS * float(rate_hz) / POINTS_REFERENCE_HZ))
+    scaled = int(round(float(rate_hz) / POINT_HZ_TARGET))
     return max(SPATIAL_POINTS, min(int(nbins), scaled))
 
 
@@ -214,6 +230,9 @@ class Finder:
         self.fast = np.zeros((FAST_FRAMES, 2, self.points), dtype=np.float32)
         self.fast_i = 0
         self.fast_n = 0
+        self.slot = np.zeros((2, self.points), dtype=np.float64)   # part-built slot
+        self.slot_s = 0.0
+        self.slot_frames = 0
         self.frame_s = None
         self.elapsed = 0.0
         self._since_slow = 0.0
@@ -253,6 +272,7 @@ class Finder:
             self._reset_history()
             return
         self.fast = _shift_bins(self.fast, point_shift, 0.0)
+        self.slot = _shift_bins(self.slot, point_shift, 0.0)
         self.slow = _shift_bins(self.slow, window_shift, 0.0)
         self.slow_terms = _shift_bins(self.slow_terms, window_shift, 0.0)
         self.slow_kind = _shift_bins(self.slow_kind, window_shift, kinds.NOISE)
@@ -276,13 +296,24 @@ class Finder:
     def update(self, X, frame_s):
         pa = _decimate(np.abs(np.asarray(X[0])) ** 2, self._order, self.points)
         pb = _decimate(np.abs(np.asarray(X[1])) ** 2, self._order, self.points)
-        self.fast[self.fast_i, 0] = pa
-        self.fast[self.fast_i, 1] = pb
-        self.fast_i = (self.fast_i + 1) % FAST_FRAMES
-        self.fast_n = min(self.fast_n + 1, FAST_FRAMES)
-        self.frame_s = frame_s if self.frame_s is None else self.frame_s + 0.05 * (frame_s - self.frame_s)
         self.elapsed += frame_s
         self._since_slow += frame_s
+        # frames go into the ring a slot at a time, so "a row of the ring" is
+        # the same length of TIME at every span (see SLOT_S)
+        self.slot[0] += pa
+        self.slot[1] += pb
+        self.slot_s += frame_s
+        self.slot_frames += 1
+        if self.slot_s < SLOT_S:
+            return
+        self.fast[self.fast_i] = self.slot / self.slot_frames
+        self.fast_i = (self.fast_i + 1) % FAST_FRAMES
+        self.fast_n = min(self.fast_n + 1, FAST_FRAMES)
+        slot_s = self.slot_s
+        self.frame_s = slot_s if self.frame_s is None else self.frame_s + 0.05 * (slot_s - self.frame_s)
+        self.slot[:] = 0.0
+        self.slot_s = 0.0
+        self.slot_frames = 0
         if self._since_slow >= SLOW_PERIOD_S and self.fast_n >= FAST_FRAMES // 2:
             self._since_slow = 0.0
             self._analyse()

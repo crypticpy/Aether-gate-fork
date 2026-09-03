@@ -120,7 +120,11 @@ def test_a_rate_change_still_rebuilds_the_map_the_live_rows_and_the_finder():
     _feed_scene(st, rng, 1, [])
     assert st.map is not first_map and st.map.frames == 1
     assert st.live is not first_live
-    assert st.finder is not first_finder and st.finder.fast_n == 1
+    assert st.finder is not first_finder
+    # the finder counts SLOTS, not frames (core/finder.py SLOT_S): at twice
+    # the span a block is half a slot long, so the frame is accepted and
+    # accumulated but the ring has not gained a row from it yet
+    assert st.finder.fast_n == 0 and st.finder.elapsed == pytest.approx(BLOCK / (RATE * 2))
 
 
 def test_sources_list_a_coherent_noise_source_at_its_frequency():

@@ -163,7 +163,12 @@ def _voice_scene_frames(rng, n_frames, rate, offset_hz, phase_deg=50.0, ratio_db
         t += frame_s
 
 
-FRAME_TARGET_S = 3.0   # real seconds of scene fed per (rate, centre) below
+FRAME_TARGET_S = 5.0   # real seconds of scene fed per (rate, centre) below.
+                       # The finder scores nothing until its ring holds
+                       # FAST_FRAMES // 2 SLOTS of SLOT_S (core/finder.py), which
+                       # is ~4.2 s of band at every span -- frames alone are not
+                       # enough above 125 kS/s, where they arrive far faster than
+                       # syllables happen.
 
 
 def _finder_spatial_case(rate, center, seed):

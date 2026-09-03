@@ -13,10 +13,14 @@ it is.
 
 Run:  python -m pytest aether_gate/tests/test_kinds.py
 """
+import math
+import os
+
 import numpy as np
+import pytest
 
 from aether_gate.core import kinds
-from aether_gate.core.finder import Finder, WINDOW_STEP_POINTS
+from aether_gate.core.finder import FAST_FRAMES, Finder, SLOT_S, WINDOW_STEP_POINTS
 
 NBINS = 2048
 RATE = 125_000.0
@@ -166,3 +170,227 @@ def test_the_verdict_survives_a_map_shorter_than_the_windows_expect():
                                 win, WINDOW_STEP_POINTS, 244.0)
     assert code.shape == conf.shape == (nwin,)
     assert all(kinds.name(c) == "noise" for c in code)       # nothing over the floor
+
+
+# =========================================================================
+# The grid the 2026-09-03 defect was found and fixed against
+# =========================================================================
+# Honest CW and honest SSB voice at every span and every workable SNR.
+#
+# The five cases above build their voice out of a FLAT patch of band noise,
+# which is the one shape the old occupied-width measure got right: it counted
+# the points within 6 dB of the window's strongest one, and a flat patch is all
+# of them. A real SSB signal is not flat -- its long-term spectrum falls 15-20
+# dB from the strongest formant region to the top of the passband -- so that
+# measure read real phone as 500-1000 Hz wide, narrower than a keyed tone is
+# supposed to be, and on 2026-09-03 every conversation on 80 m and 40 m came
+# back from the live gate as "cw" at a high score. See kinds.py BW_ENERGY_FRAC.
+#
+# So the signals below are built the way the band builds them: a keyed tone
+# sending random Morse at 25 wpm with raised-cosine edges, and an SSB patch with
+# a -6 dB/octave tilt on it and a jittered syllabic gate. They are fed at all six
+# RSPduo spans, because a defect that only shows at one resolution is a defect
+# nobody finds.
+GRID_RATES_HZ = (62_500.0, 125_000.0, 250_000.0, 500_000.0, 1_020_000.0, 2_040_000.0)
+GRID_SNR_DB = (3.0, 6.0, 10.0, 20.0)
+CHUNK = 4096                     # adapters/soapy.py's raw block read length
+GRID_S = 0.001                   # envelope grid, finer than any keying edge
+VOICE_LO_HZ, VOICE_HI_HZ = 300.0, 2700.0
+TILT_DB_PER_OCT = -6.0           # an SSB signal's long-term spectrum above the knee
+TILT_KNEE_HZ = 500.0
+GATE_FLOOR = 0.01                # 20 dB down between syllables, between elements
+SYLLABLE_HZ = 4.0
+SYLLABLE_DUTY = 0.40             # a talker holds the frequency 40% of the time
+WPM = 25.0
+RISE_S = 0.005                   # keying edge: ~200 Hz of sidebands, no clicks
+MORSE = {"a": ".-", "b": "-...", "c": "-.-.", "d": "-..", "e": ".", "f": "..-.",
+         "g": "--.", "h": "....", "i": "..", "j": ".---", "k": "-.-", "l": ".-..",
+         "m": "--", "n": "-.", "o": "---", "p": ".--.", "q": "--.-", "r": ".-.",
+         "s": "...", "t": "-", "u": "..-", "v": "...-", "w": ".--", "x": "-..-",
+         "y": "-.--", "z": "--..", "0": "-----", "1": ".----", "2": "..---",
+         "3": "...--", "4": "....-", "5": ".....", "6": "-....", "7": "--...",
+         "8": "---..", "9": "----."}
+ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+
+def _smooth(g, seconds):
+    k = max(3, int(round(seconds / GRID_S)) | 1)
+    w = np.hanning(k)
+    return np.convolve(g, w / w.sum(), mode="same")
+
+
+def _syllabic_envelope(rng, total_s):
+    """Speech's own envelope on a 1 ms grid: on SYLLABLE_DUTY of the time at
+    SYLLABLE_HZ, the syllable length jittered so it is a talker and not a
+    metronome, 20 dB down in between."""
+    g = np.full(int(math.ceil(total_s / GRID_S)) + 1, GATE_FLOOR)
+    t = 0.0
+    while t < total_s:
+        period = float(rng.uniform(0.7, 1.3)) / SYLLABLE_HZ
+        g[int(t / GRID_S):int(min(total_s, t + period * SYLLABLE_DUTY) / GRID_S)] = 1.0
+        t += period
+    return _smooth(g, 0.030)               # a syllable does not start in a microsecond
+
+
+def _keyed_envelope(rng, total_s):
+    """A keyed envelope on the same grid: random Morse at WPM (PARIS timing),
+    proper element/character/word spacing, RISE_S edges."""
+    g = np.full(int(math.ceil(total_s / GRID_S)) + 1, GATE_FLOOR)
+    dot = 1.2 / WPM
+    t = 0.0
+    while t < total_s:
+        for el in MORSE[ALPHABET[int(rng.integers(len(ALPHABET)))]]:
+            on = (3 if el == "-" else 1) * dot
+            g[int(t / GRID_S):int(min(total_s, t + on) / GRID_S)] = 1.0
+            t += on + dot                                  # inter-element space
+        t += 2 * dot                                       # inter-character space
+        if rng.random() < 0.2:
+            t += 4 * dot                                   # word space
+    return _smooth(g, RISE_S)
+
+
+def _tilt(f_audio):
+    """Relative POWER of an SSB signal's long-term spectrum at f_audio."""
+    octaves = np.log2(np.maximum(np.maximum(f_audio, 1.0) / TILT_KNEE_HZ, 1.0))
+    return 10.0 ** (TILT_DB_PER_OCT * octaves / 10.0)
+
+
+def _grid_scene(rng, rate, n_frames, kind, offset_hz, tilt=True):
+    """Yield (Xn, Xs) per frame: the (2, NBINS) noise spectrum pair and the
+    unit-power signal spectrum pair, Hann-windowed and transformed exactly as
+    adapters/diversity_state._map_update does it. The caller adds amp * Xs to
+    Xn to set the SNR, which the FFT's linearity makes identical to having
+    summed the two in the time domain -- and lets one pass over the scene feed
+    a Finder per SNR."""
+    total_s = n_frames * CHUNK / rate + NBINS / rate
+    grid_t = np.arange(int(math.ceil(total_s / GRID_S)) + 1) * GRID_S
+    env = (_keyed_envelope(rng, total_s) if kind == "cw"
+           else _syllabic_envelope(rng, total_s))
+    norm = math.sqrt(float(np.mean(env)))       # unit mean power over the run
+    w = np.hanning(NBINS)
+    f = np.fft.fftfreq(NBINS, 1.0 / rate)
+    aud = offset_hz - f                         # LSB: the audio sits below the carrier
+    sel = (aud >= VOICE_LO_HZ) & (aud <= VOICE_HI_HZ)
+    mask = np.zeros(NBINS)
+    mask[sel] = _tilt(aud[sel]) if tilt else 1.0
+    mask *= NBINS / max(float(mask.sum()), 1e-30)
+    root = np.sqrt(mask)
+    for i in range(n_frames):
+        t = (i * CHUNK + np.arange(NBINS)) / rate
+        e = np.interp(t, grid_t, env)
+        Xn = np.fft.fft(np.stack([
+            (rng.normal(size=NBINS) + 1j * rng.normal(size=NBINS)) / math.sqrt(2) * w
+            for _ in range(2)]), axis=1)
+        if kind == "cw":
+            s = np.sqrt(e) * np.exp(2j * np.pi * offset_hz * t) / norm
+        else:
+            u = (rng.normal(size=NBINS) + 1j * rng.normal(size=NBINS)) / math.sqrt(2)
+            s = np.fft.ifft(np.fft.fft(u) * root) * np.sqrt(e) / norm
+        yield Xn, np.fft.fft(np.stack([s, s]) * w, axis=1)
+
+
+_GRID_CACHE = {}
+
+
+def _grid(rate, kind, tilt=True, seed=11):
+    """(kind name, confidence, measured snr_db) per GRID_SNR_DB, from ONE pass
+    over the scene feeding one Finder per SNR."""
+    key = (rate, kind, tilt, seed)
+    if key in _GRID_CACHE:
+        return _GRID_CACHE[key]
+    frame_s = CHUNK / rate
+    # enough frames to fill the ring past the finder's own gate at every span
+    per_slot = max(1, int(math.ceil(SLOT_S / frame_s)))
+    n_frames = (FAST_FRAMES // 2 + 8) * per_slot
+    offset = 0.20 * rate / 2                    # inside the span, clear of DC and the edge
+    fds = [Finder(NBINS, rate) for _ in GRID_SNR_DB]
+    win_hz = fds[0].win * fds[0].step_hz
+    amps = [math.sqrt(10.0 ** (s / 10.0) * win_hz / rate) for s in GRID_SNR_DB]
+    rng = np.random.default_rng(seed)
+    for Xn, Xs in _grid_scene(rng, rate, n_frames, kind, offset, tilt=tilt):
+        for fd, a in zip(fds, amps):
+            fd.update(Xn + a * Xs, frame_s)
+    out = []
+    for fd in fds:
+        assert fd._last is not None, f"the finder never scored at rate={rate}"
+        point = (offset + rate / 2) / fd.step_hz - 0.5
+        mid = int(round((point - fd.win / 2.0) / WINDOW_STEP_POINTS))
+        lo, hi = max(0, mid - 4), min(fd.nwin, mid + 5)
+        w = lo + int(np.argmax(fd._last["snr_db"][lo:hi]))
+        code, conf = fd.window_kinds()
+        out.append((kinds.name(code[w]), float(conf[w]), float(fd._last["snr_db"][w])))
+    _GRID_CACHE[key] = out
+    return out
+
+
+@pytest.mark.parametrize("snr_db", GRID_SNR_DB, ids=lambda s: f"{s:.0f}dB")
+@pytest.mark.parametrize("rate", GRID_RATES_HZ, ids=lambda r: f"{r / 1e3:.0f}k")
+def test_a_real_ssb_signal_is_voice_at_every_span_and_snr(rate, snr_db):
+    """The defect this grid exists for: at 5-8 dB on 80 m every talker came
+    back "cw". A sloped SSB spectrum must be voice at every span."""
+    i = GRID_SNR_DB.index(snr_db)
+    kind, conf, meas = _grid(rate, "voice")[i]
+    assert kind == "voice", (rate, snr_db, kind, conf, meas)
+    assert meas == pytest.approx(snr_db, abs=2.5), (rate, snr_db, meas)
+
+
+@pytest.mark.parametrize("snr_db", GRID_SNR_DB, ids=lambda s: f"{s:.0f}dB")
+@pytest.mark.parametrize("rate", GRID_RATES_HZ, ids=lambda r: f"{r / 1e3:.0f}k")
+def test_a_keyed_tone_is_cw_and_never_voice_at_every_span_and_snr(rate, snr_db):
+    """And the other way round, which the fix must not buy with the first:
+    25 wpm Morse is never somebody talking."""
+    i = GRID_SNR_DB.index(snr_db)
+    kind, conf, meas = _grid(rate, "cw")[i]
+    assert kind == "cw", (rate, snr_db, kind, conf, meas)
+    assert meas == pytest.approx(snr_db, abs=2.5), (rate, snr_db, meas)
+
+
+@pytest.mark.parametrize("rate", GRID_RATES_HZ, ids=lambda r: f"{r / 1e3:.0f}k")
+def test_a_flat_ssb_patch_is_still_voice_at_every_span(rate):
+    """The untilted patch the older cases in this file use, at every span:
+    the width measure had to change to see a real signal, and it must not
+    have stopped seeing the ideal one."""
+    for snr_db, (kind, conf, _meas) in zip(GRID_SNR_DB, _grid(rate, "voice", tilt=False)):
+        assert kind == "voice", (rate, snr_db, kind, conf)
+
+
+# =========================================================================
+# ...and the same question put to the band itself
+# =========================================================================
+CAPTURE_DIR = os.path.expanduser("~/aether-gate-captures")
+# 6 s of 80 m phone (3.828-3.954 MHz) recorded 2026-09-02, four talkers in it
+# and no CW: the recording the "everything is cw" report was reproduced on.
+PHONE_CAPTURE = "20260902-231538_3891250Hz_125000sps.npz"
+
+
+def _replay(path):
+    """A capture from adapters/diversity_state's /diversity/capture through a
+    Finder, framed exactly as _map_update frames the live reader."""
+    d = np.load(path)
+    a, b, lag = d["a"], d["b"], int(d["lag_samples"])
+    if lag > 0:
+        a, b = a[lag:], b[:len(b) - lag]
+    elif lag < 0:
+        a, b = a[:len(a) + lag], b[-lag:]
+    rate = float(d["rate_hz"])
+    fd = Finder(NBINS, rate)
+    w = np.hanning(NBINS)
+    for i in range(0, min(len(a), len(b)) - CHUNK + 1, CHUNK):
+        fd.update(np.fft.fft(np.stack([a[i:i + NBINS], b[i:i + NBINS]]) * w, axis=1),
+                  CHUNK / rate)
+    return fd, float(d["center_hz"])
+
+
+@pytest.mark.skipif(not os.path.exists(os.path.join(CAPTURE_DIR, PHONE_CAPTURE)),
+                    reason=f"no {PHONE_CAPTURE} under {CAPTURE_DIR}")
+def test_a_recorded_stretch_of_80m_phone_is_called_voice():
+    """Off-air, not synthesised. Every candidate the finder raises on this
+    recording is a talker in the 80 m phone band; before the width measure
+    changed it called all four of them "cw" at 0.6-1.0 confidence."""
+    fd, center = _replay(os.path.join(CAPTURE_DIR, PHONE_CAPTURE))
+    out = fd.candidates(center)
+    assert out["available"], out
+    cands = out["candidates"]
+    assert len(cands) >= 3, cands
+    assert all(3_700_000 <= c["hz"] <= 4_000_000 for c in cands), cands
+    assert [c["kind"] for c in cands] == ["voice"] * len(cands), cands
