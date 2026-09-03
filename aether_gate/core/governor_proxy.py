@@ -157,7 +157,11 @@ def _squeeze(kind, snap, after, rise):
     want = NOTCH_DEPTH_KEEP_DB if name == "notch" else NULL_DEPTH_KEEP_DB
     depth = after["depth_db"]
     if depth is None:
-        return False, f"squeeze put back: no {name} held on the {kind} {TAIL}"
+        sq = snap.get("squeeze") or {}
+        if not sq.get("held"):
+            reason = sq.get("reason") or "never took hold"
+            return False, f"squeeze put back: {reason} on the {kind} {TAIL}"
+        return False, f"squeeze put back: no {name} depth measured on the {kind} {TAIL}"
     if depth < want:
         return False, (f"squeeze put back: {depth:.1f} dB of {name} depth on the "
                        f"{kind}, under {want:g} {TAIL}")

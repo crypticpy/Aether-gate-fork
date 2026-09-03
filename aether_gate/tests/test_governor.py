@@ -370,6 +370,36 @@ def test_a_squeeze_with_no_talker_is_kept_on_its_own_measured_depth():
     assert g.status()["holding"][0]["scorer"] == "proxy:depth"
 
 
+def test_a_squeeze_is_given_time_to_take_hold_and_scored_the_moment_it_does():
+    # on air the comb squeeze was scored at 2 s, before its detector had even
+    # read the band, and put back as "no null held on the mains"
+    assert G.SQUEEZE_SETTLE_S == 8.0
+    g = gov()
+    run(g, snap(0.0, objective=None, coherence=0.6,
+                carriers=[{"hz": 1200.0, "db": 20.0}]))
+    not_yet = {"held": False, "tool": None, "depth_db": None, "configured": True,
+               "hz": 1200.0, "reason": None}
+    assert g.tick(snap(3.0, objective=None, coherence=0.6, squeeze=not_yet)) == []
+    assert g.state == "settling" and "take hold" in g.why
+    held = {"held": True, "tool": "null", "depth_db": 12.0, "configured": True,
+            "hz": 1200.0, "reason": None}
+    assert g.tick(snap(5.0, objective=None, coherence=0.6, squeeze=held)) == []
+    assert g.events[-1]["result"] == "kept" and "12.0 dB of null depth" in g.events[-1]["why"]
+
+
+def test_a_squeeze_that_never_takes_hold_is_put_back_with_its_own_reason():
+    g = gov()
+    run(g, snap(0.0, objective=None, coherence=0.6,
+                carriers=[{"hz": 1200.0, "db": 20.0}]))
+    refused = {"held": False, "tool": None, "depth_db": None, "configured": True,
+               "hz": 1200.0, "reason": "too weak"}
+    assert g.tick(snap(7.9, objective=None, coherence=0.6, squeeze=refused)) == []
+    acts = g.tick(snap(8.1, objective=None, coherence=0.6, squeeze=refused))
+    assert acts[0]["revert"] is True
+    assert g.events[-1]["result"] == "undone"
+    assert "too weak on the carrier" in g.events[-1]["why"]
+
+
 def test_a_shallow_null_is_put_back_and_a_notch_is_asked_for_more():
     g = gov()
     acts = _squeeze_move(g, 3.1)                     # under NULL_DEPTH_KEEP_DB

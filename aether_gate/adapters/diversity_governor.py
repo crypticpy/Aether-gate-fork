@@ -205,6 +205,7 @@ class GovernorRunner:
             "talking": bool(div.get("talking")),
             "squeeze": {
                 "held": bool(sq.get("held")), "tool": sq.get("tool"),
+                "reason": sq.get("reason"),
                 "depth_db": sq.get("depth_db"), "target": sq.get("target"),
                 "hz": sq.get("hz"),
                 # core.squeeze.Squeeze.active, from the status keys: a target is

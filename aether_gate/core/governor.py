@@ -63,6 +63,10 @@ _num = proxy._num                       # the adapter reads it through this name
 
 SETTLE_S = 2.0                  # after a move, before the objective is read again
 GUARD_SETTLE_S = 10.0           # ...but the guard steps the LNA on its own loop
+SQUEEZE_SETTLE_S = 8.0          # ...and a squeeze takes hold over blocks: the comb
+                                # detector alone wants ~2 s and retries; a proxy-
+                                # scored squeeze is read as soon as it is held,
+                                # and put back if it never is by this
 OPERATOR_GRACE_S = 60.0         # a knob the operator moved is theirs for this long
 BACKOFF_S = 300.0               # a (kind, tool) that hurt is not retried for this
 DIG_BACKOFF_S = 1800.0          # ...and a dig is a minute of knob-turning: half
@@ -193,8 +197,15 @@ class Governor:
         p = self.pending
         if p["tool"] == "dig":
             return self._resolve_dig(snap, now)
-        if now - p["t"] < (GUARD_SETTLE_S if p["tool"] == "guard" else self.settle_s):
-            self.state, self.why = "settling", f"{p['tool']}: measuring what it did"
+        settle = GUARD_SETTLE_S if p["tool"] == "guard" else self.settle_s
+        waiting = (p["tool"] == "squeeze" and p["scorer"] != "snr"
+                   and not (snap.get("squeeze") or {}).get("held"))
+        if waiting:
+            settle = SQUEEZE_SETTLE_S            # held: scored; not yet: wait for it
+        if now - p["t"] < settle:
+            self.state, self.why = "settling", (f"squeeze: waiting for it to take hold"
+                                                if waiting else
+                                                f"{p['tool']}: measuring what it did")
             return []
         if p["scorer"] != "snr":                     # no talker: its own proxy scores it
             keep, why = proxy.verdict(p["tool"], p["kind"], self._before, snap)
