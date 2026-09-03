@@ -256,5 +256,8 @@ class DigRunner:
                 "verdict": word, "best": r["best"], "changed": r["changed"],
                 "objective_before": r["objective_before"],
                 "objective_after": r["objective_after"],
+                "measured_best_db": r["measured_best_db"],
+                "margin_db": r["margin_db"], "unsteady": r["unsteady"],
+                "note": r["note"],
                 "seconds": int(self._seconds), "talker_id": self._talker_id,
                 "signal": self._kind, "steps": r["steps"]}

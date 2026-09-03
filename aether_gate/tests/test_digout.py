@@ -160,26 +160,56 @@ def test_a_tie_goes_to_the_setting_the_operator_already_had():
     assert all(st["delta_db"] == 0.0 and not st["kept"] for st in s.steps)
 
 
-def test_the_margin_is_the_spread_of_the_baseline_reads():
+class Jitter:
+    """A landscape that likes post v2 by `lift` dB, with one baseline read
+    knocked sideways by `noise` — a band moving under the measurement."""
+
+    def __init__(self, noise, lift=1.0):
+        self.n, self.noise, self.lift = 0, noise, lift
+
+    def __call__(self, cur):
+        self.n += 1
+        base = 10.0 + (self.lift if cur["post"] == "v2" else 0.0)
+        return base + (self.noise if self.n == 2 else 0.0)
+
+
+def test_the_margin_is_half_the_baseline_spread():
     """A jittery band has to be beaten by more than its own jitter."""
-    class Jitter:
-        def __init__(self, noise):
-            self.n, self.noise = 0, noise
-
-        def __call__(self, cur):
-            self.n += 1
-            base = 10.0 + (1.0 if cur["post"] == "v2" else 0.0)
-            return base + (self.noise if self.n == 2 else 0.0)
-
     quiet = digout.DigSearch(60)
     drive(quiet, Jitter(0.0))
     assert quiet.margin_db == digout.MIN_MARGIN_DB
+    assert quiet.baseline_spread_db == 0.0 and quiet.unsteady is False
+    assert quiet.note() is None
     assert quiet.steps[0]["knob"] == "post" and quiet.steps[0]["kept"]
 
     noisy = digout.DigSearch(60)
     drive(noisy, Jitter(3.0))
-    assert noisy.margin_db == pytest.approx(3.0)
-    assert not noisy.steps[0]["kept"]          # +1 dB does not clear a 3 dB spread
+    assert noisy.baseline_spread_db == pytest.approx(3.0)
+    assert noisy.margin_db == pytest.approx(1.5)      # half the range
+    assert not noisy.steps[0]["kept"]          # +1 dB does not clear 1.5 dB
+
+
+def test_an_unsteady_band_caps_the_margin_and_says_so():
+    """The 05:58 run on 80 m: three baseline reads 7.7 dB apart. The old
+    rule made the margin 7.7 and threw away a +4.8 dB win; the margin is now
+    capped, so post v2 is kept and the operator is told the ground moved."""
+    s = digout.DigSearch(60)
+    drive(s, Jitter(7.7, lift=4.79))
+    assert s.baseline_spread_db == pytest.approx(7.7)
+    assert s.margin_db == digout.MARGIN_MAX_DB == 2.0
+    assert s.unsteady is True
+    assert s.note() == "the band swung 7.7 dB while sampling; results are tentative"
+    assert s.steps[0]["knob"] == "post" and s.steps[0]["kept"]
+    assert s.gain_db == pytest.approx(4.79)
+    r = s.report()
+    assert r["unsteady"] is True and r["note"] and r["baseline_spread_db"] == 7.7
+
+
+def test_the_margin_is_never_wider_than_a_setting_could_clear():
+    for spread in (0.0, 2.0, 7.7, 40.0):
+        s = digout.DigSearch(60)
+        drive(s, Jitter(spread, lift=0.0))
+        assert digout.MIN_MARGIN_DB <= s.margin_db <= digout.MARGIN_MAX_DB
 
 
 def test_the_incumbent_follows_the_band_between_trials():
@@ -197,6 +227,11 @@ def test_the_incumbent_follows_the_band_between_trials():
     drive(s, Drift())
     assert s.incumbent == pytest.approx(15.0)
     assert not any(st["kept"] for st in s.steps)   # the lift is not credited to a knob
+    r = s.report()
+    # the band really did come up 5 dB, and the report says so - but the
+    # operator is holding none of it, so the gain is zero
+    assert r["objective_before"] == 10.0 and r["objective_after"] == 15.0
+    assert r["gain_db"] == 0.0 and r["changed"] == {}
 
 
 def test_the_run_stops_when_the_clock_runs_out_not_when_the_plan_does():
@@ -240,7 +275,9 @@ def test_the_report_carries_everything_the_panel_needs():
     r = s.report(48.0)
     for key in ("gain_db", "steps", "best", "started", "ends", "elapsed_s",
                 "phase", "objective_before", "objective_after", "margin_db",
-                "trials_planned", "trials_done", "changed", "kind", "seconds"):
+                "trials_planned", "trials_done", "changed", "kind", "seconds",
+                "measured_best_db", "measured_best", "baseline_spread_db",
+                "unsteady", "note"):
         assert key in r, key
     assert r["phase"] == "done" and r["started"] == 0.0 and r["ends"] == 60.0
     assert r["elapsed_s"] == 48.0
@@ -248,6 +285,43 @@ def test_the_report_carries_everything_the_panel_needs():
     assert set(step) == {"knob", "from", "to", "delta_db", "kept", "at_s"}
     assert step["knob"] == "post" and step["from"] is True and step["to"] == "v2"
     assert step["delta_db"] == pytest.approx(4.0) and step["kept"] is True
+
+
+def test_nothing_kept_is_a_zero_gain_and_the_near_miss_is_still_reported():
+    """8 trials, 8 reverts, changed {} - the gain the operator is holding is
+    zero. What nearly won is still on the report so the panel can say "post
+    v2 measured +1.5 dB but did not clear the 2.0 dB margin"."""
+    s = digout.DigSearch(60)
+    _trace, left, _t = drive(s, Jitter(7.7, lift=1.5))
+    r = s.report()
+    assert r["margin_db"] == 2.0                    # an unsteady band, capped
+    assert left == s.snapshot and r["changed"] == {}
+    assert not any(st["kept"] for st in r["steps"])
+    assert r["gain_db"] == 0.0
+    assert r["measured_best_db"] == pytest.approx(1.5)
+    assert r["measured_best"]["knob"] == "post"
+    assert r["measured_best"]["to"] == "v2"
+    assert r["measured_best"]["kept"] is False
+
+
+def test_the_gain_is_the_sum_of_the_kept_steps():
+    def landscape(cur):
+        return (10.0 + (4.0 if cur["post"] == "v2" else 0.0)
+                + (2.0 if cur["subband"] is False else 0.0))
+
+    s = digout.DigSearch(300)
+    drive(s, landscape)
+    r = s.report()
+    kept = [st["delta_db"] for st in r["steps"] if st["kept"]]
+    assert kept == [4.0, 2.0]
+    assert r["gain_db"] == pytest.approx(sum(kept)) == 6.0
+    assert r["measured_best_db"] == 4.0
+
+
+def test_an_empty_run_reports_no_near_miss_rather_than_crashing():
+    s = digout.DigSearch(60)
+    assert s.measured_best_db == 0.0 and s.measured_best is None
+    assert s.gain_db == 0.0 and s.report()["note"] is None
 
 
 def test_set_kwargs_speak_the_adapters_own_language():

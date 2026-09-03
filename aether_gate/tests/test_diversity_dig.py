@@ -35,6 +35,7 @@ class FakeAdapter:
         self.raise_on = raise_on            # a set_diversity kwarg that explodes
         self.s = dict(START)
         self.available = True
+        self.offset = 0.0                   # the band moving under a read
 
     # ---- what the runner reads ----
     def knobs(self):
@@ -47,7 +48,8 @@ class FakeAdapter:
         if not self.available:
             return {"available": False}
         return {"available": True, "channels": 2, "talking": False,
-                "snr_db": {"a": 1.0, "b": 1.0, "out": self.score(self.knobs())},
+                "snr_db": {"a": 1.0, "b": 1.0,
+                           "out": self.score(self.knobs()) + self.offset},
                 "passband": {"flatness": 0.0},
                 "post": {"enabled": self.s["post"] is not False,
                          "version": 2 if self.s["post"] == "v2" else 1},
@@ -101,6 +103,19 @@ class Clock:
 
     def now(self):
         return self.t
+
+
+class Bumpy(Clock):
+    """A clock that lifts the band by `offset` dB for the read after hold
+    number `at` — one unsteady baseline sample, on purpose."""
+
+    def __init__(self, adapter, at, offset):
+        super().__init__()
+        self.a, self.at, self.offset = adapter, at, offset
+
+    def sleep(self, seconds):
+        super().sleep(seconds)
+        self.a.offset = self.offset if self.holds == self.at else 0.0
 
 
 class Pacer(Clock):
@@ -187,8 +202,12 @@ def test_worse_puts_every_knob_back_where_it_was():
     assert rec["gain_db"] == pytest.approx(4.0) and rec["seconds"] == 180
     assert rec["objective_before"] == 10.0 and rec["objective_after"] == 14.0
     assert rec["talker_id"] == 7 and rec["signal"] == "voice"
+    assert rec["measured_best_db"] == pytest.approx(4.0)
+    assert rec["margin_db"] == 0.5 and rec["unsteady"] is False
+    assert rec["note"] is None
     assert set(rec) >= {"kind", "t", "gain_db", "verdict", "best",
-                        "objective_before", "objective_after", "seconds"}
+                        "objective_before", "objective_after", "seconds",
+                        "measured_best_db", "margin_db", "unsteady", "note"}
 
 
 def test_better_and_keep_both_leave_the_settings_alone():
@@ -369,3 +388,48 @@ def test_threads_do_not_outlive_the_run():
     _finish(r)
     assert not any(t.name == "diversity-dig" and t.is_alive()
                    for t in threading.enumerate())
+
+
+# ---- the band moving under the measurement ---------------------------------
+
+def test_an_unsteady_band_caps_the_margin_and_reaches_the_app_as_a_note():
+    """The 05:58 run on 80 m, end to end: the three baseline reads land
+    7.7 dB apart. The margin is capped at 2.0 rather than 7.7, so post v2's
+    +4.8 dB is kept instead of thrown away, and the operator is told the
+    ground was moving while we measured it."""
+    a = FakeAdapter(score=lambda s: 10.0 + (4.79 if s["post"] == "v2" else 0.0))
+    c = Bumpy(a, at=2, offset=7.7)
+    r = DigRunner(a, clock=c.now, sleep=c.sleep, wall=lambda: 1_700_000_000.0)
+    r.start(60)
+    st = _finish(r)
+    assert st["baseline_spread_db"] == pytest.approx(7.7)
+    assert st["margin_db"] == 2.0
+    assert st["unsteady"] is True
+    assert st["note"] == "the band swung 7.7 dB while sampling; results are tentative"
+    assert st["gain_db"] == pytest.approx(4.79)
+    assert st["changed"] == {"post": "v2"} and a.s["post"] == "v2"
+    rec = r.verdict("better")["record"]
+    assert rec["unsteady"] is True and rec["note"] == st["note"]
+    assert rec["measured_best_db"] == pytest.approx(4.79)
+
+
+def test_a_steady_band_says_nothing_and_takes_the_floor_margin():
+    a = FakeAdapter(score=_likes_v2)
+    r, _c = _runner(a)
+    r.start(60)
+    st = _finish(r)
+    assert st["unsteady"] is False and st["note"] is None
+    assert st["margin_db"] == 0.5 and st["baseline_spread_db"] == 0.0
+
+
+def test_a_run_that_keeps_nothing_holds_no_gain():
+    """Whatever the band did while we watched, the gain is what the operator
+    is holding: nothing kept, nothing changed, 0.0 dB."""
+    a = FakeAdapter(score=lambda s: 10.0)
+    c = Bumpy(a, at=2, offset=7.7)          # unsteady, so the margin is 2.0
+    r = DigRunner(a, clock=c.now, sleep=c.sleep, wall=lambda: 0.0)
+    r.start(60)
+    st = _finish(r)
+    assert st["gain_db"] == 0.0 and st["changed"] == {}
+    assert not any(step["kept"] for step in st["steps"])
+    assert a.s == START

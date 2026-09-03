@@ -27,24 +27,23 @@ THE OBJECTIVE (`objective`) is one float, higher is better, in dB:
 `snr_db.out` carries the term because it is the only SNR the chain reports
 the same way whichever post filter is running — `post.snr_out_db` exists
 only under post v2, so scoring with it would make "turn v2 on" look like a
-step change in the objective rather than a change in what we can hear. It is
-used only as a stand-in when `snr_db.out` is missing altogether.
+step change in the yardstick rather than in what we can hear. It stands in
+only when `snr_db.out` is missing altogether.
 
-`talk_mod` is the modulation depth of whoever is talking. SNR alone will
-happily reward a setting that makes a steady carrier louder; the syllabic
-term keeps the search pointed at speech. It is dropped when the finder says
-the candidate is CW or data, which have no syllabic content — that is what
-the finder is for here. Its own numbers are averaged over minutes of history
-and would smear across a three-second hold, so the search reads its VERDICT
-and never its levels.
+`talk_mod` is the modulation depth of whoever is talking: SNR alone would
+happily reward making a steady carrier louder, and the syllabic term keeps
+the search pointed at speech. It is dropped when the finder calls the
+candidate CW or data, which have no syllables. The finder's own levels are
+averaged over minutes and would smear across a three-second hold, so the
+search reads its VERDICT and never its numbers.
 
-`passband.flatness` (|sum S| / sum |S|, from core/passband.py) is 1.0 when a
-single weight fits the whole passband and falls when the combine is doing
-something different in every bin. The gate publishes no residual spectral
-flatness; this is the closest thing to it and it moves the right way.
+`passband.flatness` (|sum S| / sum |S|, core/passband.py) is 1.0 when one
+weight fits the whole passband and falls when the combine does something
+different in every bin. The gate publishes no residual spectral flatness;
+this is the nearest thing and it moves the right way.
 
-The blanker penalty exists so the search cannot win by turning the noise
-blanker into a gate — under 5% blanked is free, 30% costs the full 2 dB.
+The blanker penalty is a guard, not a reward: without it the search wins by
+gating the signal. Under 5% blanked is free, 30% costs the full 2 dB.
 
 THE SCHEDULE. Every hold is 3 s: the tracker, the sub-band model and the AGC
 all settle inside about 2.5 s, and the status numbers are running averages
@@ -58,22 +57,51 @@ back), one that is kept costs one, so the budget is planned at two:
                          second
     300 s -> 48 trials   three cycles
 
-The cycle repeats on purpose rather than stopping: the chain a knob is
-measured against has changed by the end of a pass, so one that lost early
-can win late, and on a five-minute run the band itself has moved.
+The cycle repeats rather than stopping: the chain a knob was measured
+against has changed by the end of a pass, so one that lost early can win
+late, and over five minutes the band itself has moved.
 
 THE A/B RULE. The run opens with three measurements of the settings the
 operator already had — that is both the baseline and the noise floor of the
-measurement. The margin is the spread of those three, never less than
-0.5 dB. A candidate is kept only when it beats the incumbent by the margin;
-a tie goes to the operator's setting. Every rejected trial is put back and
-re-measured, so the incumbent tracks the band's own drift rather than
-holding a number from four minutes ago.
+measurement. A candidate is kept only when it beats the incumbent by the
+margin; a tie goes to the operator's setting. Every rejected trial is put
+back and re-measured, so the incumbent tracks the band's own drift rather
+than holding a number from four minutes ago.
+
+The margin is HALF the range of those three reads, floored at 0.5 dB and
+CAPPED AT 2.0 dB. The cap is the part that matters, and it is there because
+of a real 60 s run on 80 m at 05:58: an unsteady band spread the baseline
+over 7.7 dB, the margin came out 7.7, and post v2 measuring +4.8 dB was
+thrown away with everything else — 8 trials, 8 reverts, nothing learned. A
+margin that wide is not caution, it is a run that cannot conclude anything.
+2 dB is the ceiling because 2 dB on a weak signal is about the smallest
+change an operator reliably hears, so asking for more is asking for more
+than they asked for. Half the range rather than all of it because the range
+of three samples is a spread, and half of it is the scale either side of the
+middle one.
+
+A band that swings more than UNSTEADY_DB while we measure it cannot be
+out-measured in three-second holds, so the run says so rather than pretend:
+`unsteady` goes true and `note` carries the sentence for the app to show.
+The run still goes ahead — tentative beats nothing — but the operator is
+told the ground was moving.
+
+WHAT THE GAIN MEANS. `gain_db` is the sum of the kept steps' deltas: the
+improvement the operator is actually holding, 0.0 when nothing was kept. It
+is deliberately NOT `objective_after - objective_before`, which on that same
+80 m run read +2.47 dB while `changed` was empty — the band drifting up
+under a search that had kept nothing, credited to knobs that never moved.
+Both raw numbers are still reported, drift and all; they just are not the
+gain. `measured_best_db` (and `measured_best`, which names the knob) is the
+best any one trial measured, kept or not, so the report can say "post v2
+measured +4.8 dB but did not clear the margin".
 """
 
 HOLD_S = 3.0                  # settle before every read
 SAMPLE_HOLDS = 3              # baseline reads before the search starts
 MIN_MARGIN_DB = 0.5           # a candidate must beat the incumbent by this
+MARGIN_MAX_DB = 2.0           # ... and never by more, however jumpy the band
+UNSTEADY_DB = 3.0             # baseline reads spread wider than this: say so
 TAIL_S = 3.0                  # slack kept back so a run ends on time
 
 WEIGHTS = {"talk": 3.0, "flat": 2.0, "blank": 2.0}
@@ -237,6 +265,8 @@ class DigSearch:
         self.current = {}
         self.baseline = self.incumbent = None
         self.margin_db = self.min_margin_db
+        self.baseline_spread_db = None
+        self.unsteady = False
         self.trials_planned = 0
         self.trials_done = 0
         self._plan = []
@@ -291,7 +321,13 @@ class DigSearch:
             if len(self._samples) >= self.sample_holds:
                 s = sorted(self._samples)
                 self.baseline = self.incumbent = s[len(s) // 2]
-                self.margin_db = round(max(self.min_margin_db, s[-1] - s[0]), 3)
+                self.baseline_spread_db = round(s[-1] - s[0], 3)
+                # half the range, floored and capped: a jumpy band must not
+                # set a margin no setting could ever clear (see the docstring)
+                self.margin_db = round(min(MARGIN_MAX_DB,
+                                           max(self.min_margin_db,
+                                               0.5 * (s[-1] - s[0]))), 3)
+                self.unsteady = self.baseline_spread_db > UNSTEADY_DB
                 self.phase = "searching"
         elif why == "revert":
             self.incumbent = value           # let the incumbent follow the band
@@ -338,9 +374,28 @@ class DigSearch:
 
     @property
     def gain_db(self):
-        if self.baseline is None or self.incumbent is None:
-            return 0.0
-        return round(self.incumbent - self.baseline, 2)
+        """The improvement being held: the kept steps and nothing else. Band
+        drift is measured (objective_before/after carry it) but never
+        credited to a knob that did not move."""
+        return round(sum(st["delta_db"] for st in self.steps if st["kept"]), 2)
+
+    @property
+    def measured_best_db(self):
+        """The best any one trial measured, kept or not — so the report can
+        say what nearly won and why it did not."""
+        return round(max((st["delta_db"] for st in self.steps), default=0.0), 2)
+
+    @property
+    def measured_best(self):
+        """...and which trial that was, so the sentence can name the knob."""
+        return max(self.steps, key=lambda st: st["delta_db"], default=None)
+
+    def note(self):
+        """One plain sentence for the panel, or nothing to say."""
+        if not self.unsteady:
+            return None
+        return (f"the band swung {self.baseline_spread_db:.1f} dB while "
+                "sampling; results are tentative")
 
     def changed(self):
         """The knobs that ended up somewhere other than where they started."""
@@ -362,7 +417,12 @@ class DigSearch:
             "elapsed_s": elapsed,
             "objective_before": self.baseline,
             "objective_after": self.incumbent,
+            "measured_best_db": self.measured_best_db,
+            "measured_best": self.measured_best,
             "margin_db": self.margin_db,
+            "baseline_spread_db": self.baseline_spread_db,
+            "unsteady": bool(self.unsteady),
+            "note": self.note(),
             "trials_planned": self.trials_planned,
             "trials_done": self.trials_done,
             "kind": self.kind,
