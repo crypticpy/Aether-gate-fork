@@ -40,38 +40,65 @@ NOISE = KINDS.index("noise")
 # window that sits between the two gets a partial verdict and a confidence to
 # match, because the band does not sort itself into five bins for us.
 PRESENT_DB = (1.0, 4.0)        # SNR over the band floor: is anything here at all
-NARROW_HZ = (500.0, 1100.0)    # occupied width: a tone, not a conversation
-WIDE_HZ = (700.0, 1400.0)      # occupied width: a conversation, not a tone --
-                               # measured 1.2-2.4 kHz on off-air 80 m and 40 m
-                               # phone with BW_ENERGY_FRAC below
-NARROW_POINTS = (2.0, 3.0)     # ...and never below what a tone itself measures:
-WIDE_POINTS = (2.5, 4.0)       # the Hann window spreads one over two map points,
-                               # so on a coarse map (500 Hz points at 1 MS/s,
-                               # 1 kHz at 2.04) the absolute pair above would
-                               # call a tone wide. Widths come out of features()
-                               # in whole points, so the bounds sit BETWEEN
-                               # counts rather than on one.
+NARROW_HZ = (900.0, 1400.0)    # occupied width: a tone, not a conversation.
+WIDE_HZ = (1100.0, 1800.0)     # occupied width: a conversation, not a tone.
+                               # Measured against DETECT_FLOOR_FRAC below: a
+                               # keyed tone at 25 wpm reads 330-1180 Hz across
+                               # the spans (its keying sidebands are real width
+                               # and grow with signal strength), off-air 80 m
+                               # and 40 m phone reads 1400-2700 Hz.
 FILLED_FRAC = (0.85, 0.98)     # share of the window's own width that is occupied
 DEPTH_STEADY = (0.12, 0.40)    # envelope swing: below this it is a constant one
 DEPTH_SWUNG = (0.20, 0.50)     # envelope swing: above this something is keying it
 SYLLABIC_VOICE = (0.35, 0.60)  # syllabic share of the modulation spectrum
-SYLLABIC_KEYED = (0.45, 0.75)  # ...and the sharper reading of the same number that
+SYLLABIC_KEYED = (0.50, 0.80)  # ...and the sharper reading of the same number that
                                # stands in for width where there is no width to be
                                # had: below it something is being keyed, above it
-                               # somebody is talking
+                               # somebody is talking. It only bites on the two
+                               # coarsest spans (1.02 and 2.04 MS/s, where a
+                               # window is 5 and 3 map points across and there is
+                               # no width verdict to be had); measured there over
+                               # four noise seeds and 3-20 dB, a keyed tone reads
+                               # 0.43-0.57 and phone reads 0.81-0.91, so the
+                               # crossing has to clear 0.57 -- at 0.60 a keyer
+                               # that noise has lifted to 0.57 reads as speech.
 PEAKY = (0.45, 0.80)           # share of the excess energy in the strongest point
-BIMODAL = (0.35, 0.65)         # 1 - the share of frames caught between on and off
-DUTY_ON = (0.10, 0.25)         # keying that is never off, or never on, is not keying
-DUTY_OFF = (0.80, 0.95)
+BIMODAL = (0.35, 0.65)         # 1 - the share of frames caught between on and
+                               # off. Loose on purpose: a keyed tone reads
+                               # 0.81-1.00 here at 6 dB and up, but only
+                               # 0.61-0.65 at 3 dB, where the noise fills the
+                               # gaps in. It is a guard against an envelope
+                               # that is continuously varied rather than
+                               # switched, not a keying detector.
+DUTY_ON = (0.10, 0.25)         # keying that is never off, or never on, is not
+DUTY_OFF = (0.70, 0.85)        # keying. PARIS timing is key-down half the time
+                               # within a character and less across words;
+                               # measured over the ring at 8-35 wpm and every
+                               # span it comes out 0.43-0.69, so a window
+                               # occupied more than about 70% of the time is
+                               # not being keyed by an operator -- it is a
+                               # signal that is simply on.
 CREST_IMPULSE = (4.0, 10.0)    # loudest frame over the average one: a crash, a spark
 OCCUPANCY_HERE = (0.10, 0.30)  # how much of the window's time anything was there
 FLOOR_TRACK = (0.35, 0.70)     # correlation with the whole band's floor: weather
 
-RESOLVED_POINTS = (3.5, 5.0)   # map points across one window: fewer than this
-                               # and no width verdict has been earned at all
+RESOLVED_POINTS = (5.0, 8.0)   # map points across one window: fewer than this
+                               # and no width verdict has been earned at all.
+                               # Measured: at five points (1.02 MS/s) a keyed
+                               # tone occupies 1.5-2.0 kHz of them and phone
+                               # 2.0 kHz; at three (2.04 MS/s) both fill the
+                               # window. The map cannot tell them apart there
+                               # and must not pretend to.
 
 BW_ENERGY_FRAC = 0.90          # the share of a window's excess energy its
-                               # occupied width has to account for
+                               # ENERGY width has to account for -- the width
+                               # `filled` is measured with, which asks where a
+                               # signal's bulk sits, not how far it reaches
+DETECT_FLOOR_FRAC = 0.5        # ...and the level, as a fraction of the band's
+                               # own floor, at which a point counts as OCCUPIED
+                               # for the narrow/wide verdict: 1.8 dB over the
+                               # floor, which 256 averaged slots resolve
+                               # comfortably against the floor's own scatter
 
 
 def _ramp(x, bounds):
@@ -105,8 +132,11 @@ def features(W, floor, mean_points, snr_db, depth, syllabic, occupancy,
     # time and enormous for one frame reads as one loud frame (which is what
     # it is) instead of as a key held down half the time.
     duty = np.mean(e > 0.5, axis=0)
-    # Frames caught between on and off: speech spends most of its time there,
-    # a keyed tone almost none, which is what tells the two swings apart.
+    # Frames caught between on and off. Measured off-air, this is a small
+    # number for BOTH a talker (3-17%) and a keyed tone (1-19%) -- it is kept
+    # because a signal that spends most of its time there is being varied
+    # rather than switched, which is neither -- but see scores(): it is not
+    # what tells speech and keying apart, and it must not be asked to be.
     mid = np.mean((e > 0.35) & (e < 0.8), axis=0)
     crest = np.max(e, axis=0)                             # loudest frame / average
 
@@ -118,19 +148,31 @@ def features(W, floor, mean_points, snr_db, depth, syllabic, occupancy,
     den = np.std(a, axis=0) * float(np.std(f))
     fc = np.where(den > 1e-12, np.mean(a * f[:, None], axis=0) / np.maximum(den, 1e-12), 0.0)
 
-    # Occupied width INSIDE the window, from the mean spectrum: how many of the
-    # window's own points, strongest first, it takes to account for
-    # BW_ENERGY_FRAC of the window's excess over the floor. A carrier is one
-    # point; phone is five or six.
+    # Two widths INSIDE the window, from the mean spectrum, because "how far
+    # does this signal reach" and "where does its energy sit" are different
+    # questions and one number cannot answer both.
     #
-    # Counting instead the points within some decibels of the strongest one --
-    # which is what this did until 2026-09-03 -- measures a tone correctly and
-    # speech not at all: the long-term average spectrum of an SSB signal falls
-    # 15-20 dB from its strongest formant region to the top of the passband, so
-    # a -6 dB width of real phone comes out 500-1000 Hz, narrower than the
-    # NARROW_HZ a keyed tone is supposed to own, and every conversation on the
-    # band was called "cw". A share of the ENERGY is the same number for a tone
-    # (one point) and honest for a sloped spectrum (five or six).
+    # bw_hz: how much of the window stands DETECTABLY over the band's own
+    # floor, at DETECT_FLOOR_FRAC of it, counted strongest point first and
+    # carried a fraction of a point past the last whole one so that a talker
+    # fading does not step the width a whole map point at a time. This is the
+    # number narrow/wide are read from.
+    #
+    # Two earlier measures got this wrong in ways worth naming, because both
+    # look reasonable on paper. Counting the points within some decibels of the
+    # STRONGEST one measures a tone correctly and speech not at all: the
+    # long-term spectrum of an SSB signal falls 15-20 dB from its strongest
+    # formant region to the top of the passband, so a -6 dB width of real phone
+    # came out 500-1000 Hz -- narrower than a keyed tone -- and on 2026-09-03
+    # the live gate called every conversation on 80 m "cw". Counting instead
+    # the points holding a SHARE of the energy (BW_ENERGY_FRAC, below) fixed
+    # that but read phone as 730-1470 Hz for the same reason of slope: 90% of a
+    # talker's energy is in the bottom kilohertz of the passband. Those numbers
+    # straddle the narrow/wide bounds, so one point of drift flipped the verdict
+    # and the live gate flapped between "voice 1.0" and "cw 1.0" every few
+    # seconds. Against the FLOOR the same signals separate cleanly -- a tone is
+    # a tone all the way down, phone is 2 kHz wide all the way down -- and the
+    # measurement no longer depends on how the energy is distributed within it.
     floor_level = float(np.mean(np.asarray(floor, dtype=np.float64)))
     p = np.asarray(mean_points, dtype=np.float64)
     seg = np.lib.stride_tricks.sliding_window_view(p, win)[::window_step]
@@ -140,18 +182,45 @@ def features(W, floor, mean_points, snr_db, depth, syllabic, occupancy,
     exc = np.maximum(seg - floor_level, 0.0)
     peak = np.max(exc, axis=1)
     total = np.sum(exc, axis=1)
-    ranked = np.cumsum(np.sort(exc, axis=1)[:, ::-1], axis=1)
-    occupied = np.sum(ranked < BW_ENERGY_FRAC * total[:, None], axis=1) + 1
-    bw_hz = np.where(total > 0.0, occupied * step_hz, 0.0)
+    ranked = np.sort(exc, axis=1)[:, ::-1]                 # strongest point first
+    detect = max(DETECT_FLOOR_FRAC * floor_level, 1e-30)
+    whole = np.sum(ranked > detect, axis=1)
+    part = np.where(whole < win,
+                    ranked[np.arange(nwin), np.minimum(whole, win - 1)] / detect, 0.0)
+    bw_hz = (whole + np.clip(part, 0.0, 1.0)) * step_hz
+    # ...unless the signal runs off the end of the window, in which case what
+    # was measured is a LOWER BOUND and not a width. Windows overlap by
+    # WINDOW_STEP_POINTS, so the finder puts one on the skirt of every strong
+    # talker: it holds the top point of a conversation and nothing else, reads
+    # a few hundred hertz wide, and was called "cw" at 0.6 on off-air 80 m
+    # phone. A signal that leaves the window is at least the window wide.
+    #
+    # "Runs off the end" is a boundary point occupied AND the point just
+    # outside it occupied too -- the occupancy crosses the line -- which takes
+    # no threshold beyond the one already chosen and holds at any SNR. A
+    # boundary point occupied on its own is a signal that happens to end there,
+    # which is what a tone parked on the edge of a window looks like, and it
+    # keeps its measured width.
+    occ = np.maximum(p - floor_level, 0.0) > detect
+    lo = np.arange(nwin) * window_step
+    left = np.where(lo > 0, occ[np.maximum(lo - 1, 0)], False)
+    right_i = np.minimum(lo + win, len(p) - 1)
+    right = np.where(lo + win < len(p), occ[right_i], False)
+    crosses = ((exc[:, 0] > detect) & left) | ((exc[:, -1] > detect) & right)
+    bw_hz = np.where(crosses, win * step_hz, bw_hz)
+    # ...and the energy width, which is what `filled` means: hash with no
+    # structure needs nearly the whole window to account for its energy, a
+    # station needs a fraction of it.
+    cum = np.cumsum(ranked, axis=1)
+    energy_pts = np.sum(cum < BW_ENERGY_FRAC * total[:, None], axis=1) + 1
     peak_frac = np.where(total > 0.0, peak / np.maximum(total, 1e-30), 0.0)
 
     return {
         "bw_hz": bw_hz,
-        "filled": bw_hz / max(win * step_hz, 1e-9),
+        "filled": np.where(total > 0.0, energy_pts / max(win, 1), 0.0),
         # how much of a width verdict this map has earned here: a window only
         # three points across cannot tell a tone from a conversation by shape
         "resolved": float(_ramp(win, RESOLVED_POINTS)),
-        "step_hz": float(step_hz),
         "peak_frac": peak_frac,
         "depth": depth,
         "syllabic": np.asarray(syllabic, dtype=np.float64),
@@ -173,20 +242,31 @@ def scores(feat):
     # and the envelope's own modulation carries the verdict instead, rather
     # than a measurement that cannot separate them casting a vote anyway.
     res = np.asarray(feat.get("resolved", 1.0), dtype=np.float64)
-    step = float(feat.get("step_hz", 0.0))
-    narrow_hz = tuple(max(a, b * step) for a, b in zip(NARROW_HZ, NARROW_POINTS))
-    wide_hz = tuple(max(a, b * step) for a, b in zip(WIDE_HZ, WIDE_POINTS))
     spoken = _ramp(feat["syllabic"], SYLLABIC_KEYED)
-    narrow = res * (1.0 - _ramp(feat["bw_hz"], narrow_hz)) + (1.0 - res) * (1.0 - spoken)
-    wide = res * _ramp(feat["bw_hz"], wide_hz) + (1.0 - res) * spoken
+    narrow = res * (1.0 - _ramp(feat["bw_hz"], NARROW_HZ)) + (1.0 - res) * (1.0 - spoken)
+    wide = res * _ramp(feat["bw_hz"], WIDE_HZ) + (1.0 - res) * spoken
     filled = _ramp(feat["filled"], FILLED_FRAC)
     steady = 1.0 - _ramp(feat["depth"], DEPTH_STEADY)
     swung = _ramp(feat["depth"], DEPTH_SWUNG)
     peaky = _ramp(feat["peak_frac"], PEAKY)
-    # keying is a swing that is nearly all on or all off, and that is sometimes
+    # Keying is a swing that is nearly all on or all off, and that is sometimes
     # both: a tone left down for the whole window is a carrier, not a station
-    # working somebody.
+    # working somebody. Where the map has no width to offer, it must also not be
+    # paced by syllables -- that is the whole of the evidence left there.
+    #
+    # What this deliberately does NOT claim is that the on/off structure alone
+    # separates a keyer from a talker. It does not, and 2026-09-03 measured it
+    # both ways: off-air 80 m phone is `swung` (depth ~1.0), sits inside the duty
+    # band (0.5), and spends 3-17% of its frames between 0.35 and 0.8 of its own
+    # mean, against a keyed tone's 1-19% -- so `keyed` read 1.0 on every
+    # conversation on the band. Nor can it be repaired by looking harder at the
+    # timing: eight seconds of 30 ms slots resolve modulation to about 15 Hz,
+    # 12-35 wpm Morse keys elements at 5-15 Hz, and the run lengths of Morse
+    # (0.10-0.49 s) and of speech (0.07-0.82 s) overlap outright at that
+    # resolution. Keying is a corroborating term. WIDTH is the discriminator,
+    # and where the width is not resolved the modulation spectrum is.
     keyed = (swung * _ramp(1.0 - feat["mid"], BIMODAL)
+             * (res + (1.0 - res) * (1.0 - spoken))
              * _ramp(feat["duty"], DUTY_ON) * (1.0 - _ramp(feat["duty"], DUTY_OFF)))
     impulsive = _ramp(feat["crest"], CREST_IMPULSE) * (1.0 - _ramp(feat["occupancy"],
                                                                   OCCUPANCY_HERE))

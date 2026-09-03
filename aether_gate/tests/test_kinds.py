@@ -20,7 +20,8 @@ import numpy as np
 import pytest
 
 from aether_gate.core import kinds
-from aether_gate.core.finder import FAST_FRAMES, Finder, SLOT_S, WINDOW_STEP_POINTS
+from aether_gate.core.finder import (FAST_FRAMES, Finder, KIND_HOLD_ROWS, SLOT_S,
+                                      WINDOW_STEP_POINTS)
 
 NBINS = 2048
 RATE = 125_000.0
@@ -394,3 +395,154 @@ def test_a_recorded_stretch_of_80m_phone_is_called_voice():
     assert len(cands) >= 3, cands
     assert all(3_700_000 <= c["hz"] <= 4_000_000 for c in cands), cands
     assert [c["kind"] for c in cands] == ["voice"] * len(cands), cands
+
+
+# =========================================================================
+# ...and again the next night, when the answer would not sit still
+# =========================================================================
+# 25 s of the same band recorded 2026-09-03 at 04:34 local, spanning the two
+# reads of /diversity/finder thirty seconds apart that the operator reported:
+# the first came back "cw" on four of eight candidates -- two of them at
+# confidence 1.0 -- and the second came back "voice" on the same four. Nobody
+# sends Morse on 80 m phone at half past four in the morning.
+#
+# Replayed through the finder as adapters/diversity_state._map_update frames it,
+# that recording reproduces the flap exactly: before the fix its 21 scored rows
+# put "cw" on 22 of 119 candidate rows, up to 1.00 confidence, and the same
+# window read voice-cw-voice-cw from one second to the next.
+FLAP_CAPTURE = "20260903-043417_3937250Hz_125000sps.npz"
+# The one thing on that recording that is genuinely not a conversation: two
+# carriers 977 Hz apart at 3.8815 and 3.8824 MHz, each about 490 Hz wide with
+# clear floor between them, switching on and off 4 dB over the floor. A narrow
+# keyed pair is what it is, and the gate is entitled to say so.
+NOT_A_TALKER_HZ = 3_882_000.0
+NOT_A_TALKER_MARGIN_HZ = 1_500.0
+FLAP_PATH = os.path.join(CAPTURE_DIR, FLAP_CAPTURE)
+needs_flap_capture = pytest.mark.skipif(
+    not os.path.exists(FLAP_PATH), reason=f"no {FLAP_CAPTURE} under {CAPTURE_DIR}")
+
+
+def _replay_rows(path, finder=Finder):
+    """A capture through a Finder, with the candidate list as it stood after
+    every scored row: what a read of /diversity/finder a second apart would
+    have said each time, which is the thing that was not sitting still."""
+    d = np.load(path)
+    a, b, lag = d["a"], d["b"], int(d["lag_samples"])
+    if lag > 0:
+        a, b = a[lag:], b[:len(b) - lag]
+    elif lag < 0:
+        a, b = a[:len(a) + lag], b[-lag:]
+    rate, center = float(d["rate_hz"]), float(d["center_hz"])
+    fd = finder(NBINS, rate)
+    w = np.hanning(NBINS)
+    rows = []
+    for i in range(0, min(len(a), len(b)) - CHUNK + 1, CHUNK):
+        before = fd.slow_n
+        fd.update(np.fft.fft(np.stack([a[i:i + NBINS], b[i:i + NBINS]]) * w, axis=1),
+                  CHUNK / rate)
+        if fd.slow_n != before:
+            rows.append((fd.elapsed, fd.candidates(center)["candidates"]))
+    return fd, center, rows
+
+
+@needs_flap_capture
+def test_no_talker_on_a_recorded_80m_evening_is_ever_called_cw():
+    """Every candidate on the recording, at every one of its scored rows --
+    not just at the end, because the operator reads the gate whenever they
+    read it."""
+    _fd, _center, rows = _replay_rows(FLAP_PATH)
+    assert len(rows) >= 15, len(rows)
+    for t, cands in rows:
+        assert cands, t
+        for c in cands:
+            if abs(c["hz"] - NOT_A_TALKER_HZ) <= NOT_A_TALKER_MARGIN_HZ:
+                continue
+            assert c["kind"] in ("voice", "noise"), (round(t, 1), c)
+
+
+@needs_flap_capture
+def test_the_verdict_on_a_recorded_80m_evening_stops_flapping():
+    """No candidate may change its mind more than twice in twenty-five
+    seconds, and none may be confidently anything it was not a moment ago:
+    "cw 1.0" for thirty seconds on a conversation is the complaint."""
+    _fd, _center, rows = _replay_rows(FLAP_PATH)
+    seen, changes = {}, {}
+    for _t, cands in rows:
+        for c in cands:
+            was = seen.get(c["hz"])
+            if was is not None and was != c["kind"]:
+                changes[c["hz"]] = changes.get(c["hz"], 0) + 1
+            seen[c["hz"]] = c["kind"]
+    assert changes == {} or max(changes.values()) <= 2, changes
+    talkers = [c for _t, cands in rows for c in cands
+               if abs(c["hz"] - NOT_A_TALKER_HZ) > NOT_A_TALKER_MARGIN_HZ]
+    assert not [c for c in talkers if c["kind"] == "cw"], talkers
+
+
+class _Unheld(Finder):
+    """The same finder showing each row's verdict raw, as it did before."""
+
+    def _hold(self, kind, kconf):
+        return kind, kconf
+
+
+@needs_flap_capture
+def test_holding_the_verdict_halves_the_flapping_across_the_whole_span():
+    """Not only on the candidates: every window of the map, counted over the
+    stored rows. The hold is worth about a factor of two, which is the
+    difference between a display that reads and one that strobes."""
+    held, _c, _r = _replay_rows(FLAP_PATH)
+    raw, _c, _r = _replay_rows(FLAP_PATH, finder=_Unheld)
+    hk = held._slow_rows()[2]
+    rk = raw._slow_rows()[2]
+    assert hk.shape == rk.shape and hk.shape[0] >= 15
+    held_changes = int(np.count_nonzero(np.diff(hk, axis=0)))
+    raw_changes = int(np.count_nonzero(np.diff(rk, axis=0)))
+    assert raw_changes > 100, raw_changes           # the flap is in the recording
+    assert held_changes * 2 <= raw_changes, (held_changes, raw_changes)
+
+
+def test_a_confident_verdict_gives_way_only_to_a_run_of_contradictions():
+    """The hold, on its own terms: one confident row establishes a verdict,
+    a single contradiction never takes it, and KIND_HOLD_ROWS of them do."""
+    fd = Finder(NBINS, RATE)
+    voice = np.full(fd.nwin, kinds.KINDS.index("voice"), dtype=np.int8)
+    cw = np.full(fd.nwin, kinds.KINDS.index("cw"), dtype=np.int8)
+    sure = np.ones(fd.nwin, dtype=np.float32)
+    kind, conf = fd._hold(voice, sure)               # nothing yet to protect
+    assert kinds.name(kind[0]) == "voice" and conf[0] == pytest.approx(1.0)
+    kind, _ = fd._hold(cw, sure)                     # one contradiction: no
+    assert kinds.name(kind[0]) == "voice"
+    kind, _ = fd._hold(voice, sure)                  # ...and the run is broken
+    assert kinds.name(kind[0]) == "voice"
+    for _ in range(KIND_HOLD_ROWS):
+        kind, conf = fd._hold(cw, sure)
+    assert kinds.name(kind[0]) == "cw" and conf[0] == pytest.approx(1.0)
+
+
+def test_a_confident_verdict_decays_before_it_changes():
+    """The other half of the same rule. A contradicted verdict loses its
+    confidence first -- so the display goes "voice 1.0", "voice 0.4", "cw"
+    rather than "voice 1.0", "cw 1.0" -- and a verdict held at 1.0 outlasts a
+    hesitant challenger that a verdict held at 0.2 gives way to."""
+    fd = Finder(NBINS, RATE)
+    voice = np.full(fd.nwin, kinds.KINDS.index("voice"), dtype=np.int8)
+    cw = np.full(fd.nwin, kinds.KINDS.index("cw"), dtype=np.int8)
+    hesitant = np.full(fd.nwin, 0.2, dtype=np.float32)
+    fd._hold(voice, np.ones(fd.nwin, dtype=np.float32))
+    kind, conf = fd._hold(cw, np.full(fd.nwin, 0.6, dtype=np.float32))
+    assert kinds.name(kind[0]) == "voice" and conf[0] == pytest.approx(0.4)
+
+    # a verdict with nothing left to spend goes on the run length alone
+    weak = Finder(NBINS, RATE)
+    weak._hold(voice, hesitant)
+    for _ in range(KIND_HOLD_ROWS):
+        kind, _ = weak._hold(cw, hesitant)
+    assert kinds.name(kind[0]) == "cw"
+    # ...and the same three rows of the same hesitant answer do not move one
+    # that was sure of itself
+    strong = Finder(NBINS, RATE)
+    strong._hold(voice, np.ones(fd.nwin, dtype=np.float32))
+    for _ in range(KIND_HOLD_ROWS):
+        kind, conf = strong._hold(cw, hesitant)
+    assert kinds.name(kind[0]) == "voice" and conf[0] == pytest.approx(0.4)

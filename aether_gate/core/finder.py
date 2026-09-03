@@ -56,6 +56,11 @@ SLOT_S = 0.030               # frames are averaged into slots at least this
                              # ~8.5 s of syllables at every span.
 SLOW_ROWS = 600              # one scored row per second: ten minutes
 SLOW_PERIOD_S = 1.0
+KIND_HOLD_ROWS = 3           # consecutive rows a new verdict has to win before
+                             # it is shown, and how the shown one gives way: see
+                             # Finder._hold
+KIND_CONF_RISE = 0.5         # how fast the shown confidence follows rows that
+                             # agree with it -- half the gap per row
 VOICE_WIDTH_HZ = 2700.0
 WINDOW_STEP_POINTS = 2
 SYLLABIC_HZ = (2.0, 8.0)     # syllable-rate band of the modulation spectrum
@@ -246,6 +251,12 @@ class Finder:
         self.slow_t = np.zeros(SLOW_ROWS)
         self.slow_i = 0
         self.slow_n = 0
+        # the verdict the finder SHOWS, which is not any one row's -- see _hold
+        self.held_kind = np.full(self.nwin, kinds.NOISE, dtype=np.int8)
+        self.held_conf = np.zeros(self.nwin, dtype=np.float32)
+        self.held_any = False        # has any row established a verdict yet
+        self.pend_kind = np.full(self.nwin, kinds.NOISE, dtype=np.int8)
+        self.pend_n = np.zeros(self.nwin, dtype=np.int16)
         self._last = None            # the latest per-window analysis
 
     # --- reader thread -----------------------------------------------------
@@ -277,6 +288,10 @@ class Finder:
         self.slow_terms = _shift_bins(self.slow_terms, window_shift, 0.0)
         self.slow_kind = _shift_bins(self.slow_kind, window_shift, kinds.NOISE)
         self.slow_kconf = _shift_bins(self.slow_kconf, window_shift, 0.0)
+        self.held_kind = _shift_bins(self.held_kind, window_shift, kinds.NOISE)
+        self.held_conf = _shift_bins(self.held_conf, window_shift, 0.0)
+        self.pend_kind = _shift_bins(self.pend_kind, window_shift, kinds.NOISE)
+        self.pend_n = _shift_bins(self.pend_n, window_shift, 0)
         if self._last is not None:
             last = self._last
             self._last = {
@@ -366,10 +381,11 @@ class Finder:
         na_w = np.mean(np.median(F[:, 0], axis=1)) * self.win
         nb_w = np.mean(np.median(F[:, 1], axis=1)) * self.win
         mean_points = np.mean(both, axis=0)
-        # what each window is, from the same frames the score came from
-        kind, kconf = kinds.classify(W, floor, mean_points, snr_db, depth, syllabic,
-                                     occupancy, self.win, WINDOW_STEP_POINTS,
-                                     self.step_hz)
+        # what each window is, from the same frames the score came from, held
+        # steady across rows so the answer is the band's and not the second's
+        kind, kconf = self._hold(*kinds.classify(W, floor, mean_points, snr_db, depth,
+                                                 syllabic, occupancy, self.win,
+                                                 WINDOW_STEP_POINTS, self.step_hz))
         self.slow[self.slow_i] = score
         self.slow_terms[self.slow_i] = np.stack([snr_db, depth, syllabic])
         self.slow_kind[self.slow_i] = kind
@@ -383,6 +399,53 @@ class Finder:
             "kind": kind, "kind_conf": kconf,
             "mean_points": mean_points, "floor": float(np.mean(floor)),
         }
+
+    def _hold(self, kind, kconf):
+        """One row's verdict turned into the verdict the finder will show.
+
+        A row is eight and a half seconds of a band that changes: a talker
+        pauses between overs, a signal fades, the window the finder centred on
+        a conversation holds nothing but its skirt for a moment. Shown raw, the
+        per-row verdict flapped -- on 2026-09-03 the same eight 80 m phone
+        candidates came back "cw 1.0" on one read of /diversity/finder and
+        "voice" on the next, thirty seconds later, with nobody sending Morse.
+        So a verdict has to earn the display:
+
+          * the first analysis sets it, because there is nothing yet to protect;
+          * a row that AGREES eases the shown confidence towards its own;
+          * a row that disagrees does not flip anything. It spends its own
+            confidence against the held one, so a verdict held at 1.0 survives
+            two or three confident contradictions and a verdict barely held at
+            0.2 gives way at once -- decay, not a coin toss;
+          * and the challenger has to win KIND_HOLD_ROWS rows in a row, and be
+            at least as sure as what is left of the verdict it displaces,
+            before it takes the window.
+
+        Rows are SLOW_PERIOD_S apart over a ring of FAST_FRAMES slots, so
+        consecutive rows share most of their frames: three of them is three
+        seconds of genuinely new evidence, which is about one over.
+        """
+        kind = np.asarray(kind, dtype=np.int8)
+        kconf = np.asarray(kconf, dtype=np.float32)
+        if not self.held_any:
+            self.held_any = True
+            self.held_kind = kind.copy()
+            self.held_conf = kconf.copy()
+            self.pend_kind = kind.copy()
+            self.pend_n = np.zeros(self.nwin, dtype=np.int16)
+            return self.held_kind.copy(), self.held_conf.copy()
+        agree = kind == self.held_kind
+        conf = np.where(agree,
+                        self.held_conf + KIND_CONF_RISE * (kconf - self.held_conf),
+                        np.maximum(self.held_conf - kconf, 0.0))
+        again = (~agree) & (kind == self.pend_kind)
+        self.pend_n = np.where(agree, 0, np.where(again, self.pend_n + 1, 1)).astype(np.int16)
+        self.pend_kind = np.where(agree, self.held_kind, kind).astype(np.int8)
+        take = (~agree) & (self.pend_n >= KIND_HOLD_ROWS) & (kconf >= conf)
+        self.held_kind = np.where(take, kind, self.held_kind).astype(np.int8)
+        self.held_conf = np.where(take, kconf, conf).astype(np.float32)
+        self.pend_n = np.where(take, 0, self.pend_n).astype(np.int16)
+        return self.held_kind.copy(), self.held_conf.copy()
 
     # --- on demand -----------------------------------------------------------
     def _slow_rows(self):
