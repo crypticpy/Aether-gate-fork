@@ -314,8 +314,8 @@ def meter_packet(stream_id, seq, meter_id, dbm):
     return vita_header(stream_id, PCC_METER, seq, len(payload)) + payload
 
 
-_FILTER_FLAGS = ("anf", "contour", "apf", "auto", "auto_eq", "nb")
-_FILTER_WORDS = ("shape", "agc")
+_FILTER_FLAGS = ("anf", "contour", "apf", "auto", "auto_eq", "nb", "talker")
+_FILTER_WORDS = ("shape", "agc", "talker_snap")
 
 
 def _filter_kwargs(q):

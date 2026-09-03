@@ -62,7 +62,24 @@ AGC_MODES = {                        # attack_ms, decay_ms, hang_ms
     "off": None,
 }
 AGC_MAX_GAIN = 1000.0                # 60 dB
-AGC_THRESHOLD_DB = 20.0              # the floor between words is held this far under the target
+AGC_THRESHOLD_DB = 20.0
+# THE FILTER PER TALKER. The tracker's talker memory recognises a known
+# talker by their spatial signature within TALK_HOLD_S (50 ms) of them
+# keying up, long before their voice print could. The filter rides on that:
+# what was in force while a talker was live (their edges, shape, automatics,
+# contour, AGC threshold -- the settings that are about a voice, not about
+# the frequency) is kept under their id and put back the block they return,
+# and a talker without a filter of their own restarts the automatics from
+# their print instead of gliding from the last talker's edges. "fast" snaps;
+# "smooth" lets the auto edges glide over ~0.4 s.
+TALKER_SETTINGS = ("low_hz", "high_hz", "shape", "auto", "auto_eq", "contour_on",
+                   "contour_hz", "contour_db", "contour_width_hz", "agc_threshold_db")
+TALKER_SNAPS = ("fast", "smooth")
+TALKER_GLIDE_UPDATES = 8             # smooth: the narrowing rate is lifted for this many fits
+# After a talker change the spectrum is this talker's from the first block
+# (a running mean, not the old EMA) and the automatics that read it hold
+# their edges for SPEC_WARMUP_BLOCKS (~1 s) so one noisy block cannot undo a
+# restored filter; the print, when there is one, has already been applied.              # the floor between words is held this far under the target
 AGC_FLOOR_RISE_MS = 8000.0           # the floor tracker follows speech up this slowly
 
 
@@ -260,6 +277,14 @@ class SliceFilter:
         self.rate_hz = float(rate_hz)
         self.spec = spec if spec is not None else FilterSpec()
         self.print_source = print_source          # () -> voice print dict or None
+        self.talker_source = None                 # () -> talker memory id or None
+        self.talker_on = True
+        self.talker_snap = "fast"
+        self.talker_id = None                     # whose filter is in force
+        self.talker_filters = {}                  # id -> snapshot (see _talker_store)
+        self._glide_until = 0                     # smooth: fits with the quick narrowing rate
+        self._auto_hold_until = 0                 # the auto width/EQ wait for the spectrum
+        self._spec_n = 0                          # blocks in the spectrum since its restart
         self.agc = Agc()
         self.lsb = False
         self.taps = None
@@ -331,6 +356,12 @@ class SliceFilter:
             elif k in ("attack_ms", "decay_ms", "hang_ms", "threshold_db"):
                 self.agc.set(**{k: v})
                 setattr(s, "agc_" + k, getattr(self.agc, k))
+            elif k == "talker":
+                self.talker_on = bool(v)
+            elif k == "talker_snap":
+                if v not in TALKER_SNAPS:
+                    raise ValueError(f"talker_snap must be one of {TALKER_SNAPS}")
+                self.talker_snap = v
             else:
                 raise ValueError(f"unknown filter setting {k!r}")
         if s.high_hz - s.low_hz < 50.0 and s.low_hz - s.high_hz < 50.0:
@@ -395,6 +426,7 @@ class SliceFilter:
             self.lsb = lsb
             self.dirty = True
         if ch == 0 and len(sig):
+            self._follow_talker()
             self._observe(sig)
         if self.dirty or self.taps is None:
             self._redesign()
@@ -407,24 +439,119 @@ class SliceFilter:
         self.state[ch] = x[len(x) - (n - 1):]
         return y
 
+    # ----- the filter per talker ------------------------------------------
+    def _follow_talker(self):
+        if not self.talker_on or self.talker_source is None:
+            return
+        tid = self.talker_source()
+        # Between overs the filter stays whoever's it was: an edit made in
+        # the silence after an over belongs to the voice just heard, and
+        # that talker keying up again changes nothing.
+        if tid is None or tid == self.talker_id:
+            return
+        if self.talker_id is not None:
+            self._talker_store(self.talker_id)
+        self.talker_id = tid
+        snap = self.talker_filters.get(tid)
+        if snap is not None:
+            self._talker_restore(snap)
+        elif self.spec.auto:
+            self._auto_restart()
+
+    def _talker_store(self, tid):
+        self.talker_filters[tid] = {
+            "spec": self.spec.copy(),
+            "auto_low": self.auto_low, "auto_high": self.auto_high,
+            "auto_source": self.auto_source,
+            "eq_tilt_db": self.eq_tilt_db, "eq_lean_db": self.eq_lean_db,
+        }
+
+    def _talker_restore(self, snap):
+        s = self.spec.copy()
+        for k in TALKER_SETTINGS:
+            setattr(s, k, getattr(snap["spec"], k))
+        self.agc.set(threshold_db=s.agc_threshold_db)
+        self.spec = s
+        self.eq_tilt_db, self.eq_lean_db = snap["eq_tilt_db"], snap["eq_lean_db"]
+        if s.auto:
+            if self.talker_snap == "fast" or self.auto_low is None:
+                self.auto_low, self.auto_high = snap["auto_low"], snap["auto_high"]
+                self.auto_source = snap["auto_source"]
+        else:
+            self.auto_low = self.auto_high = self.auto_source = None
+        self._spectrum_restart()
+        self.dirty = True
+
+    def _spectrum_restart(self):
+        """This talker's spectrum from here on, and a hold on the automatics
+        that read it until it has settled."""
+        self.spec_db = None
+        self._spec_n = 0
+        self._auto_hold_until = self._blocks + SPEC_WARMUP_BLOCKS
+        if self.talker_snap == "smooth":
+            self._glide_until = self._auto_hold_until + 4 * TALKER_GLIDE_UPDATES
+
+    def _auto_restart(self):
+        """A talker with no filter of their own: the automatics begin again
+        from this talker's print (at once, if they have one) and a fresh
+        spectrum, instead of gliding from where the last talker left them."""
+        self.auto_low = self.auto_high = self.auto_source = None
+        pr = self._print()
+        if pr and pr.get("low_hz") is not None and pr.get("high_hz") is not None:
+            lo = max(AUTO_LOW_MARGIN_HZ, float(pr["low_hz"]) - AUTO_LOW_MARGIN_HZ)
+            hi = max(float(pr["high_hz"]) + AUTO_HIGH_MARGIN_HZ, AUTO_MIN_HIGH_HZ)
+            lo = min(lo, AUTO_MAX_LOW_HZ)
+            if hi - lo < AUTO_MIN_WIDTH_HZ:
+                hi = lo + AUTO_MIN_WIDTH_HZ
+            self.auto_low, self.auto_high, self.auto_source = lo, hi, "print"
+        self._spectrum_restart()
+        self.dirty = True
+
+    def talker_forget(self, keep_ids=None):
+        """Drop the remembered filters (all, or those whose talker is gone)."""
+        if keep_ids is None:
+            self.talker_filters = {}
+            self.talker_id = None
+        else:
+            self.talker_filters = {k: v for k, v in self.talker_filters.items() if k in keep_ids}
+
+    def talker_filter_summary(self, tid):
+        """The remembered filter of one talker, for the memory table; the
+        live one if that talker's filter is in force now."""
+        if tid == self.talker_id:
+            self._talker_store(tid)
+        snap = self.talker_filters.get(tid)
+        if snap is None:
+            return None
+        sp = snap["spec"]
+        if sp.auto and snap["auto_low"] is not None:
+            lo, hi = snap["auto_low"], snap["auto_high"]
+        else:
+            lo, hi = min(abs(sp.low_hz), abs(sp.high_hz)), max(abs(sp.low_hz), abs(sp.high_hz))
+        return {"low_hz": round(lo), "high_hz": round(hi), "shape": sp.shape,
+                "auto": sp.auto, "auto_eq": sp.auto_eq, "contour": sp.contour_on,
+                "threshold_db": sp.agc_threshold_db, "live": tid == self.talker_id}
+
     def _observe(self, sig):
         m = min(len(sig), SPEC_N)
         x = sig[-m:] * np.hanning(m)
         X = np.fft.fft(x, SPEC_N)
         p = 10 * np.log10(np.abs(X) ** 2 / m + 1e-30)
+        self._spec_n += 1
         if self.spec_db is None:
             self.spec_db = p
         else:
-            al = 1.0 - math.exp(-m / self.rate_hz / SPEC_TC_S)
+            al = max(1.0 - math.exp(-m / self.rate_hz / SPEC_TC_S), 1.0 / self._spec_n)
             self.spec_db += al * (p - self.spec_db)
         self._blocks += 1
         if self._blocks % 4:
             return
-        if self.spec.auto:
+        hold = self._blocks < self._auto_hold_until
+        if self.spec.auto and not hold:
             self._auto_width()
         if self.spec.anf:
             self._auto_notch()
-        if self.spec.auto_eq:
+        if self.spec.auto_eq and not hold:
             self._auto_eq()
 
     def _print(self):
@@ -477,8 +604,9 @@ class SliceFilter:
         else:
             # widen quickly, narrow slowly: a syllable that reaches further
             # must not be clipped while one quiet over must not close the door
-            new_lo = self.auto_low + (0.5 if lo < self.auto_low else 0.05) * (lo - self.auto_low)
-            new_hi = self.auto_high + (0.5 if hi > self.auto_high else 0.05) * (hi - self.auto_high)
+            slow = 0.5 if self._blocks < self._glide_until else 0.05
+            new_lo = self.auto_low + (0.5 if lo < self.auto_low else slow) * (lo - self.auto_low)
+            new_hi = self.auto_high + (0.5 if hi > self.auto_high else slow) * (hi - self.auto_high)
         if (self.auto_low is None or abs(new_lo - self.auto_low) > 25.0
                 or abs(new_hi - self.auto_high) > 25.0):
             self.dirty = True
@@ -568,6 +696,9 @@ class SliceFilter:
             "nb": {"enabled": s.nb_on, "threshold_db": s.nb_db,
                    "blanked_pct": round(self.blanked_pct, 2)},
             "agc": self.agc.status(),
+            "talker": {"enabled": self.talker_on, "snap": self.talker_snap,
+                       "id": self.talker_id,
+                       "remembered": sorted(int(k) for k in self.talker_filters)},
             "roofing": {"analogue_hz": None, "digital_hz": round(self.rate_hz)},
             "_sign": sgn,
         }

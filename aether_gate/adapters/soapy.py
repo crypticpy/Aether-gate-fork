@@ -629,8 +629,11 @@ class SoapyAdapter(RadioAdapter):
         prev = self._filt
         self._filt = SliceFilter(self._pd_rate, spec=prev.spec if prev is not None else None,
                                  print_source=self._active_print)
+        self._filt.talker_source = self._active_talker
         if prev is not None:
             self._filt.agc = prev.agc
+            for k in ("talker_on", "talker_snap", "talker_id", "talker_filters"):
+                setattr(self._filt, k, getattr(prev, k))
         # The SSB passband is the operator's filter (self._filt, built above);
         # the fixed one-sided taps that used to live here are gone with it.
         # --- NBFM: a REAL discriminator, not the SSB path ------------------
@@ -1456,6 +1459,11 @@ class SoapyAdapter(RadioAdapter):
         active = d.memory.active
         return vp.summary(active) if vp is not None and active is not None else None
 
+    def _active_talker(self):
+        """The talker memory's id for whoever is talking, for the filter per talker."""
+        mem = getattr(self._div, "memory", None)
+        return mem.active if mem is not None else None
+
     def filter_status(self):
         if self._filt is None:
             return {"available": False}
@@ -1524,7 +1532,14 @@ class SoapyAdapter(RadioAdapter):
     def diversity_status(self, slice_id=None):
         if self._div is None:
             return {"available": False}
-        return self._div.status(slice_id)
+        st = self._div.status(slice_id)
+        if self._filt is not None and isinstance(st.get("memory"), list):
+            # each remembered talker's filter beside their voice print
+            self._filt.talker_forget(keep_ids={e["id"] for e in st["memory"]}
+                                     | ({self._filt.talker_id} - {None}))
+            for e in st["memory"]:
+                e["filter"] = self._filt.talker_filter_summary(e["id"])
+        return st
 
     def set_diversity(self, mode=None, phase_deg=None, ratio_db=None, source=None,
                       slice_id=None, nb=None, nb_db=None, pan=None, null_source=None,
@@ -1569,6 +1584,8 @@ class SoapyAdapter(RadioAdapter):
     def diversity_memory_clear(self):
         if self._div is not None:
             self._div.memory_clear()
+        if self._filt is not None:
+            self._filt.talker_forget()
 
     def diversity_memory_name(self, talker_id, name):
         if self._div is None:
