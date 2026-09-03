@@ -108,11 +108,17 @@ from ..core.filter import SliceFilter, blank_impulses
 from ..core.roofing import DigitalRoof, snap_analogue_hz
 from .chainstatus import chain_rows
 from .device_info import device_block
+from .frontend_guard import FrontEndGuard
 
 # Bin powers in a noise-only FFT are exponentially distributed; their median is
 # ln(2) times their mean. read_meters divides by this to turn a robust median
 # into the mean power the noise actually carries.
 _LN2 = math.log(2.0)
+
+# B23 front-end guard: the int16-scaled CF32 stream never legitimately exceeds
+# +/-1.0, so a sample at or past this counts as ADC full scale (clipping).
+_FE_CLIP_THRESH = 0.999
+_FE_TICK_S = 1.0             # how often the read loop asks the guard for a decision
 
 SSB_BW_HZ = 2700.0          # SSB audio passband width
 # What the demodulator actually passes, as offsets from the slice frequency.
@@ -228,6 +234,18 @@ class SoapyAdapter(RadioAdapter):
         # out. Soapy cannot tell us what a state is worth in dB (see below).
         self._lna_state = "0"
         self._lna_cal_state = "0"
+        # B23 front-end guard: floor_state defaults to the state the operator
+        # opened the device at (self._lna_state, above) — the guard's own
+        # floor is not known until _open_hw reads the device's rfgain_sel
+        # bound, so max_state starts None (see _open_hw and frontend_status).
+        # enabled=False: the operator turns it on, same reason dbm_trim is
+        # never auto-set — the dBm scale moves when this does (see the
+        # writeSetting block below).
+        self.frontend = FrontEndGuard(floor_state=self._lna_state, max_state=None,
+                                       enabled=False)
+        self._fe_state = {}                 # per-channel peak/headroom bookkeeping; see _open_hw
+        self._fe_available = False          # True once a block has actually been measured
+        self._fe_tick_at = 0.0              # monotonic stamp of the last guard.tick()
         self._antenna_to = None             # pending antenna port (ditto)
         self._gain_lo = 0.0                 # device gain range, filled in by _open_hw
         self._gain_hi = 50.0
@@ -355,6 +373,12 @@ class SoapyAdapter(RadioAdapter):
         if want_dual and nch < 2:
             print(f"[soapy] mode=DT asked for but the driver offers {nch} channel(s) "
                   f"— running single tuner", flush=True)
+        # B23 front-end guard: one peak/headroom bookkeeping slot per channel
+        # actually opened. -120 dBFS is a harmless starting "peak" (near
+        # silence) until the first real block lands.
+        _fe_t0 = time.monotonic()
+        self._fe_state = {ch: {"peak_dbfs": -120.0, "hold_dbfs": -120.0, "hold_at": _fe_t0,
+                                "clip_1s": 0, "clip_at": _fe_t0} for ch in self._channels}
         for ch in self._channels:
             self._sdr.setSampleRate(SOAPY_SDR_RX, ch, self.samp_rate)
         # Never trust the requested rate: drivers snap to their own rate table
@@ -411,6 +435,31 @@ class SoapyAdapter(RadioAdapter):
         except Exception as e:
             print(f"[soapy] no gain range from the driver ({e!r}) — advertising "
                   f"{self._gain_lo:.0f}..{self._gain_hi:.0f} dB", flush=True)
+        # B23 front-end guard: rfgain_sel's own bound, asked of the driver
+        # rather than assumed. Checked live against a running RSPduo
+        # (2026-09-03): this setting comes back as an ENUM — `options`, a list
+        # of strings — not a numeric ArgInfo `range` (unlike e.g. agc_setpoint,
+        # which is a real ranged control and does carry min/max/step). So the
+        # ceiling here is the highest of those option strings, same as
+        # device_controls() would show an operator, not info.range.maximum().
+        try:
+            for _info in self._sdr.getSettingInfo():
+                if str(_info.key) != "rfgain_sel":
+                    continue
+                _opts = [str(o) for o in _info.options] if _info.options else []
+                _nums = [int(o) for o in _opts if str(o).lstrip("-").isdigit()]
+                if _nums:
+                    self.frontend.max_state = str(max(_nums))
+                else:
+                    try:
+                        _r = _info.range
+                        if float(_r.maximum()) > float(_r.minimum()):
+                            self.frontend.max_state = str(int(float(_r.maximum())))
+                    except Exception:
+                        pass
+                break
+        except Exception:
+            pass
         try:
             _agc_now = self._sdr.getGainMode(SOAPY_SDR_RX, 0)
             _g_now = self._sdr.getGain(SOAPY_SDR_RX, 0)
@@ -950,6 +999,44 @@ class SoapyAdapter(RadioAdapter):
             have += k
         return out
 
+    def _fe_observe(self, ch, block):
+        """B23 front-end guard: one channel's peak/headroom bookkeeping for
+        this block. Called from the read loop for every channel's raw block,
+        BEFORE `_div.ingest` combines them — the guard needs to know which
+        physical tuner is close to the rail, and ingest() has already mixed
+        the pair into one signal by the time it returns.
+
+        Cheap numpy only: one max() over |re| and |im| each (no per-sample
+        Python loop), no copy of `block` (the read loop already made the one
+        copy it needs off the driver's buffer at `buf[:n].copy()`).
+
+        The "short-memory max" is a HELD peak that decays after ~1 s rather
+        than an exact sliding-window max: cheaper than keeping a timestamped
+        history, and this only has to be right to within about a block's
+        worth of time, not to the sample.
+        """
+        st = self._fe_state.get(ch)
+        if st is None:
+            return
+        np = self._np
+        re = block.real
+        im = block.imag
+        peak = float(np.maximum(np.abs(re).max(), np.abs(im).max()))
+        clips = int(np.count_nonzero((np.abs(re) >= _FE_CLIP_THRESH)
+                                      | (np.abs(im) >= _FE_CLIP_THRESH)))
+        peak_dbfs = 20.0 * math.log10(max(peak, 1e-9))
+        now = time.monotonic()
+        st["peak_dbfs"] = peak_dbfs
+        if peak_dbfs >= st["hold_dbfs"] or (now - st["hold_at"]) >= 1.0:
+            st["hold_dbfs"] = peak_dbfs
+            st["hold_at"] = now
+        if (now - st["clip_at"]) >= 1.0:
+            st["clip_1s"] = clips
+            st["clip_at"] = now
+        else:
+            st["clip_1s"] += clips
+        self._fe_available = True
+
     # --- the persistent reader (this is what kills the per-frame PLL re-lock) --
     def _read_loop(self):
         np = self._np
@@ -1152,6 +1239,25 @@ class SoapyAdapter(RadioAdapter):
                             self._lna_state = str(got)
                     except Exception as e:
                         print(f"[soapy] SET {key}={want!r} FAILED: {e!r}", flush=True)
+                # ── B23 FRONT-END GUARD: one decision every _FE_TICK_S ────────
+                # Same thread, same reason as every setter above: writeSetting
+                # races readStream on this driver. The guard's answer becomes a
+                # normal set_device_setting("rfgain_sel", ...) queue entry, so
+                # it is applied on the NEXT iteration through the exact write
+                # path above — read-back, "setters lie" handling and the
+                # dbm_calibrated warning all run on a guard-initiated write
+                # exactly as they do on an operator-initiated one.
+                _fe_now = _time.monotonic()
+                if self._fe_state and (_fe_now - self._fe_tick_at) >= _FE_TICK_S:
+                    self._fe_tick_at = _fe_now
+                    _fe_headroom = min(-s["hold_dbfs"] for s in self._fe_state.values())
+                    _fe_clips = sum(int(s["clip_1s"]) for s in self._fe_state.values())
+                    _fe_new = self.frontend.tick(t=_fe_now, headroom_db=_fe_headroom,
+                                                  clip_count=_fe_clips, lna_state=self._lna_state)
+                    if _fe_new is not None:
+                        self.set_device_setting("rfgain_sel", _fe_new)
+                        print(f"[soapy] frontend guard: rfgain_sel {self._lna_state} -> "
+                              f"{_fe_new} ({self.frontend.events[-1]['reason']})", flush=True)
                 # ── REOPEN A DROPPED DEVICE INSTEAD OF GOING OFF THE AIR ──────
                 # Set by either liveness test below. See _recover_device for why
                 # reopening is the only way back once the driver has stopped.
@@ -1227,6 +1333,7 @@ class SoapyAdapter(RadioAdapter):
                         fresh_at = _now         # don't re-fire on every block
                     block = buf[:n].copy()
                     audio = block
+                    self._fe_observe(0, block)          # B23: channel A peak/headroom
                     if self._div is not None:
                         # dual tuner: the same count from B, then align; the pan
                         # sees the combined block and the demod the aligned pair
@@ -1241,6 +1348,7 @@ class SoapyAdapter(RadioAdapter):
                             self._div.request_realign("channel B read failed")
                             _note_read_error()
                             continue
+                        self._fe_observe(1, b)           # B23: channel B peak/headroom
                         block, audio = self._div.ingest(block, b)
                     with self._lock:
                         self._latest = block        # for the meters (latest is fine)
@@ -1512,6 +1620,46 @@ class SoapyAdapter(RadioAdapter):
             value = "true" if value else "false"
         self._setting_to[str(key)] = str(value)
         return True
+
+    def frontend_status(self):
+        """B23: the /frontend JSON. Same keys whatever the state — before the
+        first block, on a device with no rfgain_sel, mid-hold, after a step —
+        so the panel never has to special-case a missing key.
+
+        `dbm_calibrated` is exactly `_lna_state == _lna_cal_state`: the
+        writeSetting block above is the only place that ever moves
+        `_lna_state`, guard-initiated or operator-initiated alike, so this
+        stays honest however the state got where it is.
+        """
+        ch_ids = sorted(self._fe_state.keys())
+        per_ch = []
+        clip_total = 0
+        for ch in ch_ids:
+            st = self._fe_state[ch]
+            hd = round(-st["peak_dbfs"], 1)
+            per_ch.append({"headroom_db": hd, "clips_1s": int(st["clip_1s"])})
+            clip_total += int(st["clip_1s"])
+        headroom_db = round(min(-self._fe_state[c]["peak_dbfs"] for c in ch_ids), 1) if ch_ids else None
+        peak_dbfs = round(max(self._fe_state[c]["peak_dbfs"] for c in ch_ids), 1) if ch_ids else None
+        headroom_1s = round(min(-self._fe_state[c]["hold_dbfs"] for c in ch_ids), 1) if ch_ids else None
+        snap = self.frontend.snapshot()
+        return {
+            "available": bool(self._fe_available),
+            "guard": snap["guard"],
+            "floor_state": snap["floor_state"],
+            "max_state": snap["max_state"],
+            "lna_state": snap["lna_state"],
+            "dbm_calibrated": str(self._lna_state) == str(self._lna_cal_state),
+            "cal_state": str(self._lna_cal_state),
+            "headroom_db": headroom_db,
+            "peak_dbfs": peak_dbfs,
+            "headroom_1s_db": headroom_1s,
+            "clips_1s": clip_total,
+            "per_channel": per_ch,
+            "state": snap["state"],
+            "hold_until": snap["hold_until"],
+            "events": snap["events"],
+        }
 
     def device_block(self):
         """What is plugged in and whether the pair is running (device_info),

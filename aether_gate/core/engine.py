@@ -3862,7 +3862,10 @@ def start_control_server(radio, port):
                 a = radio.adapter
                 if not hasattr(a, "device_controls"):
                     return self._json({"error": "adapter has no device controls"})
-                return self._json(a.device_controls())
+                out = a.device_controls()
+                if hasattr(a, "frontend_status"):
+                    out["frontend"] = a.frontend_status()
+                return self._json(out)
             if u.path == "/device/set":
                 a = radio.adapter
                 q = urllib.parse.parse_qs(u.query)
@@ -3878,6 +3881,47 @@ def start_control_server(radio, port):
                 # read-back below reflects the write rather than the old value.
                 time.sleep(0.35)
                 return self._json(a.device_controls())
+
+            # ---- B23: front-end linearity guard ----------------------------
+            # Automatic gain headroom on the RSPduo/RSPdx front end: steps
+            # rfgain_sel toward more attenuation when headroom runs low or a
+            # sample clips, and back toward the operator's own setting once
+            # it has been clear for a while. See adapters/frontend_guard.py
+            # for the policy and adapters/soapy.py's frontend_status() for
+            # what every key below means; both are the same in every state so
+            # this route never has to special-case "not available yet".
+            #   GET /frontend                    -> status
+            #   GET /frontend/set?guard=on        -> turn the guard on/off
+            #   GET /frontend/set?floor=4         -> move the operator floor
+            if u.path == "/frontend":
+                a = radio.adapter
+                if hasattr(a, "frontend_status"):
+                    return self._json(a.frontend_status())
+                return self._json({
+                    "available": False, "guard": False, "floor_state": None,
+                    "max_state": None, "lna_state": None, "dbm_calibrated": True,
+                    "cal_state": None, "headroom_db": None, "peak_dbfs": None,
+                    "headroom_1s_db": None, "clips_1s": 0, "per_channel": [],
+                    "state": "idle", "hold_until": None, "events": [],
+                })
+            if u.path == "/frontend/set":
+                a = radio.adapter
+                if not hasattr(a, "frontend_status"):
+                    return self._json({"error": "adapter has no front-end guard"})
+                q = urllib.parse.parse_qs(u.query)
+                if "guard" in q:
+                    want = q["guard"][0].strip().lower()
+                    if want not in ("on", "off"):
+                        return self._json({"error": f"bad value: guard={want!r} (want on|off)"})
+                    a.frontend.enabled = (want == "on")
+                    log(f"[ctl] frontend guard -> {'on' if a.frontend.enabled else 'off'}")
+                if "floor" in q:
+                    floor = q["floor"][0].strip()
+                    if not floor.lstrip("-").isdigit():
+                        return self._json({"error": f"bad value: floor={floor!r}"})
+                    a.frontend.floor_state = floor
+                    log(f"[ctl] frontend floor -> {floor}")
+                return self._json(a.frontend_status())
 
             # ---- panadapter resolution (bins and/or device sample rate) ----
             # Its own route, not /set: changing the rate restarts the adapter's
