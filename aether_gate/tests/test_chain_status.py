@@ -24,7 +24,7 @@ GOLDEN_IDS = [
     "antenna", "traps", "lna", "ifgr", "rf_agc",        # the front end
     "roof_rf", "adc",                                   # the hardware roofing
     "align", "nb", "roof_digital",                      # full-rate gate stages
-    "combiner", "subband", "post",                      # the pair
+    "combiner", "subband", "squeeze", "post",           # the pair
     "slice", "passband", "auto", "shape", "notch",      # the slice FIR
     "anf", "contour", "apf", "auto_eq",
     "detect", "agc", "app",                             # out of the gate
@@ -100,6 +100,10 @@ def _diversity():
                         "since_s": 55.7}},
         "subband": {"enabled": True, "bins": 12, "extra_db": 1.4},
         "post": {"enabled": True, "floor_db": -6.0, "mean_db": -8.5},
+        "squeeze": {"hz": -1200, "width_hz": 300, "held": True, "tool": "null",
+                    "why": "one wavefront, coherence 0.82: the null takes it",
+                    "coherence": 0.82, "depth_db": -18.4, "target": "signal",
+                    "comb": None},
     }
 
 
@@ -142,7 +146,8 @@ def test_every_row_validates_against_the_contract():
 
 def test_a_single_tuner_simply_has_no_pair_rows():
     ids = [r["id"] for r in _rows(div=None)]
-    assert [i for i in GOLDEN_IDS if i not in ("align", "combiner", "subband", "post")] == ids
+    assert [i for i in GOLDEN_IDS
+            if i not in ("align", "combiner", "subband", "squeeze", "post")] == ids
 
 
 def test_a_gate_with_no_device_surface_still_serves_the_chain():
@@ -186,6 +191,26 @@ def test_the_pair_rows_quote_the_diversity_status_and_never_recompute_it():
     assert rows["post"]["measured"]["out_db"] == div["post"]["mean_db"]
     assert rows["combiner"]["measured"] == {"in_db": div["snr_db"]["b"],
                                             "out_db": div["snr_db"]["out"]}
+
+
+def test_the_squeeze_row_quotes_the_tool_and_releases_while_held():
+    div = _diversity()
+    row = {r["id"]: r for r in _rows(div=div)}["squeeze"]
+    assert row["enabled"] is True and row["kind"] == "value"
+    assert "null" in row["detail"] and div["squeeze"]["why"] in row["detail"]
+    assert "-1200 Hz" in row["detail"] and row["value"] == -1200
+    assert row["action"] == {"label": "RELEASE", "route": "/diversity/set",
+                             "query": "squeeze=off"}
+    # Off: the query is left open for the VISUAL tab to finish.
+    div["squeeze"] = {"hz": None, "held": False, "target": "signal", "comb": None}
+    row = {r["id"]: r for r in _rows(div=div)}["squeeze"]
+    assert row["enabled"] is False and row["action"]["query"] == "squeeze="
+    # Comb armed but not found yet: says so, and can still be released.
+    div["squeeze"] = {"hz": None, "held": False, "target": "comb", "comb": None,
+                      "reason": "no comb found"}
+    row = {r["id"]: r for r in _rows(div=div)}["squeeze"]
+    assert "armed" in row["detail"] and "no comb found" in row["detail"]
+    assert row["action"]["query"] == "squeeze=off" and row["value"] == "comb"
 
 
 def test_measured_appears_only_where_a_level_was_measured():
@@ -256,7 +281,7 @@ def test_the_adapter_serves_the_chain_from_filter_status():
     ids = [r["id"] for r in st["chain"]]
     assert ids == [i for i in GOLDEN_IDS
                    if i not in ("antenna", "traps", "lna", "align",
-                                "combiner", "subband", "post")]
+                                "combiner", "subband", "squeeze", "post")]
     for row in st["chain"]:
         _validate(row)
     assert st["roofing"]["samp_rate_hz"] == 250_000.0

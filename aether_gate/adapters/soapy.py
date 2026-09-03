@@ -1747,6 +1747,10 @@ class SoapyAdapter(RadioAdapter):
         # chainstatus.py from the dicts above and nothing else -- see there for
         # why the gate authors these rows rather than the app.
         st["chain"] = chain_rows(st, div, self._chain_device(), self._chain_frontend())
+        # The VISUAL tab draws the SQUEEZE target (or comb teeth) on the
+        # curve, so the block rides along with the rows it explains.
+        if div:
+            st["squeeze"] = div.get("squeeze")
         st["response"] = self._filt.response_db()
         st["spectrum"] = self._filt.spectrum_db()
         return st

@@ -217,6 +217,7 @@ def _combiner_rows(div):
              f"{float(sb.get('extra_db') or 0.0):+.1f} dB"),
         enabled=bool(sb.get("enabled")),
         action=_toggle("/diversity/set", "subband", bool(sb.get("enabled")))))
+    rows.append(_squeeze_row(div.get("squeeze") or {}))
     pf = div.get("post") or {}
     mean = pf.get("mean_db")
     rows.append(_row(
@@ -228,6 +229,35 @@ def _combiner_rows(div):
         measured=None if mean is None else {"in_db": None,
                                             "out_db": round(float(mean), 1)}))
     return rows
+
+
+def _squeeze_row(sq):
+    """SQUEEZE: one signal (or a comb) taken out of the station and kept
+    out. The gate picks the tool from inter-loop coherence -- the row quotes
+    that choice and its reason rather than restating the rule. While a
+    target is held the action releases it; otherwise the query is left open
+    for the VISUAL tab to finish with the frequency it was clicked at."""
+    held = bool(sq.get("held"))
+    target = sq.get("target") or "signal"
+    hz = sq.get("hz")
+    comb = sq.get("comb") or {}
+    if held:
+        where = (f"comb · {comb.get('spacing_hz')} Hz teeth · {len(comb.get('teeth_in_band') or [])} in band"
+                 if target == "comb" else
+                 (f"{float(hz):+.0f} Hz" if hz is not None else None))
+        detail = _dot(where, str(sq.get("tool") or "?"),
+                      f"{_db(sq.get('depth_db'))} dB" if sq.get("depth_db") is not None else None,
+                      sq.get("why"))
+    elif hz is not None or target == "comb":
+        detail = _dot("armed", sq.get("reason") or sq.get("why"))
+    else:
+        detail = "off · click a signal on VISUAL, or squeeze=comb"
+    return _row(
+        "squeeze", "SQUEEZE", "value", detail, enabled=held,
+        value=("comb" if target == "comb" else hz),
+        action=(_set("/diversity/set", "squeeze=off", label="RELEASE")
+                if (held or hz is not None or target == "comb")
+                else _set("/diversity/set", "squeeze=")))
 
 
 # ----- the slice filter ------------------------------------------------------
