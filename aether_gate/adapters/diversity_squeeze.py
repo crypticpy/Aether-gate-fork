@@ -141,17 +141,18 @@ def _bearing(state, now):
 
 
 def _notch_depth_db(state, sq):
-    """core.squeeze cannot measure this -- it has no taps -- so the FIR's
-    own designed response at the notch's frequencies, the same figure
-    core.filter's own notch status reports for the operator's table."""
+    """core.squeeze cannot measure this -- it has no taps, and no bank
+    either -- so the slice filter's own COMBINED response (the FIR and its
+    dedicated SQUEEZE notch bank, core/notchbank.py, together) at the
+    target's frequencies: the depth actually delivered, not the FIR's own
+    design alone (see SliceFilter.combined_response_db)."""
     filt = getattr(state.a, "_filt", None)
     if filt is None or filt.taps is None:
         return None
-    from ..core.filter import response_at
     hzs = [hz for hz, _w in _notch_targets(sq)]
     if not hzs:
         return None
-    vals = [-response_at(filt.taps, filt.rate_hz, hz) for hz in hzs]
+    vals = [-filt.combined_response_db(hz) for hz in hzs]
     return round(float(np.mean(vals)), 1)
 
 

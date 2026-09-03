@@ -314,22 +314,161 @@ def test_tracker_squeeze_hook_wins_and_release_lets_the_tracker_refit():
     assert t.m != _FakeSqueeze.null_m
 
 
-# --- the notch fallback in core/filter.py -----------------------------------
+# --- the notch bank in core/notchbank.py, wired via core/filter.py ---------
 
-def test_filter_squeeze_notches_are_deep_at_the_teeth_and_flat_elsewhere():
-    # a realistic post-decimation audio rate (AUDIO_RATE-ish), "sharp" shape:
-    # TOOTH_WIDTH_HZ (60 Hz) is narrower than "soft"'s own transition at this
-    # rate and barely dents it (-1 to -4 dB measured) -- a comb needs the
-    # long Kaiser taps to actually get a notch this narrow, same as the
-    # operator's own table would for a notch this width.
-    filt = SliceFilter(24_000.0)
-    filt.set(low=100.0, high=2900.0, shape="sharp")
-    filt.set_squeeze_notches([(t, 140.0) for t in (650.0, 1650.0)])
-    filt.apply(np.zeros(64, dtype=np.complex128))       # forces the redesign
-    for hz in (650.0, 1650.0):
-        assert response_at(filt.taps, 24_000.0, hz) <= -15.0
-    assert abs(response_at(filt.taps, 24_000.0, 1200.0)) <= 1.0   # a talker's own frequency, untouched
-    assert filt.spec.notches == []                       # never mixed into the operator's own table
+def test_filter_squeeze_notches_are_deep_regardless_of_shape():
+    """The whole point of core/notchbank.py: the OLD behaviour (squeeze
+    notches folded into the FIR design) only reached real depth with
+    "sharp"'s long Kaiser window -- "soft"'s wide main lobe barely dented a
+    notch this narrow (see git history of this test). The dedicated bank
+    does not care what `shape` the operator picked."""
+    for shape in ("soft", "sharp"):
+        filt = SliceFilter(24_000.0)
+        filt.set(low=100.0, high=2900.0, shape=shape)
+        filt.set_squeeze_notches([(t, 140.0) for t in (650.0, 1650.0)])
+        filt.apply(np.zeros(64, dtype=np.complex128))   # forces the FIR redesign
+        for hz in (650.0, 1650.0):
+            assert filt.combined_response_db(hz) <= -25.0, (shape, hz)
+        # a talker's own frequency, well clear of either tooth, is untouched
+        assert abs(filt.combined_response_db(1200.0)) <= 1.0, shape
+        assert filt.spec.notches == []                   # never mixed into the operator's own table
+        # the FIR's OWN taps no longer carry the squeeze notch at all -- it
+        # is entirely the bank's doing now
+        assert response_at(filt.taps, 24_000.0, 650.0) > -3.0, shape
+
+
+SLICE_RATE = 24_000.0
+SLICE_BLOCK = 819                # a realistic post-decimation block (test_filter.py's own figure)
+
+
+def _voice_like_slice(seconds, amp, low=200.0, high=2800.0, seed=11):
+    """Band-limited noise, a stand-in for a talker (same recipe as
+    test_filter.py's own _voice_like, duplicated here to keep this file
+    self-contained)."""
+    from aether_gate.core.filter import design_taps as _dt
+    rng = np.random.default_rng(seed)
+    total = int(seconds * SLICE_RATE)
+    w = amp * (rng.standard_normal(total + 1100) + 1j * rng.standard_normal(total + 1100))
+    return np.convolve(w, _dt(SLICE_RATE, low, high, "sharp"), mode="valid")[:total]
+
+
+def _feed_slice(sf, sig):
+    out = []
+    for i in range(0, len(sig) - SLICE_BLOCK + 1, SLICE_BLOCK):
+        out.append(sf.apply(sig[i:i + SLICE_BLOCK], 0))
+    return np.concatenate(out)
+
+
+def _tone_db_slice(y, hz):
+    """A matched-filter correlation against one exact tone over the whole
+    record: at ~2 s this is a ~0.5 Hz-wide bin, comfortably clear of teeth
+    60 Hz apart or a talker's own broadband floor."""
+    t = np.arange(len(y)) / SLICE_RATE
+    return 20.0 * math.log10(abs(np.mean(y * np.exp(-2j * math.pi * hz * t))) + 1e-30)
+
+
+def _band_db_slice(y, lo, hi, avoid_hz, guard=45.0):
+    """The talker band's own periodogram level, away from any tooth -- the
+    "the talker is untouched" half of the comb test. y is complex baseband
+    IQ (fft, not rfft: there is no real-signal symmetry to exploit here)."""
+    Y = np.fft.fft(y)
+    f = np.fft.fftfreq(len(y), 1.0 / SLICE_RATE)
+    sel = (f >= lo) & (f <= hi)
+    for hz in avoid_hz:
+        sel &= np.abs(f - hz) > guard
+    return 10.0 * math.log10(float(np.mean(np.abs(Y[sel]) ** 2)) + 1e-30)
+
+
+def _comb_scene_slice(teeth, tone_db_below_talker=-20.0, talker_amp=0.05):
+    talker = _voice_like_slice(2.0, talker_amp, low=350.0, high=2400.0)
+    t = np.arange(len(talker)) / SLICE_RATE
+    tone_amp = talker_amp * 10.0 ** (tone_db_below_talker / 20.0)
+    sig = talker + sum(tone_amp * np.exp(2j * math.pi * hz * t) for hz in teeth)
+    return sig.astype(np.complex128)
+
+
+def _comb_case(shape):
+    from aether_gate.core.comb import TOOTH_WIDTH_HZ
+    teeth = [700.0 + 60.0 * k for k in range(5)]        # a 60 Hz comb, 5 teeth in-band
+    sig = _comb_scene_slice(teeth)
+
+    before_sf = SliceFilter(SLICE_RATE)
+    before_sf.set(low=350.0, high=2400.0, shape=shape)
+    before = _feed_slice(before_sf, sig.copy())
+    before_band = _band_db_slice(before, 350.0, 2400.0, teeth)
+
+    after_sf = SliceFilter(SLICE_RATE)
+    after_sf.set(low=350.0, high=2400.0, shape=shape)
+    after_sf.set_squeeze_notches([(hz, TOOTH_WIDTH_HZ) for hz in teeth])
+    after = _feed_slice(after_sf, sig.copy())
+    after_band = _band_db_slice(after, 350.0, 2400.0, teeth)
+
+    for hz in teeth:
+        depth = _tone_db_slice(before, hz) - _tone_db_slice(after, hz)
+        assert depth >= 25.0, (shape, hz, depth)
+    assert abs(after_band - before_band) <= 1.0, (shape, before_band, after_band)
+
+
+def test_comb_notch_bank_soft_shape_deep_teeth_talker_untouched():
+    _comb_case("soft")
+
+
+def test_comb_notch_bank_sharp_shape_deep_teeth_talker_untouched():
+    _comb_case("sharp")
+
+
+def test_signal_squeeze_notch_bank_deep_at_centre_and_shows_in_response_db():
+    hz, width = 1200.0, 300.0
+    talker = _voice_like_slice(2.0, 0.05)
+    t = np.arange(len(talker)) / SLICE_RATE
+    tone = 0.05 * 10.0 ** (-20.0 / 20.0) * np.exp(2j * math.pi * hz * t)
+    sig = (talker + tone).astype(np.complex128)
+
+    before_sf = SliceFilter(SLICE_RATE)
+    before_sf.set(low=100.0, high=2900.0, shape="soft")
+    before = _feed_slice(before_sf, sig.copy())
+
+    after_sf = SliceFilter(SLICE_RATE)
+    after_sf.set(low=100.0, high=2900.0, shape="soft")
+    after_sf.set_squeeze_notches([(hz, width)])
+    after = _feed_slice(after_sf, sig.copy())
+
+    assert _tone_db_slice(before, hz) - _tone_db_slice(after, hz) >= 25.0
+
+    rdb = after_sf.response_db(points=512)
+    f = np.array(rdb["hz"], dtype=float)
+    idx = int(np.argmin(np.abs(f - hz)))
+    assert rdb["db"][idx] <= -20.0, rdb["db"][idx]        # the curve the VISUAL tab draws shows it
+    assert rdb["db"][int(np.argmin(np.abs(f - 300.0)))] > -3.0   # elsewhere in the passband, untouched
+
+
+def test_squeeze_notch_bank_coefficient_cache_skips_recompute_when_unchanged():
+    from aether_gate.core.notchbank import NotchBank
+    bank = NotchBank(SLICE_RATE)
+    bank.set_targets([(1000.0, 100.0), (1400.0, 100.0)])
+    assert bank.recomputes == 1
+    bank.set_targets([(1000.0, 100.0), (1400.0, 100.0)])         # unchanged -> no rebuild
+    assert bank.recomputes == 1
+    bank.set_targets([(1000.04, 100.0), (1400.0, 100.0)])        # rounds to the same table
+    assert bank.recomputes == 1
+    bank.set_targets([(1050.0, 100.0), (1400.0, 100.0)])         # a genuinely new target
+    assert bank.recomputes == 2
+    bank.set_targets([])
+    assert bank.recomputes == 3
+    bank.set_targets([])
+    assert bank.recomputes == 3
+
+
+def test_slice_filter_set_squeeze_notches_is_a_no_op_when_unchanged():
+    sf = SliceFilter(SLICE_RATE)
+    sf.set_squeeze_notches([(1000.0, 100.0)])
+    assert sf._squeeze_bank.recomputes == 1
+    sf.set_squeeze_notches([(1000.0, 100.0)])
+    assert sf._squeeze_bank.recomputes == 1
+    assert sf.squeeze_notches == [(1000.0, 100.0)]
+    sf.set_squeeze_notches([])
+    assert sf._squeeze_bank.recomputes == 2
+    assert sf.squeeze_notches == []
 
 
 def test_diversity_squeeze_sync_notches_wires_the_adapter_to_the_filter():

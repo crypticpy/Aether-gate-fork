@@ -26,6 +26,7 @@ import numpy as np
 
 from .agc import AGC_MODES, AGC_THRESHOLD_DB, Agc
 from .contour import PROFILE_BAND_HZ, fit_contour
+from .notchbank import NotchBank
 
 SHAPES = {"soft": 255, "sharp": 1023}   # soft: 196 Hz transition at 25 kS/s; 127 taps ate
                                         # 400 Hz of a 2.4 k passband and sounded muffled
@@ -227,7 +228,11 @@ class SliceFilter:
         self.auto_high = None
         self.auto_source = None
         self.anf_found = []                       # [(signed hz, width)]
-        self.squeeze_notches = []                 # [(signed hz, width)], SQUEEZE's own table
+        self._squeeze_bank = NotchBank(self.rate_hz)   # SQUEEZE's own notches (core/notchbank.py):
+                                                        # deep regardless of `shape`, so kept OUT of
+                                                        # the FIR design below rather than folded in
+        self.squeeze_notches = []                 # [(signed hz, width)], mirrors the bank's own
+                                                   # table, for anything reading it as before
         self.eq_tilt_db = 0.0                     # the tilt measured (print or spectrum)
         self.auto_bell = None                     # (hz, db, width) fitted to the talker
         self.auto_bell_source = None              # "print" while a bell is fitted
@@ -338,14 +343,13 @@ class SliceFilter:
         the target's bins when coherence has it on the notch tool rather than
         the null) -- kept apart from the operator's own table and the ANF's:
         released with squeeze=off, never touched by notch_add/notch_clear or
-        counted in their status. A no-op when the table has not actually
-        changed -- called every combined block while the notch tool holds,
-        and a redesign (DESIGN_N=4096) is not free."""
-        new = [(round(float(hz), 1), round(float(w), 1)) for hz, w in notches]
-        if new == [(round(hz, 1), round(w, 1)) for hz, w in self.squeeze_notches]:
-            return
-        self.squeeze_notches = new
-        self.dirty = True
+        counted in their status. Routed to core.notchbank.NotchBank (see its
+        own docstring for why this is NOT folded into the FIR design the way
+        the operator's notches and the ANF are); the bank itself is the
+        no-op-when-unchanged guard, called every combined block while the
+        notch tool holds."""
+        self._squeeze_bank.set_targets(notches)
+        self.squeeze_notches = list(self._squeeze_bank.targets)
 
     # ----- the sideband's sign ------------------------------------------
     def _sign(self):
@@ -375,7 +379,9 @@ class SliceFilter:
         sgn = self._sign()
         notches = [(sgn * n["hz"], n["width_hz"]) for n in s.notches] if s.notches_on else []
         notches += [(hz, w) for hz, w in self.anf_found]
-        notches += list(self.squeeze_notches)
+        # SQUEEZE's own notches are NOT here -- core/notchbank.py's dedicated
+        # cascade (self._squeeze_bank), applied ahead of this FIR in apply()
+        # below, is what makes them deep whatever `shape` is chosen.
         contour = self._contour()
         if contour is not None:
             contour = (sgn * contour[0], contour[1], contour[2])
@@ -394,7 +400,16 @@ class SliceFilter:
             self.dirty = True
         if ch == 0 and len(sig):
             self._follow_talker()
-            self._observe(sig)
+            self._observe(sig)                     # ahead of anything below, squeeze included
+        if self._squeeze_bank.n_sections and len(sig):
+            # SQUEEZE's own notch, AHEAD of the FIR and of `bypass` both: it
+            # is chainstatus.py's own row order (SQUEEZE sits in the
+            # COMBINER group, before SLICE FILTER's IF NOTCH/ANF/CONTOUR/
+            # APF/EQ group) and it is not a setting OF the slice filter for
+            # `bypass` to take out of circuit -- it is the diversity pair's
+            # own tool for one target, only living here because core.filter
+            # is what already owns a per-channel IIR pipeline on this IQ.
+            sig = self._squeeze_bank.apply(sig, ch)
         if self.spec.bypass:
             # Bypassed AFTER the measurement, not before: the spectrum, the
             # automatics and the talker's memory stay warm, so switching back
@@ -747,12 +762,27 @@ class SliceFilter:
                 "db": [round(max(float(x) - peak, -120.0), 1) for x in p],
                 "floor_db": round(floor - peak, 1)}
 
+    def combined_response_db(self, hz):
+        """|H| in dB at one signed frequency, the FIR and the SQUEEZE notch
+        bank TOGETHER (they are in series on the signal, so their dB simply
+        add) -- the true depth SQUEEZE's own notch tool reaches, not just
+        the FIR's, for anything (the squeeze status, this method's own
+        response_db) that wants the depth actually delivered rather than
+        the FIR design alone."""
+        if self.taps is None:
+            self._redesign()
+        return response_at(self.taps, self.rate_hz, hz) + self._squeeze_bank.response_db(hz)
+
     def response_db(self, points=128):
-        """The designed response across the audio band, for a picture."""
+        """The designed response across the audio band, for a picture --
+        the FIR and the SQUEEZE notch bank together (see
+        combined_response_db), so the VISUAL tab's bracket/teeth marks sit
+        on a curve that actually shows the notch whatever `shape` is in
+        force."""
         if self.taps is None:
             self._redesign()
         lo, hi = self.audio_edges()
         f_audio = np.linspace(0.0, max(hi + 500.0, 3500.0), points)
         f = self._sign() * f_audio
         return {"hz": [round(x) for x in f_audio],
-                "db": [round(max(response_at(self.taps, self.rate_hz, fx), -120.0), 1) for fx in f]}
+                "db": [round(max(self.combined_response_db(fx), -120.0), 1) for fx in f]}
