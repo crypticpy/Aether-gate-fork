@@ -67,15 +67,20 @@ AGC_THRESHOLD_DB = 20.0
 # THE FILTER PER TALKER. The tracker's talker memory recognises a known
 # talker by their spatial signature within TALK_HOLD_S (50 ms) of them
 # keying up, long before their voice print could. The filter rides on that:
-# what was in force while a talker was live (their edges, shape, automatics,
-# contour, AGC threshold -- the settings that are about a voice, not about
-# the frequency) is kept under their id and put back the block they return,
-# and a talker without a filter of their own restarts the automatics from
-# their print instead of gliding from the last talker's edges. "fast" snaps;
-# "smooth" lets the auto edges glide over ~0.4 s.
-TALKER_SETTINGS = ("low_hz", "high_hz", "shape", "auto", "auto_eq", "contour_on",
-                   "contour_hz", "contour_db", "contour_width_hz", "auto_contour",
-                   "agc_threshold_db")
+# what the AUTOMATICS learned while a talker was live (the auto edges, the
+# EQ tilt, the fitted contour bell) is kept under their id and put back the
+# block they return, and a talker without a record restarts the automatics
+# from their print instead of gliding from the last talker's edges. "fast"
+# snaps; "smooth" lets the auto edges glide over ~0.4 s.
+#
+# The OPERATOR'S choices (edges, shape, AUTO on/off, AUTO EQ, contour,
+# AGC threshold) are not per talker: they apply to everyone. The first cut
+# (2026-09-02) kept them per talker too, and on the air that meant a box
+# ticked while #3 talked went dark when #5 keyed up and came back with #3 --
+# with talker ids churning every few overs, the operator's settings simply
+# evaporated ("I have to click a couple of times to get it to turn on").
+TALKER_LEARNED = ("auto_low", "auto_high", "auto_source", "eq_tilt_db", "eq_lean_db",
+                  "auto_bell", "auto_bell_source")
 TALKER_SNAPS = ("fast", "smooth")
 TALKER_GLIDE_UPDATES = 8             # smooth: the narrowing rate is lifted for this many fits
 # After a talker change the spectrum is this talker's from the first block
@@ -479,21 +484,14 @@ class SliceFilter:
         return (s.contour_hz, s.contour_db, s.contour_width_hz) if s.contour_on else None
 
     def _talker_store(self, tid):
-        self.talker_filters[tid] = {
-            "spec": self.spec.copy(),
-            "auto_low": self.auto_low, "auto_high": self.auto_high,
-            "auto_source": self.auto_source,
-            "eq_tilt_db": self.eq_tilt_db, "eq_lean_db": self.eq_lean_db,
-            "auto_bell": self.auto_bell, "auto_bell_source": self.auto_bell_source,
-        }
+        self.talker_filters[tid] = {k: getattr(self, k) for k in TALKER_LEARNED}
 
     def _talker_restore(self, snap):
-        s = self.spec.copy()
-        for k in TALKER_SETTINGS:
-            setattr(s, k, getattr(snap["spec"], k))
-        self.agc.set(threshold_db=s.agc_threshold_db)
-        self.spec = s
-        self.eq_tilt_db, self.eq_lean_db = snap["eq_tilt_db"], snap["eq_lean_db"]
+        """What the automatics learned of this talker, back in force -- under
+        the operator's settings as they stand now, not as they stood then."""
+        s = self.spec
+        if s.auto_eq:
+            self.eq_tilt_db, self.eq_lean_db = snap["eq_tilt_db"], snap["eq_lean_db"]
         self.auto_bell, self.auto_bell_source = snap["auto_bell"], snap["auto_bell_source"]
         if s.auto:
             if self.talker_snap == "fast" or self.auto_low is None:
@@ -541,14 +539,15 @@ class SliceFilter:
             self.talker_filters = {k: v for k, v in self.talker_filters.items() if k in keep_ids}
 
     def talker_filter_summary(self, tid):
-        """The remembered filter of one talker, for the memory table; the
-        live one if that talker's filter is in force now."""
+        """The filter one talker gets, for the memory table: the operator's
+        settings with what the automatics learned of them; the live one if
+        that talker's filter is in force now."""
         if tid == self.talker_id:
             self._talker_store(tid)
         snap = self.talker_filters.get(tid)
         if snap is None:
             return None
-        sp = snap["spec"]
+        sp = self.spec
         if sp.auto and snap["auto_low"] is not None:
             lo, hi = snap["auto_low"], snap["auto_high"]
         else:

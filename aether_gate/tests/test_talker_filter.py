@@ -1,5 +1,5 @@
 #
-# Aether-gate — the filter per talker (core/filter.py, TALKER_SETTINGS).
+# Aether-gate — the filter per talker (core/filter.py, TALKER_LEARNED).
 # Copyright (C) 2026 Nigel Fenton (G0JKN). GPL-3.0-or-later.
 #
 """A known talker's filter comes back the block they key up; a new talker
@@ -58,29 +58,36 @@ def _blocks(sf, n=1):
     _run(sf, _voice(n * N / RATE + 0.01, 300, 2700))
 
 
-def test_a_known_talkers_filter_comes_back_the_block_they_key_up():
+def test_the_operators_settings_are_everyones_and_the_learned_edges_are_each_talkers():
     mic = _Mic()
-    sf = _filter(mic)
+    sf = _filter(mic, auto=True)
     mic.talker = 1
     _blocks(sf)
-    sf.set(low=300, high=2700, shape="sharp", threshold_db=12, contour=True, contour_db=4)
+    sf.set(shape="sharp", threshold_db=12, contour=True, contour_db=4)
     mic.talker = 2
-    _blocks(sf)                                   # #1's filter is stored as #2 keys up
-    sf.set(low=200, high=3100, shape="soft", threshold_db=20, contour=False)
+    _blocks(sf)                                   # #1's record is stored as #2 keys up
     st = sf.status()
     assert st["talker"] == {"enabled": True, "snap": "fast", "id": 2, "remembered": [1]}
+    # a box ticked while #2 talks is ticked for everyone
+    sf.set(auto_eq=True, threshold_db=20, contour=False, low=200, high=3100)
+    sf.talker_filters[1].update(auto_low=300.0, auto_high=2700.0, auto_source="spectrum",
+                                eq_tilt_db=-3.0, eq_lean_db=0.5)
     mic.talker = 1
-    _blocks(sf)                                   # ONE block: #1 is back
+    _blocks(sf)                                   # ONE block: #1's learned edges are back
     st = sf.status()
-    assert (st["set_low_hz"], st["set_high_hz"], st["shape"]) == (300, 2700, "sharp")
-    assert st["agc"]["threshold_db"] == 12.0 and sf.agc.threshold_db == 12.0
-    assert st["contour"]["enabled"] is True and st["contour"]["db"] == 4.0
+    assert st["auto"] == {"enabled": True, "source": "spectrum", "low_hz": 300, "high_hz": 2700}
+    assert (st["set_low_hz"], st["set_high_hz"], st["shape"]) == (200, 3100, "sharp")
+    assert st["agc"]["threshold_db"] == 20.0 and sf.agc.threshold_db == 20.0
+    assert st["contour"]["enabled"] is False and st["auto_eq"]["enabled"] is True
+    assert st["auto_eq"]["tilt_db"] == -3.0
     assert st["talker"]["id"] == 1 and st["talker"]["remembered"] == [1, 2]
+    # AUTO off by hand: nobody's learned edges are in force, the operator's are
+    sf.set(auto=False)
     mic.talker = 2
     _blocks(sf)
     st = sf.status()
-    assert (st["set_low_hz"], st["set_high_hz"], st["shape"]) == (200, 3100, "soft")
-    assert st["agc"]["threshold_db"] == 20.0 and st["contour"]["enabled"] is False
+    assert st["auto"]["enabled"] is False and st["low_hz"] == 200 and st["high_hz"] == 3100
+    assert sf.talker_filter_summary(1)["auto"] is False
 
 
 def test_notches_and_the_blanker_are_about_the_frequency_not_the_talker():
