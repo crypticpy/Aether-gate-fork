@@ -580,8 +580,14 @@ class _DiversityState:
             s = vp.summary(e["id"])
             dd = vp.distance(cur, s)
             return dd is not None and dd >= v.DIFFERENT_VOICE
-        if self.memory.reassign(time.monotonic(), unlike) is not None:
+        new = self.memory.reassign(time.monotonic(), unlike)
+        if new is not None:
             self.voice_splits += 1
+            was = self.memory.entry(active) or {}
+            print(f"[diversity] voice split: #{active}{' ' + was['name'] if was.get('name') else ''}"
+                  f"'s bearing but not their voice (d={d:.2f}, centroid {cur['centroid_hz']} vs "
+                  f"{mine['centroid_hz']} Hz, top {cur['high_hz']} vs {mine['high_hz']}, tilt "
+                  f"{cur['tilt_db']} vs {mine['tilt_db']} dB) -> #{new}", flush=True)
 
     def _monitor(self, pa, pb):
         if self.hear == "a":
