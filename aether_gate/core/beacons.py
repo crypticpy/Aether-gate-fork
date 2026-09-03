@@ -101,6 +101,155 @@ def bearing_distance(lat1, lon1, lat2, lon2):
     return brg, km
 
 
+class NarrowbandTap:
+    """The detector itself, with nothing about beacons in it: mix a coherent
+    pair down to one frequency (phase-continuous across blocks), boxcar
+    decimate, and keep the per-chunk auto- and cross-spectra of the window
+    being collected. The NCDXF slots use it, and so does the time-signal
+    watch, which listens to the same kind of carrier on the low bands.
+
+    The mixing phase multiplies both loops equally, so it cancels in the
+    cross-spectrum: a gap between windows costs nothing the pair cares
+    about, and only a RETUNE (a new offset) throws the window away."""
+
+    def __init__(self, rate_hz, decim=DECIM, chunk_s=CHUNK_S):
+        self.rate_hz = float(rate_hz)
+        self.decim = int(decim)
+        self.chunk = max(8, int(round(chunk_s * self.rate_hz / self.decim)))
+        self.offset_hz = 0.0
+        self._phase = 0.0
+        self._fifo_a = np.zeros(0, dtype=np.complex128)
+        self._fifo_b = np.zeros(0, dtype=np.complex128)
+        self.spec = []
+
+    def set_offset(self, offset_hz):
+        """Point the tap at a frequency, relative to the span's centre. A
+        no-op when it is already there; otherwise the window so far is void
+        and is dropped. True when it moved."""
+        if float(offset_hz) == self.offset_hz:
+            return False
+        self.offset_hz = float(offset_hz)
+        self._phase = 0.0
+        self._fifo_a = self._fifo_a[:0]
+        self._fifo_b = self._fifo_b[:0]
+        self.spec = []
+        return True
+
+    def reset(self):
+        """Start a new window; the mixer keeps running."""
+        self.spec = []
+
+    def feed(self, a, b):
+        n = min(len(a), len(b))
+        k = np.arange(n)
+        w = -2.0 * math.pi * self.offset_hz / self.rate_hz
+        rot = np.exp(1j * (self._phase + w * k))
+        self._phase = (self._phase + w * n) % (2.0 * math.pi)
+        d = self.decim
+        m = n // d
+        xa = (np.asarray(a[:m * d], dtype=np.complex128)
+              * rot[:m * d]).reshape(m, d).mean(axis=1)
+        xb = (np.asarray(b[:m * d], dtype=np.complex128)
+              * rot[:m * d]).reshape(m, d).mean(axis=1)
+        self._fifo_a = np.concatenate([self._fifo_a, xa])
+        self._fifo_b = np.concatenate([self._fifo_b, xb])
+        c = self.chunk
+        while len(self._fifo_a) >= c:
+            A = np.fft.fft(self._fifo_a[:c])
+            B = np.fft.fft(self._fifo_b[:c])
+            self._fifo_a = self._fifo_a[c:]
+            self._fifo_b = self._fifo_b[c:]
+            self.spec.append((np.abs(A) ** 2, np.abs(B) ** 2, A * np.conj(B)))
+
+
+def measure_window(spec, rate_hz, decim=DECIM, search_hz=SEARCH_HZ):
+    """What a collected window says about the carrier in it -- the part of a
+    scored result that a beacon slot and a time signal share.
+
+    The carrier is the strongest bin within +-search_hz of the tap's centre
+    over the whole window, each loop's floor is the median of the bins
+    outside that, and the pair's ratio and coherence are taken only over the
+    chunks the carrier was strong in (a keyed beacon is silent half the
+    time; averaging its silence in would only dilute the phase).
+
+    Returns (fields, dashes, ref_db), or None if the window is empty.
+    `dashes(n)` gives the n one-second levels from the strongest second on,
+    in the raw bin dB the HEARD_DB test uses; ref_db converts those to the
+    REF_BW_HZ convention the reported SNRs are in."""
+    if not spec:
+        return None
+    Paa = np.stack([s[0] for s in spec])
+    Pbb = np.stack([s[1] for s in spec])
+    Pab = np.stack([s[2] for s in spec])
+    c = Paa.shape[1]
+    f = np.fft.fftfreq(c, decim / rate_hz)
+    bin_hz = rate_hz / decim / c
+    ref = 10.0 * math.log10(REF_BW_HZ / bin_hz)         # bin SNR -> SNR in REF_BW_HZ
+    search = np.abs(f) <= search_hz
+    mean_spec = np.mean(Paa + Pbb, axis=0)
+    k = int(np.argmax(np.where(search, mean_spec, -np.inf)))
+    others = ~search
+    floor_a = float(np.median(Paa[:, others]))
+    floor_b = float(np.median(Pbb[:, others]))
+    # each loop's own floor, in the same REF_BW_HZ convention as the SNRs
+    # and in dBFS: an unwindowed c-point FFT of a signal of power P has
+    # E|X_k|^2 = c*P per bin, so per-bin power -> power in REF_BW_HZ is
+    # ref - 20 log10 c. snr_a + floor_a_db is then the carrier's level.
+    floor_ref = ref - 20.0 * math.log10(c)
+    pa = Paa[:, k]; pb = Pbb[:, k]; p = pa + pb
+    floor = floor_a + floor_b
+    per_s = max(1, int(round(rate_hz / (decim * c))))    # chunks in one second
+    ma = np.convolve(p, np.ones(per_s) / per_s, mode="valid")
+    i0 = int(np.argmax(ma))
+    peak = float(ma[i0])
+    bin_snr = 10.0 * math.log10(max(peak - floor, 1e-30) / max(floor, 1e-30))
+    heard = bin_snr >= HEARD_DB
+    strong = p >= floor + 0.5 * (peak - floor)
+    if heard and strong.any():
+        xab = complex(np.sum(Pab[strong, k]))
+        saa = float(np.sum(pa[strong])); sbb = float(np.sum(pb[strong]))
+        phase = math.degrees(math.atan2(xab.imag, xab.real))
+        coh = min(1.0, abs(xab) ** 2 / max(saa * sbb, 1e-30))
+        # B relative to A, COMPLEX: the least-squares S_ba / S_aa over the
+        # strong chunks. phase_deg below is the cross-spectrum's angle and
+        # so the NEGATIVE of this one's; the pair keeps both because an
+        # N-element array wants a steering vector, not an angle.
+        ratio = complex(np.conj(xab) / max(saa, 1e-30))
+        sa = max(float(np.mean(pa[strong])) - floor_a, 0.0)
+        sb = max(float(np.mean(pb[strong])) - floor_b, 0.0)
+        snr_a = 10.0 * math.log10(max(sa, 1e-30) / max(floor_a, 1e-30)) - ref
+        snr_b = 10.0 * math.log10(max(sb, 1e-30) / max(floor_b, 1e-30)) - ref
+        r = min(sa / sb, sb / sa) if sa > 0 and sb > 0 else 0.0
+        gain = 10.0 * math.log10(1.0 + r)
+    else:
+        phase = coh = ratio = None
+        snr_a = snr_b = gain = None
+
+    def dashes(n):
+        out = []
+        for s in range(int(n)):
+            j = i0 + s * per_s
+            if j >= len(ma):
+                break
+            out.append(10.0 * math.log10(max(float(ma[j]) - floor, 1e-30)
+                                         / max(floor, 1e-30)))
+        return out
+
+    fields = {
+        "heard": bool(heard), "snr_db": round(bin_snr - ref, 1),
+        "offset_hz": round(float(f[k]), 1),
+        "snr_a": None if snr_a is None else round(snr_a, 1),
+        "snr_b": None if snr_b is None else round(snr_b, 1),
+        "phase_deg": None if phase is None else round(phase, 1),
+        "coherence": None if coh is None else round(coh, 2),
+        "ratio": None if ratio is None else [round(ratio.real, 4), round(ratio.imag, 4)],
+        "floor_a_db": round(10.0 * math.log10(max(floor_a, 1e-30)) + floor_ref, 1),
+        "floor_b_db": round(10.0 * math.log10(max(floor_b, 1e-30)) + floor_ref, 1),
+        "gain_db": None if gain is None else round(gain, 1),
+    }
+    return fields, dashes, ref
+
+
 def slot_at(t_utc):
     return int(t_utc // SLOT_S) % SLOTS
 
@@ -119,14 +268,10 @@ class BeaconWatch:
         self.store_path = os.path.expanduser(store_path) if store_path else None
         self.station_grid = None
         self._station = None               # (lat, lon) once the grid is known
-        self.chunk = max(8, int(round(CHUNK_S * self.rate_hz / DECIM)))
+        self.tap = NarrowbandTap(self.rate_hz)
+        self.chunk = self.tap.chunk
         self.band_hz = None
-        self._offset_hz = 0.0
-        self._phase = 0.0                  # NCO phase, continuous across blocks
-        self._fifo_a = np.zeros(0, dtype=np.complex128)
-        self._fifo_b = np.zeros(0, dtype=np.complex128)
         self._slot = None                  # (slot index, band) being collected
-        self._spec = []                    # per chunk: (Paa, Pbb, Pab) over the bins
         self.results = {}                  # (band_hz, call) -> dict (latest + running)
         self.last = None
         self._load()
@@ -188,36 +333,23 @@ class BeaconWatch:
         band = self._band_in_span(center_hz)
         if band is None:
             if self._slot is not None:
-                self._slot, self._spec = None, []
+                self._slot = None
+                self.tap.reset()
             self.band_hz = None
             return
         if band != self.band_hz:
             self.band_hz = band
-            self._offset_hz = band - center_hz
-            self._phase = 0.0
-            self._fifo_a = self._fifo_a[:0]; self._fifo_b = self._fifo_b[:0]
-            self._slot, self._spec = None, []
+            self.tap.set_offset(band - center_hz)
+            self.tap.reset()
+            self._slot = None
         slot = slot_at(t_utc)
         if self._slot is not None and self._slot[0] != slot:
             self._score(self._slot, t_utc)
-            self._slot, self._spec = None, []
+            self._slot = None
+            self.tap.reset()
         if self._slot is None:
             self._slot = (slot, band, t_utc)
-        n = min(len(a), len(b))
-        k = np.arange(n)
-        w = -2.0 * math.pi * self._offset_hz / self.rate_hz
-        rot = np.exp(1j * (self._phase + w * k))
-        self._phase = (self._phase + w * n) % (2.0 * math.pi)
-        m = n // DECIM
-        xa = (np.asarray(a[:m * DECIM], dtype=np.complex128) * rot[:m * DECIM]).reshape(m, DECIM).mean(axis=1)
-        xb = (np.asarray(b[:m * DECIM], dtype=np.complex128) * rot[:m * DECIM]).reshape(m, DECIM).mean(axis=1)
-        self._fifo_a = np.concatenate([self._fifo_a, xa])
-        self._fifo_b = np.concatenate([self._fifo_b, xb])
-        c = self.chunk
-        while len(self._fifo_a) >= c:
-            A = np.fft.fft(self._fifo_a[:c]); B = np.fft.fft(self._fifo_b[:c])
-            self._fifo_a = self._fifo_a[c:]; self._fifo_b = self._fifo_b[c:]
-            self._spec.append((np.abs(A) ** 2, np.abs(B) ** 2, A * np.conj(B)))
+        self.tap.feed(a, b)
 
     def _band_in_span(self, center_hz):
         half = self.rate_hz / 2.0 - EDGE_MARGIN_HZ
@@ -229,86 +361,34 @@ class BeaconWatch:
     # --- scoring a finished slot ---------------------------------------------
     def _score(self, slot, t_now):
         idx, band, t0 = slot
-        if len(self._spec) < int(0.8 * SLOT_S / CHUNK_S):
+        if len(self.tap.spec) < int(0.8 * SLOT_S / CHUNK_S):
             return                                          # a partial slot: retune, start
-        Paa = np.stack([s[0] for s in self._spec]); Pbb = np.stack([s[1] for s in self._spec])
-        Pab = np.stack([s[2] for s in self._spec])
-        c = Paa.shape[1]
-        f = np.fft.fftfreq(c, DECIM / self.rate_hz)
-        bin_hz = self.rate_hz / DECIM / c
-        ref = 10.0 * math.log10(REF_BW_HZ / bin_hz)         # bin SNR -> SNR in REF_BW_HZ
-        search = np.abs(f) <= SEARCH_HZ
-        both = Paa + Pbb
-        mean_spec = np.mean(both, axis=0)
-        k = int(np.argmax(np.where(search, mean_spec, -np.inf)))
-        others = ~search
-        floor_a = float(np.median(Paa[:, others])); floor_b = float(np.median(Pbb[:, others]))
-        # each loop's own floor, in the same REF_BW_HZ convention as the SNRs
-        # and in dBFS: an unwindowed c-point FFT of a signal of power P has
-        # E|X_k|^2 = c*P per bin, so per-bin power -> power in REF_BW_HZ is
-        # ref - 20 log10 c. snr_a + floor_a_db is then the beacon's level.
-        floor_ref = ref - 20.0 * math.log10(c)
-        pa = Paa[:, k]; pb = Pbb[:, k]; p = pa + pb
-        floor = floor_a + floor_b
-        # 1 s moving average, the 100 W dash is the strongest second
-        per_s = int(round(1.0 / CHUNK_S))
-        ma = np.convolve(p, np.ones(per_s) / per_s, mode="valid")
-        i0 = int(np.argmax(ma))
-        peak = float(ma[i0])
-        bin_snr = 10.0 * math.log10(max(peak - floor, 1e-30) / max(floor, 1e-30))
-        snr_db = bin_snr - ref
-        heard = bin_snr >= HEARD_DB
+        got = measure_window(self.tap.spec, self.rate_hz)
+        if got is None:
+            return
+        fields, dashes, ref = got
         # the four dashes: 1 s each from the strongest second on; a step is
         # heard when its second stands HEARD_DB over the floor
-        steps = []
-        for s in range(len(STEPS_W)):
-            j = i0 + s * per_s
-            if j >= len(ma):
-                break
-            steps.append(10.0 * math.log10(max(float(ma[j]) - floor, 1e-30) / max(floor, 1e-30)))
+        steps = dashes(len(STEPS_W))
         steps_heard = 0
         for d in steps:
             if d >= HEARD_DB:
                 steps_heard += 1
             else:
                 break
-        strong = p >= floor + 0.5 * (peak - floor)
-        if heard and strong.any():
-            xab = complex(np.sum(Pab[strong, k]))
-            saa = float(np.sum(pa[strong])); sbb = float(np.sum(pb[strong]))
-            phase = math.degrees(math.atan2(xab.imag, xab.real))
-            coh = min(1.0, abs(xab) ** 2 / max(saa * sbb, 1e-30))
-            # B relative to A, COMPLEX: the least-squares S_ba / S_aa over the
-            # strong chunks. phase_deg below is the cross-spectrum's angle and
-            # so the NEGATIVE of this one's; the pair keeps both because an
-            # N-element array wants a steering vector, not an angle.
-            ratio = complex(np.conj(xab) / max(saa, 1e-30))
-            sa = max(float(np.mean(pa[strong])) - floor_a, 0.0)
-            sb = max(float(np.mean(pb[strong])) - floor_b, 0.0)
-            snr_a = 10.0 * math.log10(max(sa, 1e-30) / max(floor_a, 1e-30)) - ref
-            snr_b = 10.0 * math.log10(max(sb, 1e-30) / max(floor_b, 1e-30)) - ref
-            r = min(sa / sb, sb / sa) if sa > 0 and sb > 0 else 0.0
-            gain = 10.0 * math.log10(1.0 + r)
-        else:
-            phase = coh = ratio = None
-            snr_a = snr_b = gain = None
         call, loc = BEACONS[(idx - BANDS_HZ.index(band)) % SLOTS]
         res = {
-            "call": call, "location": loc, "band_hz": band, "at": float(t0 - (t0 % SLOT_S)),
-            "heard": bool(heard), "snr_db": round(snr_db, 1),
-            "offset_hz": round(float(f[k]), 1),
-            "snr_a": None if snr_a is None else round(snr_a, 1),
-            "snr_b": None if snr_b is None else round(snr_b, 1),
-            "phase_deg": None if phase is None else round(phase, 1),
-            "coherence": None if coh is None else round(coh, 2),
-            "ratio": None if ratio is None else [round(ratio.real, 4), round(ratio.imag, 4)],
-            "floor_a_db": round(10.0 * math.log10(max(floor_a, 1e-30)) + floor_ref, 1),
-            "floor_b_db": round(10.0 * math.log10(max(floor_b, 1e-30)) + floor_ref, 1),
-            "gain_db": None if gain is None else round(gain, 1),
+            "call": call, "location": loc, "band_hz": band,
+            "at": float(t0 - (t0 % SLOT_S)), "source": "ncdxf",
+        }
+        res.update(fields)
+        res.update({
             "steps_db": [round(d - ref, 1) for d in steps],
             "steps_heard": int(steps_heard),
             "lowest_w": STEPS_W[steps_heard - 1] if steps_heard else None,
-        }
+        })
+        snr_db = res["snr_db"]
+        heard = res["heard"]
         prev = self.results.get((band, call))
         n = int(prev.get("samples", 1)) if prev else 0
         heard_n = int(prev.get("heard_n", 0)) if prev else 0

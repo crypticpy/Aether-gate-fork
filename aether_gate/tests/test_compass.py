@@ -23,12 +23,18 @@ import numpy as np
 import pytest
 
 from aether_gate.core import compass
-from aether_gate.core.compass import (BandFit, compass_json, fit, fit_from_log,
-                                      pattern_from_log)
+from aether_gate.core.compass import (C_M_S, BandFit, compass_json, fit,
+                                      fit_from_log, fit_global,
+                                      fit_global_from_log, pattern_from_log)
 from aether_gate.core.sitelog import SiteLog
 
 BAND = 14_100_000.0
 PHI0, A, B = 120.0, 1.9, -1.4        # k = 2.36 rad, baseline 323.6 deg true
+# the global model's truth: 12.5 ns of cable difference, 3.2 m apart on 065
+DTAU, D_M, THETA_B = 12.5e-9, 3.2, 65.0
+# 14.100, 18.110 and 24.930 are NOT all multiples of one frequency, so the
+# whole-turn alias in dtau that 14.1/21.15/28.2 share is not in these
+HIGH_BANDS = (14_100_000.0, 18_110_000.0, 24_930_000.0)
 
 
 def _phase(bearing_deg, phi0=PHI0, a=A, b=B):
@@ -200,10 +206,167 @@ def test_compass_json_covers_every_band_the_log_has_and_names_the_mirror(tmp_pat
     assert 75.0 in got[BAND]["bearing_from_phase"]["bearings_deg"]
     assert got[21_150_000.0]["available"] is False
     assert "2 beacon" in got[21_150_000.0]["reason"]
-    assert compass_json(log, bands_hz=[]) == {"available": False, "bands": [],
-                                              "reason": "no beacon band heard yet, 3 needed",
-                                              "fitted": 0,
-                                              "model": out["model"],
-                                              "mirror": BandFit.MIRROR}
+    empty = compass_json(log, bands_hz=[])
+    assert set(empty) == {"available", "reason", "bands", "fitted", "model",
+                          "global", "mirror"}
+    assert (empty["available"], empty["bands"], empty["fitted"]) == (False, [], 0)
+    assert empty["reason"] == "no beacon band heard yet, 3 needed"
+    assert empty["model"] == out["model"] and empty["mirror"] == BandFit.MIRROR
     import json
     assert json.loads(json.dumps(out))["fitted"] == 1
+
+
+# --- the same pair, on every band ---------------------------------------------
+
+def _gphase(bearing_deg, f_hz, dtau=DTAU, d_m=D_M, theta_b=THETA_B):
+    """What a real pair of loops measures: a cable delay plus the geometry,
+    both of which grow with frequency. Wrapped, as a phase always is."""
+    th = math.radians(bearing_deg - theta_b)
+    return compass._wrap180(math.degrees(
+        2.0 * math.pi * f_hz * (dtau + (d_m / C_M_S) * math.cos(th))))
+
+
+def _gevent(bearing_deg, f_hz, call="C0", noise_deg=0.0, rng=None,
+            dtau=DTAU, d_m=D_M, theta_b=THETA_B, coherence=0.9):
+    """One site-log beacon line towards a known bearing on one frequency."""
+    p = _gphase(bearing_deg, f_hz, dtau, d_m, theta_b)
+    if noise_deg and rng is not None:
+        p += rng.normal(0.0, noise_deg)
+    z = np.exp(1j * math.radians(p))
+    return {"kind": "beacon", "band_hz": f_hz, "callsign": call,
+            "bearing_deg": bearing_deg, "ratio": [z.real, z.imag],
+            "coherence": coherence, "snr_a_db": 20.0, "snr_b_db": 18.0}
+
+
+def _gevents(bearings, bands, noise_deg=0.0, seed=5, **kw):
+    rng = np.random.default_rng(seed)
+    return [_gevent(t, f, "C%d" % i, noise_deg, rng, **kw)
+            for f in bands for i, t in enumerate(bearings)]
+
+
+def test_beacons_on_three_bands_give_the_pair_itself_delay_spacing_and_bearing():
+    bearings = [10.0, 75.0, 140.0, 215.0, 300.0]
+    g = fit_global(_gevents(bearings, HIGH_BANDS, noise_deg=2.0))
+    assert g.available and g.n_beacons == 15 and g.n_bands == 3
+    assert g.dtau_ns == pytest.approx(DTAU * 1e9, abs=2.0)
+    assert g.d_m == pytest.approx(D_M, abs=0.3)
+    assert g.baseline_deg == pytest.approx(THETA_B, abs=2.0)
+    assert g.quality > 0.99 and g.unique and g.alternatives == []
+    assert [b["band_hz"] for b in g.bands] == sorted(HIGH_BANDS)
+    assert all(b["n_beacons"] == 5 and b["max_residual_deg"] < 8.0 for b in g.bands)
+    d = g.as_dict()
+    assert d["dtau_ns"] == round(g.dtau_ns, 2) and d["n_bands"] == 3
+    assert len(d["beacons"]) == 15 and "reflection" in d["mirror"]
+    # every band's own k is the one 2 pi f d / c predicts
+    for band in HIGH_BANDS:
+        assert g.k_at(band) == pytest.approx(2 * math.pi * band * D_M / C_M_S, abs=0.05)
+
+
+def test_a_second_band_breaks_the_alias_four_beacons_on_one_band_cannot():
+    four = [20.0, 130.0, 200.0, 310.0]
+    one = _gevents(four, [BAND])
+    per_band = fit(four, [complex(*e["ratio"]) for e in one], band_hz=BAND)
+    assert per_band.available and not per_band.unique      # four wrapped phases
+    assert len(per_band.alias_k) > 1
+    # the SAME four directions, heard again on 18.110: one spacing explains
+    # both bands and the wider alias explains neither
+    g = fit_global(one + _gevents(four, [18_110_000.0]))
+    assert g.available and g.unique and g.alternatives == []
+    assert g.d_m == pytest.approx(D_M, abs=0.1)
+    assert g.baseline_deg == pytest.approx(THETA_B, abs=1.0)
+    assert g.dtau_ns == pytest.approx(DTAU * 1e9, abs=1.0)
+
+
+def test_a_compass_earned_on_the_high_bands_answers_on_eighty_metres():
+    g = fit_global(_gevents([10.0, 75.0, 140.0, 215.0, 300.0], HIGH_BANDS,
+                            noise_deg=1.0))
+    assert g.available
+    # not 245 or 65: a bearing ON the baseline is the edge of the pattern,
+    # where a tenth of a degree of phase error is outside the model
+    for truth in (30.0, 110.0, 200.0):
+        ans = g.bearing_from_phase(_gphase(truth, 3_800_000.0), 3_800_000.0)
+        assert ans["available"] and not ans["outside_model"]
+        assert ans["f_hz"] == 3_800_000.0 and not ans["grating_lobes"]
+        assert len(ans["bearings_deg"]) == 2
+        assert min(abs(b - truth) for b in ans["bearings_deg"]) < 5.0
+        # and the model's own phase at 3.8 MHz inverts exactly
+        for b in ans["bearings_deg"]:
+            assert g.phase_at(b, 3_800_000.0) == pytest.approx(
+                compass._wrap180(_gphase(truth, 3_800_000.0)), abs=1.0)
+
+
+def test_a_pair_over_half_a_wavelength_apart_has_grating_lobes():
+    g = fit_global(_gevents([10.0, 75.0, 140.0, 215.0, 300.0], HIGH_BANDS,
+                            d_m=12.0))
+    assert g.available and g.d_m == pytest.approx(12.0, abs=0.1)
+    ans = g.bearing_from_phase(_gphase(110.0, 28_200_000.0, d_m=12.0), 28_200_000.0)
+    assert ans["grating_lobes"] and ans["d_over_lambda"] > 0.5
+    assert len(ans["bearings_deg"]) > 2                    # the extra answers
+    assert min(abs(b - 110.0) for b in ans["bearings_deg"]) < 2.0
+    # ... and on 80 m the same pair is a fraction of a wavelength again
+    low = g.bearing_from_phase(_gphase(110.0, 3_800_000.0, d_m=12.0), 3_800_000.0)
+    assert not low["grating_lobes"] and len(low["bearings_deg"]) == 2
+
+
+def test_one_band_fits_the_geometry_but_cannot_pin_the_cable_delay():
+    five = [10.0, 75.0, 140.0, 215.0, 300.0]
+    g = fit_global(_gevents(five, [BAND], noise_deg=0.5))
+    assert g.available and g.n_bands == 1
+    assert g.d_m == pytest.approx(D_M, abs=0.3)
+    assert g.baseline_deg == pytest.approx(THETA_B, abs=2.0)
+    # a whole turn at 14.100 is 70.9 ns of delay and lands on the same
+    # phases: the fit takes the shortest cable and NAMES the others
+    assert not g.unique and g.alternatives
+    step = 1e9 / BAND
+    for alt in g.alternatives:
+        assert alt["d_m"] == pytest.approx(g.d_m, abs=0.05)
+        turns = (alt["dtau_ns"] - g.dtau_ns) / step
+        assert abs(turns - round(turns)) < 0.05 and round(turns) != 0
+
+
+def test_the_global_fit_says_why_when_the_beacons_are_too_few_or_bunched():
+    five = [10.0, 75.0, 140.0, 215.0, 300.0]
+    g = fit_global(_gevents(five[:3], [BAND]))
+    assert not g.available and "3 beacon" in g.reason and "4 needed" in g.reason
+    assert g.as_dict() == {"available": False, "reason": g.reason, "n_beacons": 3,
+                           "n_bands": 1, "model": compass.GLOBAL_MODEL}
+    g = fit_global(_gevents(five[:4], [BAND]))
+    assert not g.available and "on one band" in g.reason and "5 needed" in g.reason
+    assert fit_global(_gevents(five[:2], HIGH_BANDS)).available          # 6 over 3
+    bunched = fit_global(_gevents([10.0, 25.0, 40.0, 55.0, 70.0], HIGH_BANDS))
+    assert not bunched.available and "span 60 deg" in bunched.reason
+    assert bunched.bearing_from_phase(20.0, 3_800_000.0) == {
+        "available": False, "reason": bunched.reason, "bearings_deg": []}
+    assert bunched.phase_at(20.0, 3_800_000.0) is None
+    # a line with no ratio, no bearing or no coherence is not a measurement
+    thin = _gevents(five, HIGH_BANDS)
+    for e in thin[:11]:
+        e["ratio"] = None
+    assert fit_global(thin).n_beacons == 4
+
+
+def test_the_log_feeds_the_global_fit_and_the_compass_answers_at_the_slice(tmp_path):
+    log = SiteLog(str(tmp_path / "site-log.jsonl"))
+    bearings = [10.0, 75.0, 140.0, 215.0, 300.0]
+    calls = ["4U1UN", "W6WX", "ZL6B", "OH2B", "CS3B"]
+    for f in HIGH_BANDS:
+        for call, t in zip(calls, bearings):
+            log.beacon(band_hz=f, callsign=call, bearing_deg=t, distance_km=5000.0,
+                       snr_a_db=20.0, snr_b_db=18.0, floor_a_db=-24.0,
+                       floor_b_db=-23.5, coherence=0.9,
+                       ratio=np.exp(1j * math.radians(_gphase(t, f))))
+    g = fit_global_from_log(log)
+    assert g.available and g.n_beacons == 15 and g.unique
+    assert g.d_m == pytest.approx(D_M, abs=0.1)
+    truth = 250.0
+    out = compass_json(log, phase_deg=_gphase(truth, 3_800_000.0), f_hz=3_800_000.0)
+    assert out["global"]["available"] and out["global"]["n_bands"] == 3
+    assert min(abs(b - truth) for b in out["bearing"]["bearings_deg"]) < 5.0
+    # the per-band fits are the check on the global one, and they agree
+    for row in out["bands"]:
+        assert row["available"] and abs(row["vs_global"]["disagreement_deg"]) < 3.0
+        assert row["vs_global"]["k_global"] == pytest.approx(row["k"], abs=0.05)
+    # no frequency, no global bearing -- the per-band answers still stand
+    quiet = compass_json(log, phase_deg=_gphase(truth, BAND))
+    assert "bearing" not in quiet and quiet["global"]["available"]
+    assert quiet["bands"][0]["bearing_from_phase"]["available"]
