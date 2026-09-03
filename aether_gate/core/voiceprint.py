@@ -168,11 +168,13 @@ class VoicePrint:
         p_lo = float(b[3:8].sum())            # 300 .. 800 Hz
         p_hi = float(b[15:25].sum())          # 1.5 .. 2.5 kHz
         tilt = 10 * math.log10(p_hi / p_lo) if p_lo > 0 and p_hi > 0 else None
+        bands_db = 10 * np.log10(np.maximum(b, peak * 1e-6) / peak)
         return {"centroid_hz": round(float((centres * b).sum() / total)),
                 "low_hz": round(lo_hz), "high_hz": round(hi_hz),
                 "tilt_db": None if tilt is None else round(tilt, 1),
                 "syllabic_hz": None if syllabic is None else round(syllabic, 1),
-                "over_s": round(over_s, 1), "overs": int(overs)}
+                "over_s": round(over_s, 1), "overs": int(overs),
+                "bands_db": [round(float(x), 1) for x in bands_db]}    # 100 Hz bands, re peak
 
     def forget(self, keep_ids=None):
         """Drop every print, or every print whose talker is not in keep_ids."""

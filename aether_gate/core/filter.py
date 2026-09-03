@@ -24,6 +24,8 @@ import math
 
 import numpy as np
 
+from .contour import PROFILE_BAND_HZ, fit_contour
+
 SHAPES = {"soft": 255, "sharp": 1023}   # soft: 196 Hz transition at 25 kS/s; 127 taps ate
                                         # 400 Hz of a 2.4 k passband and sounded muffled
 DESIGN_N = 4096                      # frequency-sampling grid for the design
@@ -53,7 +55,6 @@ EQ_REFERENCE_TILT_DB = -6.0          # a normally set-up SSB station: highs ~6 d
 EQ_STRENGTH = 0.5                    # take half the deviation out, never all of it
 EQ_LOW_CENTRE_HZ = 550.0             # the print's tilt is 1.5-2.5 k over 300-800 Hz
 EQ_HIGH_CENTRE_HZ = 2000.0
-
 AGC_MODES = {                        # attack_ms, decay_ms, hang_ms
     "fast": (2.0, 100.0, 0.0),
     "med": (5.0, 250.0, 250.0),
@@ -73,7 +74,8 @@ AGC_THRESHOLD_DB = 20.0
 # their print instead of gliding from the last talker's edges. "fast" snaps;
 # "smooth" lets the auto edges glide over ~0.4 s.
 TALKER_SETTINGS = ("low_hz", "high_hz", "shape", "auto", "auto_eq", "contour_on",
-                   "contour_hz", "contour_db", "contour_width_hz", "agc_threshold_db")
+                   "contour_hz", "contour_db", "contour_width_hz", "auto_contour",
+                   "agc_threshold_db")
 TALKER_SNAPS = ("fast", "smooth")
 TALKER_GLIDE_UPDATES = 8             # smooth: the narrowing rate is lifted for this many fits
 # After a talker change the spectrum is this talker's from the first block
@@ -118,6 +120,7 @@ class FilterSpec:
         self.apf_width_hz = 150.0
         self.auto = False
         self.auto_eq = False
+        self.auto_contour = True                  # the bell comes from the talker's profile
         self.nb_on = False
         self.nb_db = 12.0
         self.agc_mode = "med"
@@ -297,6 +300,8 @@ class SliceFilter:
         self.auto_source = None
         self.anf_found = []                       # [(signed hz, width)]
         self.eq_tilt_db = 0.0                     # the tilt measured (print or spectrum)
+        self.auto_bell = None                     # (hz, db, width) fitted to the talker
+        self.auto_bell_source = None              # "print" while a bell is fitted
         self.eq_lean_db = 0.0                     # the correction in the taps
         self.blanked_pct = 0.0
         self._blocks = 0
@@ -321,12 +326,17 @@ class SliceFilter:
                     self.anf_found = []
             elif k == "contour":
                 s.contour_on = bool(v)
-            elif k == "contour_hz":
-                s.contour_hz = float(v)
+            elif k == "contour_hz":                       # a hand on the knob takes over
+                s.contour_hz, s.auto_contour = float(v), False
             elif k == "contour_db":
                 s.contour_db = max(-20.0, min(20.0, float(v)))
+                s.auto_contour = False
             elif k == "contour_width":
-                s.contour_width_hz = max(50.0, float(v))
+                s.contour_width_hz, s.auto_contour = max(50.0, float(v)), False
+            elif k == "auto_contour":
+                s.auto_contour = bool(v)
+                if not s.auto_contour:
+                    self.auto_bell = None
             elif k == "apf":
                 s.apf_on = bool(v)
             elif k == "apf_hz":
@@ -411,7 +421,9 @@ class SliceFilter:
         sgn = self._sign()
         notches = [(sgn * n["hz"], n["width_hz"]) for n in s.notches]
         notches += [(hz, w) for hz, w in self.anf_found]
-        contour = (sgn * s.contour_hz, s.contour_db, s.contour_width_hz) if s.contour_on else None
+        contour = self._contour()
+        if contour is not None:
+            contour = (sgn * contour[0], contour[1], contour[2])
         apf = (sgn * s.apf_hz, s.apf_width_hz) if s.apf_on else None
         taps = design_taps(self.rate_hz, lo, hi, s.shape, notches, contour, apf,
                            self.eq_lean_db if s.auto_eq else 0.0)
@@ -455,8 +467,16 @@ class SliceFilter:
         snap = self.talker_filters.get(tid)
         if snap is not None:
             self._talker_restore(snap)
-        elif self.spec.auto:
+        else:
             self._auto_restart()
+
+    def _contour(self):
+        """The bell in force, audio hertz: the fitted one when the contour
+        is automatic, the operator's when it is on by hand."""
+        s = self.spec
+        if s.auto_contour:
+            return self.auto_bell
+        return (s.contour_hz, s.contour_db, s.contour_width_hz) if s.contour_on else None
 
     def _talker_store(self, tid):
         self.talker_filters[tid] = {
@@ -464,6 +484,7 @@ class SliceFilter:
             "auto_low": self.auto_low, "auto_high": self.auto_high,
             "auto_source": self.auto_source,
             "eq_tilt_db": self.eq_tilt_db, "eq_lean_db": self.eq_lean_db,
+            "auto_bell": self.auto_bell, "auto_bell_source": self.auto_bell_source,
         }
 
     def _talker_restore(self, snap):
@@ -473,6 +494,7 @@ class SliceFilter:
         self.agc.set(threshold_db=s.agc_threshold_db)
         self.spec = s
         self.eq_tilt_db, self.eq_lean_db = snap["eq_tilt_db"], snap["eq_lean_db"]
+        self.auto_bell, self.auto_bell_source = snap["auto_bell"], snap["auto_bell_source"]
         if s.auto:
             if self.talker_snap == "fast" or self.auto_low is None:
                 self.auto_low, self.auto_high = snap["auto_low"], snap["auto_high"]
@@ -504,6 +526,9 @@ class SliceFilter:
             if hi - lo < AUTO_MIN_WIDTH_HZ:
                 hi = lo + AUTO_MIN_WIDTH_HZ
             self.auto_low, self.auto_high, self.auto_source = lo, hi, "print"
+        self.auto_bell = self.auto_bell_source = None
+        if self.spec.auto_contour and pr and pr.get("bands_db") is not None:
+            self.auto_bell, self.auto_bell_source = fit_contour(pr["bands_db"]), "print"
         self._spectrum_restart()
         self.dirty = True
 
@@ -532,6 +557,16 @@ class SliceFilter:
                 "auto": sp.auto, "auto_eq": sp.auto_eq, "contour": sp.contour_on,
                 "threshold_db": sp.agc_threshold_db, "live": tid == self.talker_id}
 
+    def _contour_status(self):
+        s = self.spec
+        bell = self._contour()
+        if s.auto_contour:
+            hz, db, width = bell if bell is not None else (None, 0.0, None)
+            return {"enabled": bell is not None, "hz": hz, "db": db, "width_hz": width,
+                    "auto": True, "source": self.auto_bell_source if bell is not None else None}
+        return {"enabled": s.contour_on, "hz": s.contour_hz, "db": s.contour_db,
+                "width_hz": s.contour_width_hz, "auto": False, "source": "manual"}
+
     def _observe(self, sig):
         m = min(len(sig), SPEC_N)
         x = sig[-m:] * np.hanning(m)
@@ -553,6 +588,8 @@ class SliceFilter:
             self._auto_notch()
         if self.spec.auto_eq and not hold:
             self._auto_eq()
+        if self.spec.auto_contour and not hold:
+            self._auto_contour()
 
     def _print(self):
         try:
@@ -643,6 +680,30 @@ class SliceFilter:
             self.anf_found = found
             self.dirty = True
 
+    def _profile_db(self):
+        """The talker's band profile: their print, once they have one. The
+        1 s spectrum is not used -- a carrier, a tone or the noise between
+        words would earn a bell the voice never asked for."""
+        pr = self._print()
+        if pr and pr.get("bands_db") is not None:
+            return np.asarray(pr["bands_db"], dtype=float), "print"
+        return None, None
+
+    def _auto_contour(self):
+        prof, source = self._profile_db()
+        if prof is None:
+            return
+        bell = fit_contour(prof)
+        old = self.auto_bell
+        changed = (bell is None) != (old is None) or (
+            bell is not None and (abs(bell[0] - old[0]) >= PROFILE_BAND_HZ
+                                  or abs(bell[1] - old[1]) >= 0.5
+                                  or abs(bell[2] - old[2]) >= PROFILE_BAND_HZ))
+        self.auto_bell_source = source
+        if changed:
+            self.auto_bell = bell
+            self.dirty = True
+
     def _auto_eq(self):
         pr = self._print()
         tilt = pr.get("tilt_db") if pr else None
@@ -685,8 +746,7 @@ class SliceFilter:
                     "found_hz": [round(abs(hz)) for hz, _w in self.anf_found],
                     "depth_db": [round(-response_at(self.taps, self.rate_hz, hz), 1)
                                  for hz, _w in self.anf_found]},
-            "contour": {"enabled": s.contour_on, "hz": s.contour_hz, "db": s.contour_db,
-                        "width_hz": s.contour_width_hz},
+            "contour": self._contour_status(),
             "apf": {"enabled": s.apf_on, "hz": s.apf_hz, "width_hz": s.apf_width_hz},
             "auto": {"enabled": s.auto, "source": self.auto_source,
                      "low_hz": round(self.auto_low) if self.auto_low is not None else None,

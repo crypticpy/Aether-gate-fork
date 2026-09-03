@@ -205,7 +205,9 @@ def test_memory_entries_carry_a_voice_print_learned_while_the_talker_is_live():
     assert len(mem) == 1 and "voice" in mem[0]
     v = mem[0]["voice"]
     assert v is not None and v["overs"] == 1 and 3.0 <= v["over_s"] <= 3.4
-    assert set(v) == {"centroid_hz", "low_hz", "high_hz", "tilt_db", "syllabic_hz", "over_s", "overs"}
+    assert set(v) == {"centroid_hz", "low_hz", "high_hz", "tilt_db", "syllabic_hz", "over_s",
+                      "overs", "bands_db"}
+    assert len(v["bands_db"]) == 32 and max(v["bands_db"]) == 0.0
     # clearing the memory clears the prints too
     st.memory_clear()
     assert st.prints[0].prints == {}
