@@ -184,6 +184,7 @@ class SpatialMap:
         self.cov_tc_s = float(cov_tc_s)
         self.R = None                       # (nbins, N, N) floor covariance, natural FFT order
         self._stale = None                  # (nbins,) frames since the bin last accepted
+        self._frame_s = None                # the last frame's length, for stale_mask()
         self.frames = 0
         self._cache = None
 
@@ -222,6 +223,7 @@ class SpatialMap:
         inst = X.T[:, :, None] * np.conj(X.T[:, None, :])         # (nbins, N, N)
         self._cache = None
         self.frames += 1
+        self._frame_s = float(frame_s)
         if self.R is None:
             self.R = inst
             self._stale = np.zeros(self.nbins, dtype=np.int64)
@@ -237,6 +239,14 @@ class SpatialMap:
         al = max(1.0 - math.exp(-frame_s / self.cov_tc_s), 1.0 / self.frames)
         self.R[accept] += al * (inst[accept] - self.R[accept])
         self._stale[accept] = 0
+
+    def stale_mask(self):
+        """(nbins,) bool, natural FFT order: bins whose floor is older than
+        STALE_S and should not be trusted for a weight. None before the
+        first frame."""
+        if self._stale is None or not self._frame_s:
+            return None
+        return self._stale * self._frame_s > STALE_S
 
     # --- on demand (control port / pan) --------------------------------------
     def _analyse(self):

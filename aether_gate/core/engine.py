@@ -3919,6 +3919,7 @@ def start_control_server(radio, port):
             # GET /diversity/finder                     -> where people are talking (ranked)
             # GET /diversity/beacons                    -> NCDXF beacon slots heard on the pair
             # GET /diversity/compass                    -> phase -> bearing, fitted from the beacons
+            # GET /diversity/timesignals                -> WWV/CHU/RWM/BPM windows heard on the pair
             # GET /diversity/capture?seconds=            -> start a diagnostic IQ capture
             # GET /diversity/memory/clear                -> forget remembered talker positions
             # GET /diversity/memory/name?id=&name=       -> label a remembered talker ('' clears)
@@ -4018,9 +4019,20 @@ def start_control_server(radio, port):
                         kwargs["subband"] = sb == "on"
                     if "post" in q:
                         pf = q["post"][0]
-                        if pf not in ("on", "off"):
+                        if pf not in ("on", "off", "v2"):
                             raise ValueError(f"post={pf!r}")
-                        kwargs["post"] = pf == "on"
+                        kwargs["post"] = "v2" if pf == "v2" else pf == "on"
+                    if "mrc" in q:
+                        mrc = q["mrc"][0]
+                        if mrc not in ("on", "off"):
+                            raise ValueError(f"mrc={mrc!r}")
+                        kwargs["mrc"] = mrc == "on"
+                    if "assume_hz" in q:
+                        # assume_hz=10000000&assume_call=WWVH names the station the
+                        # operator hears on a shared carrier; assume_call=off forgets
+                        kwargs["assume_hz"] = float(q["assume_hz"][0])
+                        call = q.get("assume_call", ["off"])[0].strip()
+                        kwargs["assume_call"] = None if call.lower() in ("", "off", "none") else call
                     if "post_floor_db" in q:
                         kwargs["post_floor_db"] = float(q["post_floor_db"][0])
                     if "grid" in q:
@@ -4059,7 +4071,7 @@ def start_control_server(radio, port):
                     return self._json({"error": "not supported"})
                 return self._json(fn())
             if u.path in ("/diversity/spatial", "/diversity/finder", "/diversity/beacons",
-                          "/diversity/compass"):
+                          "/diversity/compass", "/diversity/timesignals"):
                 # live per-bin phase/coherence rows for the spatial waterfall,
                 # the conversation finder's ranked candidates, what the NCDXF
                 # beacons say about the pair, and the compass fitted from them

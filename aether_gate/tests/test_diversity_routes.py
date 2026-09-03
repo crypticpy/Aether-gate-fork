@@ -68,11 +68,15 @@ class FakeDiversityAdapter:
 
     def set_diversity(self, mode=None, phase_deg=None, ratio_db=None, source=None, slice_id=None,
                        nb=None, nb_db=None, pan=None, null_source=None, focus=None,
-                       subband=None, grid=None):
+                       subband=None, grid=None, post=None, mrc=None, assume_hz=None,
+                       assume_call=None):
         self.calls.append(("set", {"mode": mode, "phase_deg": phase_deg,
                                     "ratio_db": ratio_db, "source": source, "slice_id": slice_id,
                                     "nb": nb, "nb_db": nb_db, "pan": pan, "null_source": null_source,
-                                    "focus": focus, "subband": subband, "grid": grid}))
+                                    "focus": focus, "subband": subband, "grid": grid, "post": post,
+                                    "mrc": mrc, "assume_hz": assume_hz, "assume_call": assume_call}))
+        if assume_call not in (None, "WWVH"):
+            raise ValueError(f"{assume_call} is not on that frequency")
         if focus not in (None, "") and focus != 7:
             raise ValueError(f"unknown talker id {focus}")
         if grid not in (None, "", "EM10", "EM10cf"):
@@ -109,6 +113,10 @@ class FakeDiversityAdapter:
     def diversity_compass(self):
         self.calls.append(("compass", {}))
         return {"available": False, "reason": "2 beacon(s) with a bearing and a ratio, 3 needed"}
+
+    def diversity_timesignals(self):
+        self.calls.append(("timesignals", {}))
+        return {"available": True, "freq_hz": 3330000.0, "results": []}
 
     def diversity_beacons(self):
         self.calls.append(("beacons", {}))
@@ -173,6 +181,7 @@ class FakeDiversityAdapterNoV2(FakeDiversityAdapter):
     diversity_spatial = None
     diversity_finder = None
     diversity_beacons = None
+    diversity_timesignals = None
     diversity_capture = None
     diversity_memory_clear = None
     diversity_memory_name = None
@@ -245,7 +254,8 @@ def test_set_forwards_every_given_param():
     assert kwargs == {"mode": "track", "phase_deg": 45.5, "ratio_db": -3.5,
                        "source": "b", "slice_id": 1,
                        "nb": True, "nb_db": 18.5, "pan": "nulled", "null_source": 2,
-                       "focus": None, "subband": False, "grid": None}
+                       "focus": None, "subband": False, "grid": None, "post": None,
+                       "mrc": None, "assume_hz": None, "assume_call": None}
     assert out["mode"] == "track" and out["source"] == "b"
 
 
@@ -268,7 +278,8 @@ def test_set_with_only_one_param_leaves_the_rest_unset():
     assert kwargs == {"mode": None, "phase_deg": None, "ratio_db": 5.0,
                        "source": None, "slice_id": None,
                        "nb": None, "nb_db": None, "pan": None, "null_source": None, "focus": None,
-                       "subband": None, "grid": None}
+                       "subband": None, "grid": None, "post": None, "mrc": None,
+                       "assume_hz": None, "assume_call": None}
 
 
 # ---- v2 /diversity/set params: nb, nb_db, pan, null_source ------------------
@@ -686,3 +697,32 @@ def test_bad_subband_value_is_an_error():
     out = _get(port, "/diversity/set?subband=maybe")
     assert "error" in out
     assert not [c for c in a.calls if c[0] == "set"]
+
+
+def test_post_v2_mrc_and_an_assumed_time_signal_reach_the_adapter():
+    a = FakeDiversityAdapter()
+    _, port = _start(a)
+    assert "error" not in _get(port, "/diversity/set?post=v2&mrc=on")
+    last = [c for c in a.calls if c[0] == "set"][-1][1]
+    assert last["post"] == "v2" and last["mrc"] is True
+    assert "error" not in _get(port, "/diversity/set?post=on&mrc=off")
+    last = [c for c in a.calls if c[0] == "set"][-1][1]
+    assert last["post"] is True and last["mrc"] is False
+    assert "error" in _get(port, "/diversity/set?post=v3")
+    assert "error" in _get(port, "/diversity/set?mrc=maybe")
+    assert "error" not in _get(port, "/diversity/set?assume_hz=10000000&assume_call=WWVH")
+    last = [c for c in a.calls if c[0] == "set"][-1][1]
+    assert last["assume_hz"] == 10_000_000.0 and last["assume_call"] == "WWVH"
+    assert "error" not in _get(port, "/diversity/set?assume_hz=10000000&assume_call=off")
+    assert [c for c in a.calls if c[0] == "set"][-1][1]["assume_call"] is None
+    assert "error" in _get(port, "/diversity/set?assume_hz=10000000&assume_call=CHU")
+
+
+def test_timesignals_route_passes_the_adapter_answer_through():
+    a = FakeDiversityAdapter()
+    _, port = _start(a)
+    ts = _get(port, "/diversity/timesignals")
+    assert ts["available"] and ts["freq_hz"] == 3330000.0
+    assert ("timesignals", {}) in a.calls
+    _, port2 = _start(FakeDiversityAdapterNoV2())
+    assert _get(port2, "/diversity/timesignals") == {"error": "not supported"}

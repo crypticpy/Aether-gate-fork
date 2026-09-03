@@ -17,8 +17,8 @@ this module wires them to the adapter's three threads:
 
 Every shared value is a Python scalar, a small dict swapped whole, or an
 object replaced atomically, so no lock is needed for a reader to see a
-consistent weight; the two places two threads mutate the same list
-(calibration accumulation, capture accumulation) take a lock.
+consistent weight; the two accumulations two threads share (calibration,
+capture) take a lock. The optional stages live in diversity_enhance.
 
 Weights are PER SLICE: the beam is arithmetic on the same two streams, so
 the slice on a net can be steered at whoever is talking while a second slice
@@ -97,6 +97,16 @@ def _sl():
     return sitelog
 
 
+def _rc():
+    from . import diversity_capture
+    return diversity_capture
+
+
+def _en():
+    from . import diversity_enhance
+    return diversity_enhance
+
+
 def _cp():
     from ..core import compass
     return compass
@@ -168,6 +178,7 @@ class _DiversityState:
         self.subbands = {}                  # sid -> SubbandCombiner
         self.post_on = True                 # the coherence post-filter (core.postfilter)
         self.post_floor_db = None           # None = the module's default
+        self.enh = _en().Enhancers()        # post=v2, mrc, time signals, the compass cache
         self.prints = {}                    # sid -> VoicePrint (per talker voice/rig prints)
         self._voice_checked = False         # the running over has been judged against its print
         self.voice_splits = 0               # overs moved off a recalled talker by their voice
@@ -184,10 +195,7 @@ class _DiversityState:
         self.live = None                    # LiveSpatial: the span right now
         self.finder = None                  # Finder: where people are talking
         self._win = {}                      # length -> Hann window
-        # raw two-channel capture (see capture())
-        self._cap_lock = threading.Lock()
-        self._capture = None
-        self.last_capture = None
+        self._cap = _rc().RawCapture()      # raw two-channel capture (see capture())
 
     # --- the `source` alias -------------------------------------------------
     @property
@@ -293,13 +301,15 @@ class _DiversityState:
             if last is not self._last_beacon:       # one slot scored: keep it
                 self._last_beacon = last
                 self.sitelog.beacon_result(last)
+            self.enh.timesignals_update(a, b, self.a.samp_rate, self.a.center_hz, time.time(),
+                                        self.sitelog, self.beacons.station_grid)
         if self.nb_on:
             a, b, frac = _dv().blank_impulses(a, b, self.nb_db)
             self.blanked_pct = 0.9 * self.blanked_pct + 0.1 * 100.0 * frac
         elif self.blanked_pct:
             self.blanked_pct = 0.0
-        if self._capture is not None:
-            self._capture_ingest(a, b)
+        if self._cap.active:
+            self._cap.ingest(a, b, self.a._np, self._capture_meta)
         if self.aligner.aligned:
             self._map_update(a, b)
         if self.pan == "a":
@@ -308,6 +318,12 @@ class _DiversityState:
             pan = b
         elif self.pan == "nulled" and self.map is not None and self.aligner.aligned:
             pan = self._nulled(a, b)
+        elif self.enh.mrc_on and self.aligner.aligned and self.mode != "off":
+            pan = self.enh.mrc_pan(a, b, self.map, self.a.samp_rate, self.a.center_hz,
+                                   self._passband_hz(), self.weight_for(self.active_slice),
+                                   time.time())
+            if pan is None:
+                pan = _dv().combine(a, b, self.weight_for(self.active_slice))
         else:
             pan = _dv().combine(a, b, self.weight_for(self.active_slice))
         return pan, (a, b)
@@ -411,46 +427,17 @@ class _DiversityState:
 
     # --- capture ---------------------------------------------------------
     def capture(self, seconds):
-        """Start recording `seconds` of the aligned raw pair; returns the path
-        the .npz will appear at once the reader has collected it."""
-        seconds = float(seconds)
-        with self._cap_lock:
-            if self._capture is not None:
-                raise RuntimeError("a capture is already running")
-            d = os.path.expanduser(self.CAPTURE_DIR)
-            os.makedirs(d, exist_ok=True)
-            path = os.path.join(d, time.strftime("%Y%m%d-%H%M%S")
-                                + f"_{int(self.a.center_hz)}Hz_{int(self.a.samp_rate)}sps.npz")
-            self._capture = {"want": int(seconds * self.a.samp_rate), "n": 0,
-                             "a": [], "b": [], "path": path, "seconds": seconds,
-                             "slice_hz": getattr(self.a, "_slice_hz", None),
-                             "slice_mode": getattr(self.a, "_mode", None)}
-        return path
+        """Record `seconds` of the aligned raw pair; returns the .npz path."""
+        return self._cap.start(self.CAPTURE_DIR, seconds, self.a.samp_rate, self.a.center_hz,
+                               getattr(self.a, "_slice_hz", None), getattr(self.a, "_mode", None))
 
-    def _capture_ingest(self, a, b):
-        with self._cap_lock:
-            c = self._capture
-            if c is None:
-                return
-            c["a"].append(a.copy()); c["b"].append(b.copy()); c["n"] += len(a)
-            if c["n"] < c["want"]:
-                return
-            self._capture = None
-        np = self.a._np
-        meta = {"rate_hz": float(self.a.samp_rate), "center_hz": float(self.a.center_hz),
-                "lag_samples": int(self.aligner.lag), "aligned": bool(self.aligner.aligned),
-                "seconds": c["seconds"]}
-        if c.get("slice_hz") is not None:
-            meta["slice_hz"] = float(c["slice_hz"])          # what the operator was listening to
-            meta["slice_mode"] = str(c.get("slice_mode") or "")
+    @property
+    def last_capture(self):
+        return self._cap.last_path
 
-        def _write():
-            np.savez(c["path"], a=np.concatenate(c["a"])[:c["want"]],
-                     b=np.concatenate(c["b"])[:c["want"]], **meta)
-            self.last_capture = c["path"]
-            print(f"[diversity] capture written: {c['path']}", flush=True)
-        # 60 s at 2 MS/s is ~1 GB of complex64: not on the reader thread
-        threading.Thread(target=_write, name="diversity-capture", daemon=True).start()
+    def _capture_meta(self):
+        return {"rate_hz": float(self.a.samp_rate), "center_hz": float(self.a.center_hz),
+                "lag_samples": int(self.aligner.lag), "aligned": bool(self.aligner.aligned)}
 
     def memory_clear(self):
         self.memory.clear()
@@ -497,6 +484,9 @@ class _DiversityState:
     def _beacon_watch(self):
         return _bc().BeaconWatch(self.a.samp_rate, store_path=self.BEACONS_PATH)
 
+    def timesignals_json(self):
+        return self.enh.timesignals_json(time.time())
+
     def beacons_json(self):
         if self.beacons is None:
             return {"available": False}
@@ -518,7 +508,6 @@ class _DiversityState:
         # because the aligner has not locked yet.
         ph, ra = _dv().weight_to_polar(self._configured_weight(sid))
         t = self.trackers.get(sid)
-        cap = self._capture
         return {
             "available": True, "channels": 2,
             "mode": self.mode, "source": self.source, "pan": self.pan,
@@ -546,6 +535,7 @@ class _DiversityState:
                         **(self.subbands[sid].status() if sid in self.subbands
                            else {"bins": 0, "extra_db": 0.0})},
             "post": self._post_status(sid),
+            "mrc": self.enh.mrc_status(),
             "sources": self._sources(),
             "noise_profile": self._noise_profile(t),
             "memory": self._memory_status(sid),
@@ -554,8 +544,7 @@ class _DiversityState:
             "loops": self.balance.status(time.monotonic()),
             "focus": self.memory.focus_status(time.monotonic(),
                                               nulling=bool(t.interferer) if t is not None else False),
-            "capture": {"active": cap is not None,
-                        "path": cap["path"] if cap is not None else self.last_capture},
+            "capture": self._cap.status(),
             "slice_id": sid,
         }
 
@@ -577,11 +566,11 @@ class _DiversityState:
         return st
 
     def compass_json(self):
-        """The pair's array response fitted from the beacons it has heard, and
-        the bearing(s) the active slice's configured phase points at. The log
-        keeps B relative to A; the tracker reports the opposite sign."""
+        """The pair fitted from the beacons, and the bearing(s) the active
+        slice's phase points at (log: B rel. A; tracker: the opposite sign)."""
         ph, _ra = _dv().weight_to_polar(self._configured_weight(self.active_slice))
-        return _cp().compass_json(self.sitelog, phase_deg=-ph)
+        slice_hz = getattr(self.a, "_slice_hz", None)        # where the phase was measured
+        return self.enh.compass(self.sitelog, -ph, None if slice_hz is None else float(slice_hz))
 
     def _memory_status(self, sid):
         """The memory's entries with each talker's voice/rig print attached."""
@@ -657,13 +646,15 @@ class _DiversityState:
         return self.a._np.stack([pa[:n], pb[:n]], axis=1)
 
     def _post_status(self, sid):
+        if self.enh.post_v2:
+            return self.enh.post_status()
         sb = self.subbands.get(sid)
         pf = sb.post if sb is not None else None
         if pf is None:
-            return {"enabled": self.post_on and self.subband_on,
+            return {"enabled": self.post_on and self.subband_on, "version": 1,
                     "floor_db": _pf().FLOOR_DB if self.post_floor_db is None else self.post_floor_db,
                     "mean_db": 0.0}
-        return {"enabled": True, **pf.status()}
+        return {"enabled": True, "version": 1, **pf.status()}
 
     def _talker_profile(self, sid):
         """The live talker's print bands, for the post-filter's floor."""
@@ -689,11 +680,16 @@ class _DiversityState:
         ramp from m0 to m1.
 
         HEAR a / b hands that loop's passband straight through; stereo hands
-        both as an (n, 2) array, A left and B right, for the operator with
-        two speakers to hear the loops as a soundstage. The tracker keeps
+        both as an (n, 2) array, A left and B right. The tracker keeps
         learning from observe() either way, so a comparison costs nothing."""
         if self.hear != "combined":
             return self._monitor(pa, pb)
+        if self.enh.post_v2 and self.aligner.aligned and self.mode != "off":
+            # v2 stands in for the sub-band stage: the wideband weight, then
+            # cohpost on the same three blocks (no STFT skew between them)
+            y = _dv().combine_ramp(pa, pb, m0, m1)
+            lo, hi = self._pass_edges(getattr(self.a, "_mode", "USB"))
+            return self.enh.post_audio(y, pa, pb, rate_hz, lo, hi)
         t = self.trackers.get(sid)
         if (not self.subband_on or self.mode not in ("null", "track")
                 or not self.aligner.aligned or t is None):
@@ -718,16 +714,28 @@ class _DiversityState:
 
     def set(self, mode=None, phase_deg=None, ratio_db=None, source=None, sid=None,
             nb=None, nb_db=None, pan=None, null_source=None, focus=None, subband=None,
-            grid=None, post=None, post_floor_db=None):
+            grid=None, post=None, post_floor_db=None, mrc=None, assume_hz=None,
+            assume_call=None):
         sid = self.active_slice if sid is None else int(sid)
         if post is not None:
-            self.post_on = bool(post)
+            v2 = post == "v2"
+            self.post_on = True if v2 else bool(post)
+            if v2 != self.enh.post_v2:
+                self.enh.post_v2 = v2
+                self.enh.post_reset()
+        if mrc is not None:
+            self.enh.mrc_on = bool(mrc)
+            if not self.enh.mrc_on:
+                self.enh.mrc_reset()
+        if assume_hz is not None:
+            self.enh.set_assumed(assume_hz, assume_call)   # ValueError off that carrier
         if post_floor_db is not None:
             self.post_floor_db = max(-20.0, min(0.0, float(post_floor_db)))
         if grid is not None:
             if self.beacons is None:
                 self.beacons = self._beacon_watch()
             self.beacons.set_station(grid)           # ValueError on a bad locator
+            self.enh.set_station(grid)
         if subband is not None:
             self.subband_on = bool(subband)
             if not self.subband_on:

@@ -619,3 +619,98 @@ def test_a_polled_noise_verdict_is_kept_in_the_site_log_and_the_compass_says_why
     assert kinds.count("noise") == 1
     cp = st.compass_json()
     assert cp["available"] is False and "3" in cp["reason"]
+
+
+# --- the optional stages (adapters.diversity_enhance) ---------------------------
+def test_post_v2_stands_in_for_the_subband_stage_and_says_so():
+    from aether_gate.core.diversity import combine_ramp
+    rng = np.random.default_rng(21)
+    st = _aligned_state(mode="USB")
+    st.set(mode="track")
+    rate = 25_000.0
+    pa = rng.normal(size=4096) + 1j * rng.normal(size=4096)
+    pb = rng.normal(size=4096) + 1j * rng.normal(size=4096)
+    m = 0.5 + 0.2j
+    assert st.status()["post"]["version"] == 1
+    st.set(post="v2")
+    assert st.post_on and st.enh.post_v2
+    out = np.concatenate([st.combine_passband(0, pa, pb, m, m, rate) for _ in range(3)])
+    # one frame of delay, then sample for sample; the sub-band combiner is
+    # never built for this slice
+    assert len(out) == 3 * 4096 and 0 not in st.subbands
+    ps = st.status()["post"]
+    assert ps["enabled"] and ps["version"] == 2 and ps["nfft"] == 256
+    assert "gate" in ps and set(ps["gate"]) >= {"gaps", "noise_db"}
+    assert "hold" in ps and "in_pause" in ps
+    # back to v1: the ramp again until the tracker exists
+    st.set(post=True)
+    assert not st.enh.post_v2 and st.status()["post"]["version"] == 1
+    assert np.allclose(st.combine_passband(0, pa, pb, m, m, rate), combine_ramp(pa, pb, m, m))
+    st.set(post=False)
+    assert not st.post_on
+
+
+def test_mrc_refines_the_pan_from_the_map_and_reports_it():
+    rng = np.random.default_rng(22)
+    st = _aligned_state()
+    st.set(mode="track")
+    st.a._slice_hz = 3_601_000.0
+    assert st.status()["mrc"] == {"enabled": False}
+    st.set(mrc=True)
+    # no map yet: the broadband weight (mrc_pan says None)
+    out = _feed_scene(st, rng, 1, [])
+    assert len(out) == BLOCK
+    # a few frames on: the weights exist, the status carries their worth
+    _feed_scene(st, rng, 6, [(-20_000, -10_000, 1.0, 1.0, 40.0)])
+    ms = st.status()["mrc"]
+    assert ms["enabled"] and ms["nfft"] == 4096 and ms["band_hz"] == [3_601_000.0, 3_604_000.0]
+    assert ms["bins_used"] > 0
+    st.set(mrc=False)
+    assert st.status()["mrc"] == {"enabled": False} and st.enh._bw is None
+
+
+def test_time_signals_ride_along_and_score_into_the_site_log():
+    from aether_gate.core import timesignals as ts
+    rng = np.random.default_rng(23)
+    st = _DiversityState(_FakeAdapter(center_hz=3_330_000.0))      # CHU 3.330
+    st.BEACONS_PATH = None
+    assert st.timesignals_json() == {"available": False}
+    st.aligner.set_lag(0, 20.0, True)
+    st.set(grid="EM10")
+    st.ingest(_white(rng, BLOCK), _white(rng, BLOCK))
+    out = st.timesignals_json()
+    assert out["available"] and out["freq_hz"] == 3_330_000.0
+    assert out["station_grid"] == "EM10"
+    # a whole window, then the gap after it: one result, kept in the log
+    w = st.enh.timesignals
+    t0 = (int(time.time() // ts.PERIOD_S) + 1) * ts.PERIOD_S
+    n = int(BLOCK)
+    for k in range(int(ts.WINDOW_S * RATE / n) + 2):
+        w.update(_white(rng, n), _white(rng, n), 3_330_000.0, t0 + k * n / RATE)
+    w.update(_white(rng, n), _white(rng, n), 3_330_000.0, t0 + ts.WINDOW_S + 1.0)
+    assert w.last is not None
+    st.ingest(_white(rng, BLOCK), _white(rng, BLOCK))            # the state notices
+    assert list(st.sitelog.read(kind="beacon"))[-1]["callsign"] == "CHU"
+    # a shared carrier can be named; a station that is not there cannot
+    st.set(assume_hz=10_000_000.0, assume_call="WWVH")
+    assert st.timesignals_json()["assumed"] == {"10000000": "WWVH"}
+    with pytest.raises(ValueError):
+        st.set(assume_hz=10_000_000.0, assume_call="CHU")
+
+
+def test_the_compass_is_asked_at_the_slice_and_cached(monkeypatch):
+    from aether_gate.adapters import diversity_enhance as de
+    st = _aligned_state()
+    st.a._slice_hz = 3_850_000.0
+    calls = []
+
+    def fake(log, bands_hz=None, since=None, phase_deg=None, f_hz=None):
+        calls.append((phase_deg, f_hz))
+        return {"available": False, "reason": "none yet"}
+    monkeypatch.setattr(de._cp(), "compass_json", fake)
+    assert st.compass_json()["reason"] == "none yet"
+    st.compass_json()
+    assert calls == [(-0.0, 3_850_000.0)] or calls == [(0.0, 3_850_000.0)]
+    st.set(mode="manual", phase_deg=40.0)
+    st.compass_json()
+    assert len(calls) == 2 and calls[-1][0] == -40.0
