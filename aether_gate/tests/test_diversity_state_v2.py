@@ -402,7 +402,11 @@ def test_spatial_and_finder_follow_the_map_and_carry_the_passband():
     _feed_scene(st, rng, 300, [])                          # ~10 s: the source is out of the ring
     fj = st.finder_json()
     assert fj["available"] and len(fj["activity"]) == 512
-    assert fj["candidates"] == [], "plain noise must never be a conversation"
+    # plain noise must never be a conversation: the only row allowed is the
+    # operator's own tuned column, listed unscored so they can see what the
+    # finder thinks of what they hear
+    for c in fj["candidates"]:
+        assert c["tuned"] is True and c["score"] < 0.5 and c["kind"] != "voice", c
     live, finder = st.live, st.finder
     assert finder.fast_n == 256                            # the ring was already full
     st.a.center_hz += 50_000.0                # same span, just moved: retuned, not rebuilt

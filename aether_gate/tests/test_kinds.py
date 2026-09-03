@@ -392,9 +392,15 @@ def test_a_recorded_stretch_of_80m_phone_is_called_voice():
     out = fd.candidates(center)
     assert out["available"], out
     cands = out["candidates"]
-    assert len(cands) >= 3, cands
+    # the finder lists what is THERE now, not only what it can name (see
+    # finder_report), so the recording's four talkers come back among other
+    # detections rather than as the whole list
+    assert len(cands) >= 5, cands
     assert all(3_700_000 <= c["hz"] <= 4_000_000 for c in cands), cands
-    assert [c["kind"] for c in cands] == ["voice"] * len(cands), cands
+    assert len([c for c in cands if c["kind"] == "voice"]) >= 4, cands
+    # ...and the defect itself: a phone-wide window is never a keyed tone
+    assert not [c for c in cands
+                if c["kind"] == "cw" and c["occupied_hz"] > kinds.NARROW_HZ[1]], cands
 
 
 # =========================================================================
@@ -457,7 +463,9 @@ def test_no_talker_on_a_recorded_80m_evening_is_ever_called_cw():
         for c in cands:
             if abs(c["hz"] - NOT_A_TALKER_HZ) <= NOT_A_TALKER_MARGIN_HZ:
                 continue
-            assert c["kind"] in ("voice", "noise"), (round(t, 1), c)
+            if c["occupied_hz"] <= kinds.NARROW_HZ[1]:
+                continue          # a narrow column may be a keyed tone, and is
+            assert c["kind"] != "cw", (round(t, 1), c)
 
 
 @needs_flap_capture
@@ -475,7 +483,8 @@ def test_the_verdict_on_a_recorded_80m_evening_stops_flapping():
             seen[c["hz"]] = c["kind"]
     assert changes == {} or max(changes.values()) <= 2, changes
     talkers = [c for _t, cands in rows for c in cands
-               if abs(c["hz"] - NOT_A_TALKER_HZ) > NOT_A_TALKER_MARGIN_HZ]
+               if abs(c["hz"] - NOT_A_TALKER_HZ) > NOT_A_TALKER_MARGIN_HZ
+               and c["occupied_hz"] > kinds.NARROW_HZ[1]]
     assert not [c for c in talkers if c["kind"] == "cw"], talkers
 
 

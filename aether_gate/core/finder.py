@@ -36,7 +36,13 @@ import math
 
 import numpy as np
 
+from . import finder_floor as ffloor
+from . import finder_report
 from . import kinds
+# the read side's constants, re-exported: /diversity/finder is assembled in
+# finder_report.py and this is still the module everything imports it from
+from .finder_report import (CANDIDATE_MAX, CANDIDATE_MIN_S, CANDIDATE_RECENT_S,
+                            DIAL_GRID_HZ, EDGE_MARGIN_HZ, USB_ABOVE_HZ, VOICE_SCORE)
 
 SPATIAL_TC_S = 0.25
 SPATIAL_POINTS = 512
@@ -65,14 +71,28 @@ VOICE_WIDTH_HZ = 2700.0
 WINDOW_STEP_POINTS = 2
 SYLLABIC_HZ = (2.0, 8.0)     # syllable-rate band of the modulation spectrum
 MOD_HZ = (0.25, 15.0)        # the modulation band it is measured against
-VOICE_SCORE = 0.5            # a window at or above this is "voice"
-CANDIDATE_MAX = 12
-CANDIDATE_RECENT_S = 30.0    # a candidate must have scored within this long
-EDGE_MARGIN_HZ = 150.0       # dial sits this far outside the voice energy
-DIAL_GRID_HZ = 500.0         # phone sits on whole and half kilohertz; the map's
-                             # points are ~244 Hz apart, so the raw dial estimate
-                             # is snapped to the grid (hz) and kept beside it (hz_raw)
-USB_ABOVE_HZ = 10_000_000.0  # band convention: USB above 10 MHz, LSB below
+
+# The voice score, calibrated on "can the operator copy it", which on SSB is
+# about 3 dB in a 2.4 kHz passband with the envelope moving at syllable rate.
+# The old ramps were (2, 8) dB, (0.15, 0.60) depth and (0.40, 0.70) syllabic
+# under a cube root, which put the 0.5 gate at 4 dB and syllabic 0.51 -- and
+# that is exactly where the live gate sat on 2026-09-03: the weakest candidate
+# it would admit scored 0.496 at 4.0 dB, and the talker the operator was
+# copying by ear at 14178 kHz, 1-3 dB over the floor, never appeared at all.
+VOICE_SNR_DB = (1.5, 4.5)      # ...and read from the SNR WHILE SOMEBODY IS
+VOICE_DEPTH = (0.10, 0.45)     # TALKING (ON_PCTL), not the ring average: a
+VOICE_SYLLABIC = (0.25, 0.55)  # talker holds the frequency about 40% of the
+ON_PCTL = 75.0                 # time and averages ~4 dB below what you hear
+OCCUPANCY_GATE = (0.08, 0.20)  # a single crash of static is not a conversation
+
+# ...and the detection score, which is how everything that is NOT a
+# conversation is ranked: how far the strongest point of the window stands
+# over its own local floor, and how much of the ring it was there for.
+DETECT_DB = (3.0, 15.0)
+DETECT_PRESENT_FRAC = 0.5
+DETECT_MAX = 0.9             # a perfect carrier ranks below a perfect talker:
+                             # the list still answers "where is somebody" first,
+                             # it simply no longer answers ONLY that
 
 
 def _decimate(x, order, points):
@@ -85,6 +105,12 @@ def _decimate(x, order, points):
 
 def _clip01(x):
     return np.clip(x, 0.0, 1.0)
+
+
+def _ramp(x, bounds):
+    """0 below the pair's first value, 1 above its second, linear between."""
+    lo, hi = bounds
+    return np.clip((np.asarray(x, dtype=np.float64) - lo) / (hi - lo), 0.0, 1.0)
 
 
 def _shift_bins(arr, shift, fill, axis=-1):
@@ -226,6 +252,12 @@ class Finder:
         self.win = max(3, int(round(VOICE_WIDTH_HZ / self.step_hz)))
         self.nwin = max(1, (self.points - self.win) // WINDOW_STEP_POINTS + 1)
         self._order = np.fft.fftshift(np.arange(self.nbins))
+        # the read side (finder_report) asks the finder for its own geometry
+        # rather than importing it back, which would be a circle
+        self.window_step = WINDOW_STEP_POINTS
+        self.slow_period_s = SLOW_PERIOD_S
+        self.slow_rows = SLOW_ROWS
+        self.min_present_frac = min(1.0, CANDIDATE_MIN_S / (FAST_FRAMES * SLOT_S))
         self._reset_history()
 
     def _reset_history(self):
@@ -242,6 +274,13 @@ class Finder:
         self.elapsed = 0.0
         self._since_slow = 0.0
         self.slow = np.zeros((SLOW_ROWS, self.nwin), dtype=np.float32)
+        # the voice score on its own, because the ranking score is now the
+        # better of "somebody is talking here" and "something is here"
+        self.slow_voice = np.zeros((SLOW_ROWS, self.nwin), dtype=np.float32)
+        # how much of each row's ring the window stood over its LOCAL floor:
+        # per window, for the candidate gate, and per map point, for the strip
+        self.slow_wpres = np.zeros((SLOW_ROWS, self.nwin), dtype=np.float32)
+        self.slow_pres = np.zeros((SLOW_ROWS, self.points), dtype=np.float32)
         # what the score was made of, per row, so a candidate can be described
         # as it was at its best rather than as it is right now
         self.slow_terms = np.zeros((SLOW_ROWS, 3, self.nwin), dtype=np.float32)
@@ -285,6 +324,9 @@ class Finder:
         self.fast = _shift_bins(self.fast, point_shift, 0.0)
         self.slot = _shift_bins(self.slot, point_shift, 0.0)
         self.slow = _shift_bins(self.slow, window_shift, 0.0)
+        self.slow_voice = _shift_bins(self.slow_voice, window_shift, 0.0)
+        self.slow_wpres = _shift_bins(self.slow_wpres, window_shift, 0.0)
+        self.slow_pres = _shift_bins(self.slow_pres, point_shift, 0.0)
         self.slow_terms = _shift_bins(self.slow_terms, window_shift, 0.0)
         self.slow_kind = _shift_bins(self.slow_kind, window_shift, kinds.NOISE)
         self.slow_kconf = _shift_bins(self.slow_kconf, window_shift, 0.0)
@@ -305,6 +347,13 @@ class Finder:
                 "kind": _shift_bins(last["kind"], window_shift, kinds.NOISE),
                 "kind_conf": _shift_bins(last["kind_conf"], window_shift, 0.0),
                 "mean_points": _shift_bins(last["mean_points"], point_shift, 0.0),
+                "floor_pts": _shift_bins(last["floor_pts"], point_shift, last["floor"]),
+                "bw_hz": _shift_bins(last["bw_hz"], window_shift, 0.0),
+                "peak_db": _shift_bins(last["peak_db"], window_shift, 0.0),
+                "peak_off": _shift_bins(last["peak_off"], window_shift, 0),
+                "present": _shift_bins(last["present"], window_shift, 0.0),
+                "wpres": _shift_bins(last["wpres"], window_shift, 0.0),
+                "voice": _shift_bins(last["voice"], window_shift, 0.0),
                 "floor": last["floor"],
             }
 
@@ -346,21 +395,43 @@ class Finder:
         lo = np.arange(self.nwin) * WINDOW_STEP_POINTS
         return c[..., lo + self.win] - c[..., lo]
 
+    def _window_max(self, p):
+        """Max of p (points,) over each window -> (nwin,). A 200 Hz tone is
+        present in its window even where it lifts the window's total by under
+        3 dB, and that -- not the classifier -- is why no CW column was ever
+        a candidate."""
+        seg = np.lib.stride_tricks.sliding_window_view(p, self.win)[::WINDOW_STEP_POINTS]
+        if len(seg) < self.nwin:
+            seg = np.concatenate([seg, np.repeat(seg[-1:], self.nwin - len(seg), axis=0)])
+        return np.max(seg[:self.nwin], axis=1)
+
     def _analyse(self):
         F = self._frames().astype(np.float64)                  # (n, 2, points)
         n = F.shape[0]
         both = F[:, 0] + F[:, 1]
-        # the band's floor per point, per frame: the median point of the span
+        frame_s = self.frame_s or SLOT_S
+        self.min_present_frac = min(1.0, CANDIDATE_MIN_S / max(n * frame_s, 1e-6))
+        # The whole span's median per frame -- what kinds.py correlates a
+        # window against to recognise weather rather than a station...
         floor = np.median(both, axis=1)                         # (n,)
+        # ...and the floor a signal is actually weak against, which is the one
+        # under IT: per ~10 kHz, robust, following the span's own tilt. See
+        # finder_floor.py. Everything below is measured against this one.
+        floor_pts = ffloor.local_floor(both, self.step_hz)      # (points,)
         W = self._window_sums(both)                             # (n, nwin)
         mean_w = np.mean(W, axis=0)
-        floor_w = np.mean(floor) * self.win
-        snr_db = 10.0 * np.log10(np.maximum(mean_w, 1e-30) / max(floor_w, 1e-30))
+        floor_w = np.maximum(self._window_sums(floor_pts), 1e-30)
+        snr_db = 10.0 * np.log10(np.maximum(mean_w, 1e-30) / floor_w)
+        # ...and the SNR while somebody is actually TALKING, which is what
+        # "copyable" is a statement about: a talker holds the frequency about
+        # 40% of the time, so his ring average is some 4 dB below what you hear.
+        on_w = np.percentile(W, ON_PCTL, axis=0)
+        snr_on_db = 10.0 * np.log10(np.maximum(on_w, 1e-30) / floor_w)
         x = W / np.maximum(mean_w, 1e-30) - 1.0                 # (n, nwin) modulation
         depth = np.std(x, axis=0)
         taper = np.hanning(n)[:, None]
         M = np.abs(np.fft.rfft(x * taper, axis=0)) ** 2
-        f = np.fft.rfftfreq(n, self.frame_s or SLOW_PERIOD_S / 30.0)
+        f = np.fft.rfftfreq(n, frame_s)
         syl = (f >= SYLLABIC_HZ[0]) & (f <= SYLLABIC_HZ[1])
         band = (f >= MOD_HZ[0]) & (f <= MOD_HZ[1])
         syllabic = np.sum(M[syl], axis=0) / np.maximum(np.sum(M[band], axis=0), 1e-30)
@@ -368,25 +439,46 @@ class Finder:
         # a real voice's broader modulation spectrum) does not veto the other
         # two, while a term at zero (a steady carrier's depth, a single burst's
         # flat modulation spectrum) still does
-        score = np.cbrt(_clip01((snr_db - 2.0) / 6.0) * _clip01((depth - 0.15) / 0.45)
-                        * _clip01((syllabic - 0.4) / 0.3))
+        voice = np.cbrt(_ramp(snr_on_db, VOICE_SNR_DB) * _ramp(depth, VOICE_DEPTH)
+                        * _ramp(syllabic, VOICE_SYLLABIC))
         # a single crash of static is deep, loud and broad in modulation too;
         # what it is not is THERE: voice occupies a third to a half of the
         # frames, a burst a few percent. A gate, not a grade.
         occupancy = np.mean(W > 0.5 * mean_w, axis=0)
-        score = score * _clip01((occupancy - 0.08) / 0.12)
+        voice = voice * _ramp(occupancy, OCCUPANCY_GATE)
+        # What is HERE, whatever it is: the share of the ring each point spent
+        # over its own floor, and how far the best point of each window stands
+        # over its. A finder that ranks only by voice can only find voice.
+        mean_points = np.mean(both, axis=0)
+        pres_pts = ffloor.presence(both, floor_pts, self.step_hz, frame_s)
+        wpres = np.maximum(self._window_max(pres_pts),
+                           ffloor.presence_wide(W, floor_w, frame_s))
+        peak_db, peak_off = ffloor.peak_excess(mean_points, floor_pts, self.win,
+                                               WINDOW_STEP_POINTS, self.nwin,
+                                               self.step_hz)
+        # how far the window stands over its floor, measured the way its own
+        # shape asks to be measured: a keyed tone by its strongest point (a
+        # 2.7 kHz window can only ever see 2.8 dB of it), a filled sub-band by
+        # the whole window (its peak point is no higher than the rest of it)
+        excess = np.maximum(peak_db, snr_db)
+        detect = (DETECT_MAX * _ramp(excess, DETECT_DB)
+                  * _clip01(wpres / DETECT_PRESENT_FRAC))
+        score = np.maximum(voice, detect)
         # per-loop window power against each loop's own floor, for the gain
         pa_w = np.mean(self._window_sums(F[:, 0]), axis=0)
         pb_w = np.mean(self._window_sums(F[:, 1]), axis=0)
         na_w = np.mean(np.median(F[:, 0], axis=1)) * self.win
         nb_w = np.mean(np.median(F[:, 1], axis=1)) * self.win
-        mean_points = np.mean(both, axis=0)
         # what each window is, from the same frames the score came from, held
         # steady across rows so the answer is the band's and not the second's
-        kind, kconf = self._hold(*kinds.classify(W, floor, mean_points, snr_db, depth,
-                                                 syllabic, occupancy, self.win,
-                                                 WINDOW_STEP_POINTS, self.step_hz))
+        feat = kinds.features(W, floor, mean_points, snr_db, depth, syllabic,
+                              occupancy, self.win, WINDOW_STEP_POINTS, self.step_hz,
+                              floor_points=floor_pts, peak_db=peak_db)
+        kind, kconf = self._hold(*kinds.verdict(feat))
         self.slow[self.slow_i] = score
+        self.slow_voice[self.slow_i] = voice
+        self.slow_wpres[self.slow_i] = wpres
+        self.slow_pres[self.slow_i] = pres_pts
         self.slow_terms[self.slow_i] = np.stack([snr_db, depth, syllabic])
         self.slow_kind[self.slow_i] = kind
         self.slow_kconf[self.slow_i] = kconf
@@ -394,10 +486,15 @@ class Finder:
         self.slow_i = (self.slow_i + 1) % SLOW_ROWS
         self.slow_n = min(self.slow_n + 1, SLOW_ROWS)
         self._last = {
-            "score": score, "snr_db": snr_db, "depth": depth, "syllabic": syllabic,
+            "score": score, "voice": voice, "snr_db": snr_db, "depth": depth,
+            "syllabic": syllabic, "wpres": wpres,
+            "present": np.asarray(kinds.present(feat), dtype=np.float64),
+            "bw_hz": np.asarray(feat["bw_hz"], dtype=np.float64),
+            "peak_db": peak_db, "peak_off": peak_off,
             "pa": pa_w, "pb": pb_w, "na": na_w, "nb": nb_w,
             "kind": kind, "kind_conf": kconf,
-            "mean_points": mean_points, "floor": float(np.mean(floor)),
+            "mean_points": mean_points, "floor_pts": floor_pts,
+            "floor": float(np.mean(floor)),
         }
 
     def _hold(self, kind, kconf):
@@ -435,29 +532,50 @@ class Finder:
             self.pend_n = np.zeros(self.nwin, dtype=np.int16)
             return self.held_kind.copy(), self.held_conf.copy()
         agree = kind == self.held_kind
+        # "signal" is not a verdict, it is an admission that nothing named the
+        # window this second -- so against a window that HAS a name it is not
+        # evidence either way: it spends no confidence, it accrues no rows
+        # towards taking over, and it cannot displace anything. (Measured on
+        # the 2026-09-03 80 m recording: voice->signal->noise round trips were
+        # 53 of the 99 verdict changes the hold still let through.) A named
+        # kind still displaces a held "signal" on the usual terms.
+        mute = (~agree) & (kind == kinds.SIGNAL)
         conf = np.where(agree,
                         self.held_conf + KIND_CONF_RISE * (kconf - self.held_conf),
-                        np.maximum(self.held_conf - kconf, 0.0))
-        again = (~agree) & (kind == self.pend_kind)
-        self.pend_n = np.where(agree, 0, np.where(again, self.pend_n + 1, 1)).astype(np.int16)
-        self.pend_kind = np.where(agree, self.held_kind, kind).astype(np.int8)
-        take = (~agree) & (self.pend_n >= KIND_HOLD_ROWS) & (kconf >= conf)
+                        np.where(mute, self.held_conf,
+                                 np.maximum(self.held_conf - kconf, 0.0)))
+        again = (~agree) & (~mute) & (kind == self.pend_kind)
+        self.pend_n = np.where(agree, 0,
+                               np.where(mute, self.pend_n,
+                                        np.where(again, self.pend_n + 1, 1))).astype(np.int16)
+        self.pend_kind = np.where(agree | mute, self.pend_kind, kind).astype(np.int8)
+        take = (~agree) & (~mute) & (self.pend_n >= KIND_HOLD_ROWS) & (kconf >= conf)
         self.held_kind = np.where(take, kind, self.held_kind).astype(np.int8)
         self.held_conf = np.where(take, kconf, conf).astype(np.float32)
         self.pend_n = np.where(take, 0, self.pend_n).astype(np.int16)
         return self.held_kind.copy(), self.held_conf.copy()
 
     # --- on demand -----------------------------------------------------------
+    def _slow_idx(self):
+        if self.slow_n < SLOW_ROWS:
+            return np.arange(self.slow_n)
+        return np.concatenate([np.arange(self.slow_i, SLOW_ROWS), np.arange(self.slow_i)])
+
     def _slow_rows(self):
         """The slow ring in time order: scores (n, nwin), their terms
         (n, 3, nwin) = snr_db/depth/syllabic, the kind code and its
-        confidence (n, nwin) each, times (n,)."""
-        if self.slow_n < SLOW_ROWS:
-            idx = np.arange(self.slow_n)
-        else:
-            idx = np.concatenate([np.arange(self.slow_i, SLOW_ROWS), np.arange(self.slow_i)])
+        confidence (n, nwin) each, times (n,), the voice score alone
+        (n, nwin), and the share of each row's ring the window stood over its
+        local floor (n, nwin)."""
+        idx = self._slow_idx()
         return (self.slow[idx], self.slow_terms[idx], self.slow_kind[idx],
-                self.slow_kconf[idx], self.slow_t[idx])
+                self.slow_kconf[idx], self.slow_t[idx], self.slow_voice[idx],
+                self.slow_wpres[idx])
+
+    def _slow_points(self):
+        """The same history per MAP POINT: (n, points) of presence share,
+        which is what the activity strip is the mean of."""
+        return self.slow_pres[self._slow_idx()]
 
     def window_kinds(self):
         """The latest verdict per window: (codes into kinds.KINDS,
@@ -466,108 +584,11 @@ class Finder:
             return None
         return self._last["kind"], self._last["kind_conf"]
 
-    def _point_hz(self, i, center_hz):
-        return center_hz - self.rate_hz / 2 + (i + 0.5) * self.step_hz
+    def candidates(self, center_hz=0.0, live=None, tuned_hz=None):
+        """/diversity/finder, whole: see finder_report.payload, which builds it.
 
-    def _dial_hz(self, w, center_hz):
-        """Where to put the dial for window w: just outside the voice energy
-        on the carrier side (USB below the energy, LSB above)."""
-        last = self._last
-        lo = w * WINDOW_STEP_POINTS
-        seg = last["mean_points"][lo:lo + self.win]
-        above = np.nonzero(seg > 2.0 * last["floor"])[0]
-        usb = center_hz >= USB_ABOVE_HZ
-        if len(above) == 0:
-            edge = lo if usb else lo + self.win - 1
-        else:
-            edge = lo + (above[0] if usb else above[-1])
-        if usb:
-            raw = self._point_hz(edge, center_hz) - self.step_hz / 2 - EDGE_MARGIN_HZ
-        else:
-            raw = self._point_hz(edge, center_hz) + self.step_hz / 2 + EDGE_MARGIN_HZ
-        return DIAL_GRID_HZ * round(raw / DIAL_GRID_HZ), ("USB" if usb else "LSB"), raw
-
-    def candidates(self, center_hz=0.0, live=None):
-        last = self._last
-        if last is None:
-            return {"available": False}
-        rows, terms, kind_rows, kconf_rows, times = self._slow_rows()
-        is_recent = (self.elapsed - times) <= CANDIDATE_RECENT_S
-        recent = rows[is_recent]
-        if len(recent):
-            rec = np.max(recent, axis=0)
-            best = np.nonzero(is_recent)[0][np.argmax(recent, axis=0)]   # row of each max
-        else:
-            rec = last["score"]
-            best = None
-        voiced = rows >= VOICE_SCORE
-        activity = np.mean(voiced, axis=0) if len(rows) else np.zeros(self.nwin)
-        active_s = np.sum(voiced, axis=0) * SLOW_PERIOD_S
-        span = max(1, self.win // WINDOW_STEP_POINTS)
-        dec = live.decimated(self.points) if live is not None else None
-        out = []
-        for w in np.argsort(-rec):
-            if rec[w] < VOICE_SCORE or len(out) >= CANDIDATE_MAX:
-                break
-            a, b = max(0, w - span), min(self.nwin, w + span + 1)
-            if rec[w] < np.max(rec[a:b]) or any(abs(o["_w"] - w) <= span for o in out):
-                continue
-            hit = np.nonzero(voiced[:, w])[0]
-            last_s = float(self.elapsed - times[hit[-1]]) if len(hit) else None
-            hz, mode, hz_raw = self._dial_hz(w, center_hz)
-            # the terms as they were when the window scored best, not now:
-            # a row must describe the conversation it lists, and 20 s after
-            # the last over "now" is the floor
-            if best is not None:
-                snr_w, depth_w, syl_w = (float(x) for x in terms[best[w], :, w])
-                kind_w, kconf_w = int(kind_rows[best[w], w]), float(kconf_rows[best[w], w])
-            else:
-                snr_w, depth_w, syl_w = (float(last[k][w]) for k in ("snr_db", "depth", "syllabic"))
-                kind_w, kconf_w = int(last["kind"][w]), float(last["kind_conf"][w])
-            c = {
-                "_w": int(w), "hz": round(float(hz), 1), "hz_raw": round(float(hz_raw), 1),
-                "mode": mode,
-                "width_hz": round(self.win * self.step_hz, 1),
-                "score": round(float(rec[w]), 2),
-                # what the gate thinks it is, and how sure: a row that says
-                # "cw 0.9" saves the operator the trip
-                "kind": kinds.name(kind_w),
-                "kind_conf": round(kconf_w, 2),
-                "snr_db": round(snr_w, 1),
-                "syllabic": round(syl_w, 2),
-                "depth": round(depth_w, 2),
-                "active_s": round(float(active_s[w]), 1),
-                "last_s": None if last_s is None else round(last_s, 1),
-            }
-            sa = max(float(last["pa"][w] - last["na"]), 0.0)
-            sb = max(float(last["pb"][w] - last["nb"]), 0.0)
-            if sa > 0 and sb > 0:
-                r = min(sa / sb, sb / sa)
-                c["gain_db"] = round(10.0 * math.log10(1.0 + r), 1)
-            else:
-                c["gain_db"] = 0.0
-            if dec is not None:
-                lo = w * WINDOW_STEP_POINTS
-                saa = float(np.sum(dec[0][lo:lo + self.win]))
-                sbb = float(np.sum(dec[1][lo:lo + self.win]))
-                sab = complex(np.sum(dec[2][lo:lo + self.win]))
-                c["phase_deg"] = round(math.degrees(math.atan2(sab.imag, sab.real)), 1)
-                c["coherence"] = round(min(1.0, abs(sab) ** 2 / max(saa * sbb, 1e-30)), 2)
-                c["ratio_db"] = round(10.0 * math.log10(max(sbb, 1e-30) / max(saa, 1e-30)), 1)
-            out.append(c)
-        for c in out:
-            del c["_w"]
-        # activity per point for a strip under the waterfall: the best window
-        # covering each point
-        act_pts = np.zeros(self.points)
-        for w in range(self.nwin):
-            lo = w * WINDOW_STEP_POINTS
-            act_pts[lo:lo + self.win] = np.maximum(act_pts[lo:lo + self.win], activity[w])
-        return {
-            "available": True,
-            "span_hz": [float(center_hz - self.rate_hz / 2), float(center_hz + self.rate_hz / 2)],
-            "history_s": float(min(self.elapsed, SLOW_ROWS * SLOW_PERIOD_S)),
-            "points": int(self.points),
-            "activity": [round(float(x), 3) for x in act_pts],
-            "candidates": out,
-        }
+        `tuned_hz` is what the operator is listening to. Its column is always
+        in the list, flagged `tuned`, however it scored -- what the finder
+        thinks of what they can hear is the one row they can check.
+        """
+        return finder_report.payload(self, center_hz, live, tuned_hz)

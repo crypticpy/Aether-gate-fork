@@ -2,22 +2,31 @@
 # Aether-gate — what the finder found, not only where it is.
 # Copyright (C) 2026 Nigel Fenton (G0JKN). GPL-3.0-or-later.
 #
-"""Five answers to "yes, but what IS that?" for every window the finder scores.
+"""The answer to "yes, but what IS that?" for every window the finder scores.
 
-The finder ranks 2.7 kHz windows by how much they look like somebody talking,
-and it is honest about how far that gets you: a keyed CW tone swings its
+The finder ranks 2.7 kHz windows by what is standing over the floor in them,
+and it is honest about how far a shape gets you: a keyed CW tone swings its
 envelope at a few hertz too, an RTTY pair sits in the middle of a phone-width
 window, and a static crash is loud, deep and broad. So the same frames that
-make the score also make a verdict, from features that separate the five
-things actually on an 80 m evening:
+make the score also make a verdict, from features that separate the things
+actually on a band:
 
   voice     a phone-wide patch (1.5-2.7 kHz) whose envelope swings at
             syllable rate, 2-8 Hz, and swings deeply
   cw        a few hundred hertz wide at most, envelope hard on and off at
             a keying rate rather than continuously varying
   data      a fixed width and a constant envelope: PSK, RTTY, FT8 mid-burst
+  rtty      two columns of it, about 170 Hz apart, where the map can resolve
+            the shift at all (~90 Hz a point or finer)
   carrier   one bin of the map, no modulation at all — a heterodyne, an
             unattended beacon, somebody's switch-mode supply, not a station
+  ft8/ft4/  named by finder_bands from the band plan, not from the shape:
+  psk31     what the map can see of them is a filled block on all the time,
+            and where that block SITS is the rest of the evidence
+  signal    something is standing over the local floor and nothing above
+            fitted it well enough to name. An honest row an operator can go
+            and listen to, and the reason a CW column is no longer dropped
+            for failing to look like speech
   noise     nothing standing above the band's own floor here, or something
             impulsive, or hash that fills the window without any structure
 
@@ -25,16 +34,31 @@ What this cannot do, said plainly so a confidence of 0.4 reads as the honest
 number it is. The map's points are ~244 Hz apart and the frames arrive ~30 a
 second, so: a single-bin data mode (PSK31 at 60 Hz wide, its symbol rate far
 above the frame rate) is indistinguishable from a bare carrier and will be
-called one; CW faster than about 35 wpm keys faster than the frames can
-follow and softens towards "data"; and a mode nobody on the band is using is
-whichever of these five it most resembles. Every verdict therefore ships with
-`kind_conf`, and a low one means what it says.
+called one unless the band plan knows better; CW faster than about 35 wpm
+keys faster than the frames can follow and softens towards "data"; the 15 s
+frame of FT8 is slower than the whole 8.5 s ring and cannot be seen at all;
+and a mode nobody on the band is using comes back as `signal` rather than as
+whichever of these it least badly resembles. Every verdict therefore ships
+with `kind_conf`, and a low one means what it says.
 """
 import numpy as np
 
-# The order here is the wire order of the codes stored in the finder's ring.
-KINDS = ("voice", "cw", "data", "carrier", "noise")
+# The order here is the wire order of the codes stored in the finder's ring:
+# the first five are the original ones and keep their codes, the rest are
+# appended so that a ring written by an older build still reads correctly.
+#
+#   voice/cw/data/carrier/noise   as they always were
+#   signal                        something is here and nothing named it: the
+#                                 finder must not drop a detection just because
+#                                 it cannot say what it is (see classify)
+#   ft8/ft4/psk31                 named by the band plan, in finder_bands.refine
+#   rtty                          a two-tone shift, where the map can resolve one
+KINDS = ("voice", "cw", "data", "carrier", "noise",
+         "signal", "ft8", "ft4", "psk31", "rtty")
 NOISE = KINDS.index("noise")
+SIGNAL = KINDS.index("signal")
+RTTY = KINDS.index("rtty")
+DIGITAL = ("data", "ft8", "ft4", "psk31", "rtty")
 
 # Every threshold below is a (soft-off, soft-on) pair rather than a step: a
 # window that sits between the two gets a partial verdict and a confidence to
@@ -82,6 +106,30 @@ CREST_IMPULSE = (4.0, 10.0)    # loudest frame over the average one: a crash, a 
 OCCUPANCY_HERE = (0.10, 0.30)  # how much of the window's time anything was there
 FLOOR_TRACK = (0.35, 0.70)     # correlation with the whole band's floor: weather
 
+PEAK_PRESENT_DB = (3.0, 6.0)   # the STRONGEST point's excess over the LOCAL floor.
+                               # A 200 Hz tone in a 2.7 kHz window lifts the
+                               # window by 2.8 dB however loud it is, so the
+                               # window SNR alone can never say a CW column is
+                               # present. The ring averages 128-256 slots, so a
+                               # point of bare noise sits within ~0.5 dB of its
+                               # own floor and 3 dB is a long way out.
+ONTIME = DUTY_OFF              # occupied more than 70-85% of its time: not being
+                               # keyed by an operator, simply on. A digital block
+                               # is on; a conversation is not.
+SPOKEN_BLOCK = (0.50, 0.80)    # the syllabic reading a filled block has to beat
+                               # before it may be called speech rather than data
+RTTY_SHIFT_HZ = 170.0          # the standard amateur shift...
+RTTY_SHIFT_TOL_HZ = 60.0       # ...and how far off it may read
+RTTY_RESOLVE_HZ = 90.0         # ...but only where the map has two points across
+                               # it. Above this step size an RTTY pair is one
+                               # blob and the honest answer is "data".
+SIGNAL_TOP = 0.35              # no verdict scored better than this...
+SIGNAL_CONF = 0.20             # ...nor won by more than this over the next...
+SIGNAL_PRESENT = 0.5           # ...and something is certainly here: "signal".
+                               # All three, so that a modest but CLEAR verdict
+                               # ("voice 0.30, nothing else near it") keeps its
+                               # name and only a genuine tie is renamed.
+
 RESOLVED_POINTS = (5.0, 8.0)   # map points across one window: fewer than this
                                # and no width verdict has been earned at all.
                                # Measured: at five points (1.02 MS/s) a keyed
@@ -113,8 +161,26 @@ def name(code):
     return KINDS[i] if 0 <= i < len(KINDS) else KINDS[NOISE]
 
 
+def _two_tone_shift(exc, step_hz):
+    """The spacing of the two strongest points in each window, where there ARE
+    two: an RTTY pair is 170 Hz apart and constant, which is the one thing that
+    separates it from a carrier -- when the map is fine enough to see it, and
+    zero when it is not."""
+    nwin, win = exc.shape
+    if win < 3:
+        return np.zeros(nwin)
+    i1 = np.argmax(exc, axis=1)
+    v1 = exc[np.arange(nwin), i1]
+    idx = np.arange(win)[None, :]
+    masked = np.where(np.abs(idx - i1[:, None]) <= 1, -1.0, exc)
+    i2 = np.argmax(masked, axis=1)
+    v2 = masked[np.arange(nwin), i2]
+    pair = (v2 >= 0.4 * np.maximum(v1, 1e-30)) & (v1 > 0.0)
+    return np.where(pair, np.abs(i1 - i2) * float(step_hz), 0.0)
+
+
 def features(W, floor, mean_points, snr_db, depth, syllabic, occupancy,
-             win, window_step, step_hz):
+             win, window_step, step_hz, floor_points=None, peak_db=None):
     """The per-window features the five verdicts are made of.
 
     W (frames, windows) window sums, floor (frames,) the band's own floor per
@@ -173,17 +239,26 @@ def features(W, floor, mean_points, snr_db, depth, syllabic, occupancy,
     # seconds. Against the FLOOR the same signals separate cleanly -- a tone is
     # a tone all the way down, phone is 2 kHz wide all the way down -- and the
     # measurement no longer depends on how the energy is distributed within it.
-    floor_level = float(np.mean(np.asarray(floor, dtype=np.float64)))
+    # ...measured against the LOCAL floor where one was given (finder_floor),
+    # so that a tilted span and a dense sub-band do not decide the width of a
+    # signal 40 kHz away. Everything below is in units of the floor under each
+    # point, which is exactly what it used to be when the floor was one number.
     p = np.asarray(mean_points, dtype=np.float64)
-    seg = np.lib.stride_tricks.sliding_window_view(p, win)[::window_step]
+    if floor_points is None:
+        fl = np.full(len(p), max(float(np.mean(np.asarray(floor, dtype=np.float64))),
+                                 1e-30))
+    else:
+        fl = np.maximum(np.asarray(floor_points, dtype=np.float64), 1e-30)
+    rel = p / fl
+    seg = np.lib.stride_tricks.sliding_window_view(rel, win)[::window_step]
     if len(seg) < nwin:                                   # short map: hold the last
         seg = np.concatenate([seg, np.repeat(seg[-1:], nwin - len(seg), axis=0)])
     seg = seg[:nwin]
-    exc = np.maximum(seg - floor_level, 0.0)
+    exc = np.maximum(seg - 1.0, 0.0)
     peak = np.max(exc, axis=1)
     total = np.sum(exc, axis=1)
     ranked = np.sort(exc, axis=1)[:, ::-1]                 # strongest point first
-    detect = max(DETECT_FLOOR_FRAC * floor_level, 1e-30)
+    detect = DETECT_FLOOR_FRAC
     whole = np.sum(ranked > detect, axis=1)
     part = np.where(whole < win,
                     ranked[np.arange(nwin), np.minimum(whole, win - 1)] / detect, 0.0)
@@ -201,7 +276,7 @@ def features(W, floor, mean_points, snr_db, depth, syllabic, occupancy,
     # boundary point occupied on its own is a signal that happens to end there,
     # which is what a tone parked on the edge of a window looks like, and it
     # keeps its measured width.
-    occ = np.maximum(p - floor_level, 0.0) > detect
+    occ = np.maximum(rel - 1.0, 0.0) > detect
     lo = np.arange(nwin) * window_step
     left = np.where(lo > 0, occ[np.maximum(lo - 1, 0)], False)
     right_i = np.minimum(lo + win, len(p) - 1)
@@ -217,6 +292,12 @@ def features(W, floor, mean_points, snr_db, depth, syllabic, occupancy,
 
     return {
         "bw_hz": bw_hz,
+        # the strongest point over its own floor, in dB: what says a narrow
+        # signal is there at all, since the window SNR cannot
+        "peak_db": (10.0 * np.log10(1.0 + peak) if peak_db is None
+                    else np.asarray(peak_db, dtype=np.float64)),
+        "shift_hz": _two_tone_shift(exc, step_hz),
+        "resolves_shift": float(step_hz <= RTTY_RESOLVE_HZ),
         "filled": np.where(total > 0.0, energy_pts / max(win, 1), 0.0),
         # how much of a width verdict this map has earned here: a window only
         # three points across cannot tell a tone from a conversation by shape
@@ -230,10 +311,20 @@ def features(W, floor, mean_points, snr_db, depth, syllabic, occupancy,
     }
 
 
+def present(feat):
+    """How sure a window holds anything at all, from whichever of the two
+    measures can see it: a conversation fills the window and is read by its
+    SNR, a keyed tone or a carrier is one point of eleven and is read by its
+    peak. Before this, a 15 dB CW column raised its 2.7 kHz window by 2.8 dB,
+    scored 0.6 here, and every narrow verdict was docked for it."""
+    return np.maximum(_ramp(feat["snr_db"], PRESENT_DB),
+                      _ramp(feat.get("peak_db", feat["snr_db"]), PEAK_PRESENT_DB))
+
+
 def scores(feat):
     """A 0..1 verdict per kind. They do not sum to one; the winner takes it."""
-    present = _ramp(feat["snr_db"], PRESENT_DB)
-    absent = 1.0 - present
+    here = present(feat)                  # not shadowed: scores() calls it
+    absent = 1.0 - here
     syl = _ramp(feat["syllabic"], SYLLABIC_VOICE)
     # Where the map is fine enough, width says which of a tone and a
     # conversation this is. Where it is not -- a 2 MHz span puts three
@@ -271,34 +362,81 @@ def scores(feat):
     impulsive = _ramp(feat["crest"], CREST_IMPULSE) * (1.0 - _ramp(feat["occupancy"],
                                                                   OCCUPANCY_HERE))
     weather = _ramp(feat["floor_corr"], FLOOR_TRACK)
+    # On all the time. A block of FT8 is; an operator is not, whatever else
+    # the two have in common.
+    ontime = _ramp(feat["duty"], ONTIME)
+    spoken_block = _ramp(feat["syllabic"], SPOKEN_BLOCK)
+    # A whole sub-band of digital signals fills its window edge to edge, stays
+    # on, and is not paced by syllables. Measured on the live gate 2026-09-03,
+    # the FT8 window on 20 m read depth 0.39 and syllabic 0.52: `steady` was
+    # 0.04, so the old data term could not claim it, `swung` was 0.63 and
+    # `syl` 0.68, so voice did -- at 14074.0 and again at 14080.5, the FT8 and
+    # FT4 windows, both called "voice". What separates them from a talker is
+    # not the envelope at all: it is that a talker's energy is in the bottom
+    # kilohertz of his passband (`filled` ~0.4) and a block's is everywhere.
+    block = here * filled * (1.0 - spoken_block) * ontime
+    # Two tones a standard shift apart, held on: RTTY, where the map can
+    # resolve the shift at all. Where it cannot, this is zero and the same
+    # signal lands on `data`, which is the honest answer at 244 Hz a point.
+    shift_fit = np.exp(-((np.asarray(feat.get("shift_hz", 0.0), dtype=np.float64)
+                          - RTTY_SHIFT_HZ) / RTTY_SHIFT_TOL_HZ) ** 2)
+    rtty = (float(feat.get("resolves_shift", 0.0)) * here * shift_fit
+            * ontime * steady * narrow)
     return {
-        "voice": present * wide * syl * swung,
-        "cw": present * narrow * keyed,
+        "voice": here * wide * syl * swung,
+        "cw": here * narrow * keyed,
         # a fixed width and a flat envelope, and not the single point that
-        # would make it a carrier
-        "data": present * steady * (1.0 - peaky) * (1.0 - filled) * (0.5 + 0.5 * narrow),
-        "carrier": present * narrow * steady * peaky,
+        # would make it a carrier -- or a whole sub-band of them
+        "data": np.maximum(
+            here * steady * (1.0 - peaky) * (1.0 - filled) * (0.5 + 0.5 * narrow),
+            block),
+        "rtty": rtty,
+        "carrier": here * narrow * steady * peaky,
         # nothing above the floor, or a crash, or hash filling the window with
         # no syllables and no keying in it
-        "noise": np.maximum.reduce([absent, present * impulsive, present * weather,
-                                    present * filled * (1.0 - syl) * (1.0 - keyed)]),
+        "noise": np.maximum.reduce([absent, here * impulsive, here * weather,
+                                    here * filled * (1.0 - syl) * (1.0 - keyed)]),
+        # not a kind: what classify() needs to know before it may say "signal"
+        "_present": here,
     }
 
 
 def classify(W, floor, mean_points, snr_db, depth, syllabic, occupancy,
-             win, window_step, step_hz):
+             win, window_step, step_hz, floor_points=None):
     """(codes, confidences) per window, ready for the finder's ring.
 
     The confidence is the winner's own verdict docked by half the runner-up's:
     two kinds that both half-fit describe a window nobody can name from a
     quarter-kilohertz map and thirty frames a second, and the number says so.
+
+    Where nothing names a window that certainly HAS something in it, the answer
+    is "signal" at the confidence that something is there -- never "noise", and
+    never the least-bad of five names. A finder that drops what it cannot name
+    is worse than one that admits it: the operator can hear it either way.
     """
-    s = scores(features(W, floor, mean_points, snr_db, depth, syllabic, occupancy,
-                        win, window_step, step_hz))
-    S = np.stack([np.asarray(s[k], dtype=np.float64) for k in KINDS])
+    return verdict(features(W, floor, mean_points, snr_db, depth, syllabic,
+                            occupancy, win, window_step, step_hz,
+                            floor_points=floor_points))
+
+
+def verdict(feat):
+    """(codes, confidences) from an already-measured feature dict.
+
+    Split out of classify() so the finder can keep the features it paid for --
+    the occupied width decides how far a candidate suppresses its neighbours,
+    and measuring it twice would be measuring it differently.
+    """
+    s = scores(feat)
+    present = np.asarray(s["_present"], dtype=np.float64)
+    S = np.stack([np.asarray(np.broadcast_to(s.get(k, 0.0), present.shape),
+                             dtype=np.float64) for k in KINDS])
     ranked = np.sort(S, axis=0)
     # a window nothing scored at all is not the first kind in KINDS, it is the
     # last one: argmax has to answer something even when every verdict is zero
     code = np.where(ranked[-1] > 0.0, np.argmax(S, axis=0), NOISE).astype(np.int8)
     conf = np.clip(ranked[-1] - 0.5 * ranked[-2], 0.0, 1.0)
+    unsure = ((ranked[-1] < SIGNAL_TOP) & (conf < SIGNAL_CONF)
+              & (present >= SIGNAL_PRESENT))
+    code = np.where(unsure, SIGNAL, code).astype(np.int8)
+    conf = np.where(unsure, present, conf)
     return code, conf.astype(np.float32)

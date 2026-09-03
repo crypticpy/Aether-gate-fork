@@ -488,7 +488,7 @@ class _DiversityState:
             return {"available": False, "reason": "not aligned"}
         if self.finder is None:
             return {"available": False, "reason": "no frames yet"}
-        return self.finder.candidates(float(self.a.center_hz), self.live)
+        return self.finder.candidates(float(self.a.center_hz), self.live, getattr(self.a, "_slice_hz", None))
 
     def status(self, sid=None):
         sid = self.active_slice if sid is None else int(sid)

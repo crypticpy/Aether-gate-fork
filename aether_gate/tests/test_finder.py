@@ -84,12 +84,16 @@ def test_voice_is_found_first_and_the_carrier_and_noise_are_not():
     assert top["active_s"] >= 3 * SLOW_PERIOD_S and top["last_s"] is not None
     # and it says so: a phone-wide patch swinging at syllable rate is voice
     assert top["kind"] == "voice" and top["kind_conf"] >= 0.5
-    # every row carries a verdict, and no verdict is off the five-name list
+    # every row carries a verdict, and no verdict is off the list of names
     assert all(c["kind"] in KINDS and 0.0 <= c["kind_conf"] <= 1.0 for c in cands)
-    # the carrier (steady) and the noise never make the list
-    for c in cands[1:]:
-        assert not (CENTER - 32_000 <= c["hz"] <= CENTER - 28_000), c
-    assert all(c["score"] >= VOICE_SCORE for c in cands)
+    # the carrier IS listed now -- a finder that only lists conversations
+    # cannot answer "what is that?" -- but it is never called one, and the
+    # empty band either side of the two signals is not listed at all
+    carrier = [c for c in cands if CENTER - 32_000 <= c["hz"] <= CENTER - 28_000]
+    assert len(carrier) == 1, cands
+    assert carrier[0]["kind"] in ("carrier", "psk31", "data", "signal"), carrier
+    assert len(cands) == 2, cands
+    assert all(c["score"] > 0.0 for c in cands)
     # the pair's phase and level ratio are read at the candidate
     assert top["phase_deg"] == pytest.approx(np.degrees(-1.2), abs=8.0)
     assert top["ratio_db"] == pytest.approx(20 * np.log10(0.8), abs=1.5)
