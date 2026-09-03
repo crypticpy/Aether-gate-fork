@@ -9,6 +9,7 @@ tracker feed, and the status/set contract the engine's routes rely on.
 
 Run:  python -m pytest aether_gate/tests/test_diversity_state_v2.py
 """
+import math
 import os
 import time
 
@@ -718,3 +719,38 @@ def test_the_compass_is_asked_at_the_slice_and_cached(monkeypatch):
     st.set(mode="manual", phase_deg=40.0)
     st.compass_json()
     assert len(calls) == 2 and calls[-1][0] == -40.0
+
+
+def test_the_noise_bearing_rides_on_the_compass_payload_and_into_the_site_log(monkeypatch):
+    """core/noisebearing wired up: the map's coherent floor becomes one
+    bearing under the compass payload's "noise" key, and the same number is
+    stamped on the site log's noise line. The compass fit is made up here --
+    the fit itself is core/compass' business, tested there."""
+    from aether_gate.core import compass
+    st = _aligned_state()
+    st.memory.names_path = None
+    # nothing fed yet: the key is there and says why it is empty
+    assert st.compass_json()["noise"] == {
+        "available": False, "kind": None, "phase_deg": None, "coherence": None,
+        "bearing_deg": None, "mirror_deg": None, "bins": 0, "since": None,
+        "reason": "no spatial map yet"}
+    fit = compass.GlobalFit(True, dtau_s=12e-9, d_m=4.0, baseline_deg=70.0,
+                            quality=0.9, n_beacons=8, n_bands=3)
+    monkeypatch.setattr(st.enh, "global_fit", lambda log, now: fit)
+    st.enh._noise = None                                 # the 5 s cache, from above
+    rng = np.random.default_rng(31)
+    # 35 kHz of coherent hash below the centre, all of it from one direction
+    _feed_scene(st, rng, 12, [(-45_000, -10_000, 1.1, 1.0, 1.0)])
+    nb = st.compass_json()["noise"]
+    assert nb["available"] and nb["kind"] == "floor" and nb["bins"] >= 100
+    assert nb["coherence"] >= 0.4 and nb["since"] is not None
+    # the phase went in as b = a * exp(1.1i), which is what the log means by
+    # a ratio, and the made-up compass turns it into a bearing and its mirror
+    assert abs((nb["phase_deg"] - math.degrees(1.1) + 180.0) % 360.0 - 180.0) <= 5.0
+    seen = fit.bearing_from_phase(nb["phase_deg"], st.a.center_hz)["bearings_deg"]
+    assert min(abs(nb["bearing_deg"] - b) for b in seen) <= 1.0
+    assert nb["mirror_deg"] is not None
+    st.status()                                          # the poll writes the line
+    line = list(st.sitelog.read(kind="noise"))[-1]
+    assert line["noise_bearing_deg"] == nb["bearing_deg"]
+    assert line["noise_coherence"] is None or line["noise_coherence"] >= 0.0

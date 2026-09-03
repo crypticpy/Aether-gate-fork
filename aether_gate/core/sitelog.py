@@ -25,7 +25,10 @@ Two kinds:
   "noise"   the profile's verdict: the mains comb and its depth, the
             impulse rate and excess, the strongest non-mains lines, and --
             if the caller has it -- how coherent the noise is across the
-            pair.
+            pair and which way it points (core.noisebearing). The bearing
+            is written but is NOT part of the verdict: noise that swings a
+            few degrees is the same noise, and a month of it is a map of
+            where the neighbourhood's interference lives.
 
 The ratio is kept as [re, im] and not as a phase on purpose. A phase is all
 a two-element pair needs today; a four-element array needs the amplitude
@@ -172,7 +175,7 @@ class SiteLog:
 
     def noise(self, *, samp_rate, center_hz, mains_hz=None, hum_db=None,
               harmonics=None, impulses_per_s=None, impulse_db=None, lines=None,
-              noise_coherence=None, force=False):
+              noise_coherence=None, noise_bearing_deg=None, force=False):
         """The profile's verdict, rate-limited. Returns the line written, or
         None when this second said nothing the last line did not."""
         rec = {
@@ -183,6 +186,7 @@ class SiteLog:
             "impulses_per_s": _num(impulses_per_s), "impulse_db": _num(impulse_db),
             "lines": list(lines) if lines else [],
             "noise_coherence": _num(noise_coherence, 3),
+            "noise_bearing_deg": _num(noise_bearing_deg, 1),
         }
         now = float(self._clock())
         verdict = _verdict(rec)
@@ -196,8 +200,9 @@ class SiteLog:
         return self._append(rec)
 
     def noise_status(self, status, samp_rate, center_hz, noise_coherence=None,
-                     force=False):
-        """The same, straight from core.noiseprofile.status()."""
+                     noise_bearing_deg=None, force=False):
+        """The same, straight from core.noiseprofile.status() -- with the
+        bearing from core.noisebearing beside it when the caller has one."""
         if not status:
             return None
         return self.noise(
@@ -206,7 +211,8 @@ class SiteLog:
             harmonics=status.get("harmonics"),
             impulses_per_s=status.get("impulses_per_s"),
             impulse_db=status.get("impulse_db"), lines=status.get("periodic"),
-            noise_coherence=noise_coherence, force=force)
+            noise_coherence=noise_coherence,
+            noise_bearing_deg=noise_bearing_deg, force=force)
 
     def _append(self, rec):
         try:

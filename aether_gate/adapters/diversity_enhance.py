@@ -25,12 +25,18 @@ Everything here is off by default and says so in status().
             log is short, 0.4 s at a month of beacons. It is cached for a
             few seconds keyed on the phase and frequency it was asked
             about, so a polling window never pays twice.
+  the noise bearing rides on that same fit (core.noisebearing): the spatial
+            map's coherent floor bins averaged into one phase, put through
+            the compass. Cached the same way -- and the fit it needs is kept
+            for a minute, because the status poll asks several times a
+            second and beacons arrive one every three minutes.
 """
 import time
 
 import numpy as np
 
 COMPASS_TTL_S = 5.0
+GLOBAL_FIT_TTL_S = 60.0      # the search behind the bearing, which no new beacon outruns
 MRC_REFRESH_S = 1.0          # how often the map's covariance is handed to the weights
 
 
@@ -54,6 +60,11 @@ def _cp():
     return compass
 
 
+def _nb():
+    from ..core import noisebearing
+    return noisebearing
+
+
 class Enhancers:
     def __init__(self):
         self.post_v2 = False
@@ -66,6 +77,9 @@ class Enhancers:
         self.timesignals = None             # TimeSignalWatch
         self._last_ts = None
         self._compass = None                # (key, at, answer)
+        self._gfit = None                   # (at, GlobalFit) behind the noise bearing
+        self._noise = None                  # (at, answer)
+        self._noise_hist = None             # BearingHistory, for its `since`
 
     # --- post=v2: the coherence post-filter on the passband ------------------
     def post_audio(self, y, pa, pb, rate_hz, lo_hz, hi_hz):
@@ -162,6 +176,34 @@ class Enhancers:
             return c[2]
         out = _cp().compass_json(sitelog, phase_deg=phase_deg, f_hz=f_hz)
         self._compass = (key, now, out)
+        return out
+
+    def global_fit(self, sitelog, now):
+        """The pair itself, fitted from every band the log has heard, kept
+        for a minute (see GLOBAL_FIT_TTL_S)."""
+        g = self._gfit
+        if g is not None and now - g[0] < GLOBAL_FIT_TTL_S:
+            return g[1]
+        fit = _cp().fit_global_from_log(sitelog)
+        self._gfit = (now, fit)
+        return fit
+
+    # --- the noise bearing, cached ----------------------------------------------
+    def noise_bearing(self, spmap, profile_status, sitelog, rate_hz, center_hz,
+                      now=None):
+        """Which way the noise the profile just described is coming from:
+        the map's coherent floor bins as one phase, that phase as a bearing.
+        See core.noisebearing for what is averaged and what is left out."""
+        now = time.time() if now is None else now
+        c = self._noise
+        if c is not None and now - c[0] < COMPASS_TTL_S:
+            return c[1]
+        if self._noise_hist is None:
+            self._noise_hist = _nb().BearingHistory()
+        out = _nb().noise_bearing(spmap, profile_status,
+                                  self.global_fit(sitelog, now), center_hz,
+                                  rate_hz, now=now, history=self._noise_hist)
+        self._noise = (now, out)
         return out
 
     def status(self):

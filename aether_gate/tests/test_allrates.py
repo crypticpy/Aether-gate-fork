@@ -18,6 +18,10 @@ adapters/diversity_state.py builds it for the real reader thread:
   * noise profile                the raw aligned block pair, before the
     windowed FFT (ingest() feeds NoiseProfile.update() straight off the
     reader, at CHUNK samples a call);
+  * noise bearing                not a streaming stage at all: it reads the
+    spatial map the reader has already built, once per poll, so its row
+    below is one call per span against a map fed the same frames as the
+    spatial test above (adapters/diversity_enhance.py caches it for 5 s);
   * sub-band / voice print / contour   the demodulated PASSBAND pair, at
     _pd_rate = samp_rate // AUDIO_RATE's floor (adapters/soapy.py
     _init_demod), which is why their own "rate" argument is a few values
@@ -57,6 +61,7 @@ from aether_gate.core.contour import fit_contour, PROFILE_BANDS
 from aether_gate.core.diversity import ALIGN_MIN_PEAK, combine
 from aether_gate.core.finder import (DIAL_GRID_HZ, EDGE_MARGIN_HZ, FAST_FRAMES,
                                      Finder, LiveSpatial, VOICE_SCORE)
+from aether_gate.core import compass, noisebearing
 from aether_gate.core.noiseprofile import NoiseProfile
 from aether_gate.core.spatial import SOURCE_MIN_COHERENCE, SpatialMap
 from aether_gate.core.subband import NFFT, SubbandCombiner
@@ -286,6 +291,91 @@ def test_finder_and_spatial_process_one_second_faster_than_real_time(rate):
     assert wall < REALTIME_GENERAL_S, f"{rate}: {wall:.3f}s for 1s of input"
     if rate == max(RATES_HZ):
         assert wall < REALTIME_S, f"{rate}: {wall:.3f}s for 1s of input (must be < {REALTIME_S}s)"
+
+
+# =========================================================================
+# noise bearing
+# =========================================================================
+
+NOISE_BEARING_DEG = 200.0    # where the made-up pair below is told the hash is
+NOISE_BASELINE_DEG = 70.0
+NOISE_SNR = 4.0              # 7 dB over the floor: hash, not a transmission
+
+
+def _noise_scene(rate, seed, bearing_deg=NOISE_BEARING_DEG, station=None):
+    """A spatial map fed a coherent hash band covering 5-90 % of the span's
+    upper half at a phase a made-up compass says is `bearing_deg`, and that
+    compass. Everything is a FRACTION of the span, so the same scene is the
+    same scene at 62.5 k and at 2.04 MS/s. `station` adds a 3 kHz signal
+    25 dB over the hash, pointing somewhere else, present from the first
+    frame so the map's floor tracker learns it rather than refusing it."""
+    fit = compass.GlobalFit(True, dtau_s=12e-9, d_m=4.0,
+                            baseline_deg=NOISE_BASELINE_DEG, quality=0.95,
+                            n_beacons=8, n_bands=3)
+    center = 7_100_000.0
+    f = np.fft.fftfreq(MAP_BINS, 1.0 / rate)
+    sel = (f >= 0.05 * rate / 2) & (f < 0.90 * rate / 2)
+    at_hz = center + float(np.mean(f[sel]))
+    phase = math.radians(fit.phase_at(bearing_deg, at_hz))
+    rng = np.random.default_rng(seed)
+    sm = SpatialMap(MAP_BINS, rate)
+    frame_s = CHUNK / rate
+    for _ in range(40):
+        Xa, Xb = _white_frame(rng, MAP_BINS)
+        s = ((rng.normal(size=int(sel.sum())) + 1j * rng.normal(size=int(sel.sum())))
+             * math.sqrt(NOISE_SNR / 2))
+        Xa[sel] += s
+        Xb[sel] += s * np.exp(1j * phase)          # B relative to A, the log's sign
+        if station is not None:
+            k = int(station.sum())
+            q = (rng.normal(size=k) + 1j * rng.normal(size=k)) * math.sqrt(300.0 / 2)
+            Xa[station] += q
+            Xb[station] += q * np.exp(1j * math.radians(140.0))
+        sm.update(np.stack([Xa, Xb]), frame_s)
+    return sm, fit, center, at_hz
+
+
+@pytest.mark.parametrize("rate", RATES_HZ, ids=_rid)
+def test_noise_bearing_finds_the_same_hash_at_every_rate(rate):
+    """One local noise source, described as a fraction of the span, has to
+    come back as the same bearing whether the span is 62.5 kHz or 2.04 MHz:
+    every threshold in core/noisebearing.py that is a frequency (the 50 kHz
+    neighbourhood a station is judged against, the 20 kHz a transmission
+    cannot be wider than, the guard around DC) is derived from the rate, not
+    from a bin count."""
+    sm, fit, center, at_hz = _noise_scene(rate, seed=int(rate))
+    t0 = time.perf_counter()
+    out = noisebearing.noise_bearing(sm, {"impulses_per_s": 8.0}, fit, center, rate,
+                                     now=1000.0,
+                                     history=noisebearing.BearingHistory())
+    _record("noisebearing", _rid(rate), 1.0, time.perf_counter() - t0)
+    _assert_finite_json(out)
+    assert out["available"], out["reason"]
+    assert out["kind"] == "impulse"
+    assert out["bins"] >= noisebearing.MIN_BINS, out
+    assert out["coherence"] >= noisebearing.MIN_COHERENCE, out
+    err = abs((out["bearing_deg"] - NOISE_BEARING_DEG + 180.0) % 360.0 - 180.0)
+    assert err <= 5.0, f"bearing {out['bearing_deg']} at rate={rate} ({out['reason']})"
+    # the mirror the two elements cannot tell apart, and nothing else
+    assert abs((out["mirror_deg"] - (2 * NOISE_BASELINE_DEG - out["bearing_deg"])
+                + 180.0) % 360.0 - 180.0) <= 0.2
+    assert out["since"] == 1000.0
+
+
+@pytest.mark.parametrize("rate", RATES_HZ, ids=_rid)
+def test_noise_bearing_leaves_a_station_out_at_every_rate(rate):
+    """A 3 kHz signal 25 dB over the hash is a transmission at every span --
+    at 62.5 kS/s it is 100 bins wide and at 2.04 MS/s it is three, and
+    either way it must not get a vote in where the noise is."""
+    f = np.fft.fftfreq(MAP_BINS, 1.0 / rate)
+    station = (f >= 0.30 * rate / 2) & (f < 0.30 * rate / 2 + 3_000.0)
+    sm, fit, center, _at = _noise_scene(rate, seed=int(rate) ^ 0x5EED,
+                                        station=station)
+    _coh, _steer, _m, level = sm._analyse()
+    assert noisebearing.station_mask(level, rate)[station].all()
+    out = noisebearing.noise_bearing(sm, None, fit, center, rate)
+    err = abs((out["bearing_deg"] - NOISE_BEARING_DEG + 180.0) % 360.0 - 180.0)
+    assert err <= 5.0, f"the station moved the bearing to {out['bearing_deg']}"
 
 
 # =========================================================================

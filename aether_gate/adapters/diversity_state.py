@@ -119,16 +119,14 @@ def _is_fm(mode):
 
 class _DiversityState:
     CAL_SECONDS = 0.5          # of raw IQ cross-correlated to find the lag
-    # A quiet half second of band noise from two loops a few metres apart
-    # peaks at only 6-10x the floor (measured 2026-09-03: 34x and 49x with a
-    # talker, 9x and 10x without, on the same capture), so one window is not
-    # a verdict. Keep measuring, up to ALIGN_TRIES windows, and adopt the
-    # best; a peak past ALIGN_STRONG_PEAK ends the search early.
+    # A quiet half second of two loops' band noise peaks at only 6-10x the floor
+    # (2026-09-03: 34x and 49x with a talker, 9x and 10x without, same capture), so
+    # one window is no verdict: keep measuring up to ALIGN_TRIES windows and adopt
+    # the best; a peak past ALIGN_STRONG_PEAK ends the search early.
     ALIGN_TRIES = 8
     ALIGN_STRONG_PEAK = 30.0
     # How the lag is searched -- over a time, at every span -- is core/alignsearch.py.
-    CAL_SAMPLES_MAX = 1_000_000  # 0.49 s at 2.04 MS/s: the window is a TIME (the
-                                # offset is ~33 ms); alignsearch bounds the FFT
+    CAL_SAMPLES_MAX = 1_000_000  # 0.49 s at 2.04 MS/s: the window is a TIME (the offset is ~33 ms)
     MODES = ("off", "manual", "null", "track")
     SOURCES = ("combined", "a", "b", "stereo")   # HEAR: what reaches the audio
     PANS = ("combined", "a", "b", "nulled")      # what the panadapter shows
@@ -155,9 +153,8 @@ class _DiversityState:
             names_path=os.path.expanduser(self.NAMES_PATH))
         self.active_slice = 0
         self._cal_a, self._cal_b, self._cal_n = [], [], 0
-        # Guards _cal_a/_cal_b/_cal_n: request_realign() can land from the
-        # HTTP thread (diversity_realign) while ingest() is mid-accumulate on
-        # the reader thread, and an empty list handed to np.concatenate raises.
+        # Guards _cal_a/_cal_b/_cal_n: request_realign() can land from the HTTP
+        # thread while ingest() is mid-accumulate, and np.concatenate([]) raises.
         self._cal_lock = threading.Lock()
         self._realign = None                # why a measurement is owed, or None
         self._align_try = 0                 # windows measured for the realign in progress
@@ -184,8 +181,7 @@ class _DiversityState:
         self.sitelog = _sl().SiteLog(os.path.expanduser(self.SITELOG_PATH))
         self._last_beacon = None
         self.beacons = None                 # the NCDXF beacons on the pair (core.beacons)
-        # spatial map: rebuilt whenever the hardware centre or rate moves,
-        # since its bins are absolute frequencies
+        # spatial map: rebuilt when the centre or rate moves (its bins are absolute Hz)
         self.map = None
         self._map_key = None
         self.live = None                    # LiveSpatial: the span right now
@@ -333,14 +329,12 @@ class _DiversityState:
         rate = float(self.a.samp_rate)
         key = (center, rate)
         if self.map is None or self._map_key[1] != rate:
-            # no map yet, or the rate moved: every bin's meaning changed,
-            # nothing to slide
+            # no map yet, or the rate moved: every bin means something else now
             self.map = _sp().SpatialMap(n, rate)
             self.live = _fd().LiveSpatial(n, rate)
             self.finder = _fd().Finder(n, rate)
         elif self._map_key[0] != center:
-            # same span, different centre: the bins are still THIS wide, just
-            # sitting somewhere else -- slide the history rather than lose it
+            # same span, new centre: same bin width, elsewhere -- slide, don't lose
             delta = center - self._map_key[0]
             self.map.retune(delta)
             self.live.retune(delta)
@@ -360,8 +354,7 @@ class _DiversityState:
         n = min(len(a), len(b))
         m = self.map.null_weights(fallback=self.weight_for(self.active_slice))
         if n != self.MAP_BINS:
-            # the block and the map differ in length: index the map's bins
-            # by frequency (both are natural FFT order, so go via fftshift)
+            # block and map differ in length: index the map's bins by frequency
             ms = np.fft.fftshift(m)
             idx = (np.arange(n) * self.MAP_BINS) // n
             m = np.fft.ifftshift(ms[idx])
@@ -500,8 +493,7 @@ class _DiversityState:
         sid = self.active_slice if sid is None else int(sid)
         m = self.weight_for(sid)                     # what is ACTUALLY combined
         # phase/ratio report the operator's CONFIGURED weight, not weight_for's
-        # 0j-while-unaligned — the slider must not appear to snap to zero just
-        # because the aligner has not locked yet.
+        # 0j-while-unaligned — the slider must not snap to zero before the lock.
         ph, ra = _dv().weight_to_polar(self._configured_weight(sid))
         t = self.trackers.get(sid)
         return {
@@ -559,15 +551,24 @@ class _DiversityState:
         st["kinds"] = _npk().noise_kinds(
             st, coh, self.mode, self.nb_on, self.blanked_pct,
             self.NULLABLE_COHERENCE, filt.status() if filt is not None else None)
-        self.sitelog.noise_status(st, self.a.samp_rate, self.a.center_hz, coh)
+        nb = self.enh.noise_bearing(self.map, st, self.sitelog, self.a.samp_rate,
+                                    self.a.center_hz, time.time())
+        self.sitelog.noise_status(st, self.a.samp_rate, self.a.center_hz, coh,
+                                  nb["bearing_deg"])
         return st
 
     def compass_json(self):
-        """The pair fitted from the beacons, and the bearing(s) the active
-        slice's phase points at (log: B rel. A; tracker: the opposite sign)."""
+        """The pair fitted from the beacons, the bearing(s) the active slice's
+        phase points at (log: B rel. A; tracker: the opposite sign), and under
+        "noise" which way the noise floor itself points (core.noisebearing)."""
         ph, _ra = _dv().weight_to_polar(self._configured_weight(self.active_slice))
         slice_hz = getattr(self.a, "_slice_hz", None)        # where the phase was measured
-        return self.enh.compass(self.sitelog, -ph, None if slice_hz is None else float(slice_hz))
+        out = dict(self.enh.compass(self.sitelog, -ph,
+                                    None if slice_hz is None else float(slice_hz)))
+        out["noise"] = self.enh.noise_bearing(
+            self.map, self.profile.status() if self.profile is not None else None,
+            self.sitelog, self.a.samp_rate, self.a.center_hz, time.time())
+        return out
 
     def _memory_status(self, sid):
         """The memory's entries with each talker's voice/rig print attached."""
@@ -682,8 +683,7 @@ class _DiversityState:
         if self.hear != "combined":
             return self._monitor(pa, pb)
         if self.enh.post_v2 and self.aligner.aligned and self.mode != "off":
-            # v2 stands in for the sub-band stage: the wideband weight, then
-            # cohpost on the same three blocks (no STFT skew between them)
+            # v2 stands in for the sub-band stage: the wideband weight, then cohpost
             y = _dv().combine_ramp(pa, pb, m0, m1)
             lo, hi = self._pass_edges(getattr(self.a, "_mode", "USB"))
             return self.enh.post_audio(y, pa, pb, rate_hz, lo, hi)
