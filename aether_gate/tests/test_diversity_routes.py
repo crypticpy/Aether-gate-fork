@@ -552,6 +552,15 @@ def test_status_carries_compact_diversity_dict():
         "snr_db": {"a": 18.5, "b": 14.2, "out": 21.0},
         "nb": False, "pan": "combined",
     }
+    assert s["device"] is None                      # the fake has no device_block()
+
+
+def test_status_carries_the_device_block_when_the_adapter_has_one():
+    a = FakeDiversityAdapter()
+    a.device_block = lambda: {"model": "RSPduo", "tuners": 2,
+                              "diversity": {"capable": True, "running": True}}
+    _, port = _start(a)
+    assert _get(port, "/status")["device"]["model"] == "RSPduo"
 
 
 def test_status_diversity_nb_reflects_adapter_state():

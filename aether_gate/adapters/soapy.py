@@ -107,6 +107,7 @@ from ..core.fft import dbm_offset_for, dbfs_to_dbm_for
 from ..core.filter import SliceFilter, blank_impulses
 from ..core.roofing import DigitalRoof, snap_analogue_hz
 from .chainstatus import chain_rows
+from .device_info import device_block
 
 # Bin powers in a noise-only FFT are exponentially distributed; their median is
 # ln(2) times their mean. read_meters divides by this to turn a robust median
@@ -246,6 +247,7 @@ class SoapyAdapter(RadioAdapter):
         self._b_tmp = None                  # scratch for channel B reads
         self.diversity_available = False    # True once two channels flow (see _open_hw)
         self._div = None                    # _DiversityState, dual-tuner only
+        self._device = (None, 0.0)          # device_block() and when it was made
         # Staged-decimation + SSB/FM state for both channels, one object so a
         # rate change can never hand A and B different generations mid-call;
         # see _DemodChain. The properties above expose its fields under their
@@ -1510,6 +1512,16 @@ class SoapyAdapter(RadioAdapter):
         self._setting_to[str(key)] = str(value)
         return True
 
+    def device_block(self):
+        """What is plugged in and whether the pair is running (device_info),
+        for /status; the driver is asked at most every two seconds."""
+        blk, at = self._device
+        now = time.monotonic()
+        if blk is None or now - at > 2.0:
+            blk = device_block(self._sdr, self.driver, self.device_args, self._channels, self._div)
+            self._device = (blk, now)
+        return blk
+
     def diagnostics(self):
         """'What the gate sees from the radio' for the diagnostics panel."""
         if self._sdr is None:
@@ -1538,6 +1550,11 @@ class SoapyAdapter(RadioAdapter):
             d["device"] = controls
         if self._div is not None:
             d["diversity"] = self._div.status()
+        try:
+            d["device_block"] = device_block(
+                self._sdr, self.driver, self.device_args, self._channels, self._div)
+        except Exception:
+            pass
         return d
 
     # --- diversity (dual tuner) -------------------------------------------

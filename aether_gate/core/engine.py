@@ -3741,6 +3741,10 @@ def start_control_server(radio, port):
                     "audio_backlog_ms": (round(radio.adapter.audio_backlog_ms(), 1)
                                          if hasattr(radio.adapter, "audio_backlog_ms") else None),
                     "diversity": div,
+                    # what is plugged in: model, serial, tuners, and whether the
+                    # pair is running or one tuner is being heard (device_info)
+                    "device": (radio.adapter.device_block()
+                               if hasattr(radio.adapter, "device_block") else None),
                 })
             # ---- radio diagnostics: 'what the gate sees from the radio' ----
             if u.path == "/diagnostics":
