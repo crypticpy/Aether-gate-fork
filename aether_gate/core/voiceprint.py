@@ -43,7 +43,18 @@ MERGE = 0.3              # a new over's weight in the talker's print
 # bearing. An over that ends unlike the print it was headed for does not
 # teach it either.
 VOICE_CHECK_S = 1.0
-DIFFERENT_VOICE = 0.9
+DIFFERENT_VOICE = 1.2
+# THE BAND IS NOT THE VOICE. A print made of the raw band profile is a
+# print of the voice PLUS the band noise, and on a weak signal the noise
+# is most of it: the top edge is wherever the noise floor is, the tilt is
+# the floor's, and the same voice at 5 dB and at 20 dB looks like two
+# people (seen live: 49 splits in 17 minutes on a 5 dB night). So the
+# noise's own band profile is learned between overs and taken out of every
+# over before it is judged or learned, and an over that does not clear the
+# noise by SNR_MIN is judged nowhere and teaches nothing.
+NOISE_TC_S = 3.0
+SNR_MIN = 2.0            # the over's band power over the noise's (3 dB)
+NOISE_RESIDUE = 0.5      # a band must hold this much voice over the noise to count
 
 
 class _Over:
@@ -68,6 +79,9 @@ class VoicePrint:
         self._cur = None
         self.prints = {}            # talker id -> {bands, syllabic, over_s, overs}
         self.env_hz = self.rate_hz / self.hop
+        self.noise = None           # (BANDS,) the band between overs
+        self._noise_n = 0
+        self._nbuf = np.zeros(0)
 
     # --- feeding ----------------------------------------------------------------
     def feed(self, y, talking, talker_id):
@@ -83,8 +97,36 @@ class VoicePrint:
             while len(self._buf) >= self.hop:
                 self._hop(self._buf[:self.hop])
                 self._buf = self._buf[self.hop:]
-        elif self._cur is not None:
-            self._finish()
+        else:
+            if self._cur is not None:
+                self._finish()
+            self._nbuf = np.concatenate([self._nbuf, audio])
+            while len(self._nbuf) >= self.hop:
+                self._noise_hop(self._nbuf[:self.hop])
+                self._nbuf = self._nbuf[self.hop:]
+
+    def _noise_hop(self, x):
+        X = np.abs(np.fft.rfft(x * self.win)) ** 2
+        b = np.bincount(self._band, weights=X, minlength=BANDS + 1)[:BANDS]
+        self._noise_n += 1
+        if self.noise is None:
+            self.noise = b
+        else:
+            al = max(1.0 - math.exp(-self.hop / self.rate_hz / NOISE_TC_S), 1.0 / self._noise_n)
+            self.noise += al * (b - self.noise)
+
+    def _voice_bands(self, cur):
+        """The over's band profile with the band's noise taken out, or None
+        when the over does not clear the noise."""
+        b = cur.bands / cur.n
+        if self.noise is None:
+            return b
+        if float(b.sum()) < SNR_MIN * float(self.noise.sum()):
+            return None
+        # a band where the voice does not reach half the noise is the noise's
+        # residue, not an edge: it is emptied rather than left at -11 dB
+        v = b - self.noise
+        return np.where(v >= NOISE_RESIDUE * self.noise, v, 1e-3 * float(b.max()))
 
     def _hop(self, x):
         cur = self._cur
@@ -99,7 +141,9 @@ class VoicePrint:
         cur, self._cur, self._buf = self._cur, None, np.zeros(0)
         if cur.talker is None or cur.seconds < MIN_OVER_S or cur.n == 0:
             return
-        bands = cur.bands / cur.n
+        bands = self._voice_bands(cur)
+        if bands is None:
+            return
         syl = self._syllabic(np.asarray(cur.env))
         p = self.prints.get(cur.talker)
         if p is None:
@@ -141,8 +185,10 @@ class VoicePrint:
         cur = self._cur
         if cur is None or cur.n == 0 or cur.seconds < VOICE_CHECK_S:
             return None
-        return self._summarise(cur.bands / cur.n, self._syllabic(np.asarray(cur.env)),
-                               cur.seconds, 0)
+        bands = self._voice_bands(cur)
+        if bands is None:
+            return None
+        return self._summarise(bands, self._syllabic(np.asarray(cur.env)), cur.seconds, 0)
 
     @staticmethod
     def distance(a, b):

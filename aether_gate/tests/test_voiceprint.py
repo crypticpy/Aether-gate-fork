@@ -112,3 +112,36 @@ def test_an_over_that_is_not_this_voice_does_not_teach_the_print():
     _feed(vp, _over(rng, 3.0, 300.0, 2400.0, 3.0), 1)      # the talker again
     _silence(vp)
     assert vp.summary(1)["overs"] == 2
+
+
+def _noisy(rng, x, snr_db):
+    n = rng.normal(size=len(x)) + 1j * rng.normal(size=len(x))
+    n *= np.sqrt(np.mean(np.abs(x) ** 2) / 10 ** (snr_db / 10) / np.mean(np.abs(n) ** 2))
+    return x + n
+
+
+def _noise_only(rng, seconds, level):
+    n = int(seconds * RATE)
+    return level * (rng.normal(size=n) + 1j * rng.normal(size=n))
+
+
+def test_the_band_noise_is_taken_out_so_a_weak_over_still_reads_as_the_same_voice():
+    rng = np.random.default_rng(7)
+    vp = VoicePrint(RATE)
+    clean = _over(rng, 4.0, 300.0, 2400.0, 3.0)
+    _feed(vp, clean, 1)
+    _silence(vp)
+    mine = vp.summary(1)
+    # the band between overs: white noise at the level a 3 dB over would sit over
+    noise_level = np.sqrt(np.mean(np.abs(clean) ** 2) / 10 ** (3.0 / 10) / 2)
+    _feed(vp, _noise_only(rng, 4.0, noise_level), None, talking=False)
+    # the same voice at 3 dB SNR, judged a second in: still this talker
+    _feed(vp, _noisy(rng, _over(rng, 1.3, 300.0, 2400.0, 3.0), 3.0), 1)
+    weak = vp.current()
+    assert weak is not None and vp.distance(weak, mine) < DIFFERENT_VOICE, vp.distance(weak, mine)
+    _silence(vp)
+    # noise alone, with the VAD stuck on, is judged nowhere and teaches nothing
+    _feed(vp, _noise_only(rng, 2.0, noise_level), 1)
+    assert vp.current() is None
+    _silence(vp)
+    assert vp.summary(1)["overs"] == 1
