@@ -5,6 +5,7 @@
 #
 """Run:  python -m pytest aether_gate/tests/test_filter.py"""
 import numpy as np
+import pytest
 
 from aether_gate.core.filter import (SliceFilter, Agc, blank_impulses, design_taps,
                                      ANF_WIDTH_HZ)
@@ -28,7 +29,8 @@ def test_sharp_and_soft_passbands_pass_the_voice_and_stop_the_neighbour():
     assert abs(_resp_db(sharp, 2600)) < 0.5
     assert _resp_db(sharp, 2850) < -40                 # 150 Hz past the edge
     assert _resp_db(sharp, 3500) < -60
-    assert _resp_db(soft, 2800) > -20                  # soft skirts are soft
+    assert _resp_db(soft, 2800) > -30                  # soft skirts are soft
+    assert _resp_db(soft, 2600) > -2.0                 # but the top 100 Hz is still there
     assert _resp_db(soft, 4000) < -40
     # LSB is the mirror
     lsb = design_taps(RATE, -2700, -300, "sharp")
@@ -118,9 +120,10 @@ def test_auto_width_follows_the_occupied_spectrum_then_the_print():
     st = sf.status()
     assert st["auto"]["source"] == "spectrum"
     assert 150 <= st["auto"]["low_hz"] <= 400
-    assert 2100 <= st["auto"]["high_hz"] <= 2400
+    # the voice reaches 2100; the top is held at AUTO_MIN_HIGH_HZ, never closed onto it
+    assert 2400 <= st["auto"]["high_hz"] <= 2450
     assert st["low_hz"] == st["auto"]["low_hz"]          # the edges in use are the auto ones
-    # a print for the talker overrides the spectrum guess
+    # a print for the talker may widen the fit (its edges say the rig reaches further)
     sf.print_source = lambda: {"low_hz": 300, "high_hz": 2600, "tilt_db": -3.0}
     for _ in range(int(2.0 * RATE) // n):
         sf.apply(0.0005 * (rng.standard_normal(n) + 1j * rng.standard_normal(n)), 0)
@@ -136,12 +139,18 @@ def test_auto_eq_leans_against_the_prints_tilt():
     sf.set(low=300, high=2700, shape="sharp", auto_eq=True)
     _feed(sf, 1.0, [(1000, 0.01)])
     assert sf.status()["auto_eq"]["tilt_db"] == 5.0
+    # +5 dB is 11 dB brighter than a normal station's -6; half of that comes off the highs
+    assert sf.status()["auto_eq"]["lean_db"] == 5.5
     assert _resp_db(sf.taps, 550) - _resp_db(sf.taps, 2000) > 3.5
+    # a normal station is left alone
+    sf.print_source = lambda: {"low_hz": 300, "high_hz": 2700, "tilt_db": -6.0}
+    _feed(sf, 1.0, [(1000, 0.01)])
+    assert sf.status()["auto_eq"]["lean_db"] == 0.0
 
 
 def test_agc_attacks_fast_hangs_then_decays():
     agc = Agc(target=0.25, rate_hz=1000.0)
-    agc.set("med", attack_ms=5, decay_ms=200, hang_ms=100)
+    agc.set("med", attack_ms=5, decay_ms=200, hang_ms=100, threshold_db=0)   # 0: a plain leveller
     loud = np.full(20, 0.5)
     quiet = np.full(20, 0.05)
     for _ in range(10):
@@ -156,6 +165,33 @@ def test_agc_attacks_fast_hangs_then_decays():
     assert gains[-1] > g_loud * 2                          # then the decay lets it rise
     agc.set("off")
     assert agc.status()["mode"] == "off"
+
+
+def test_agc_threshold_leaves_the_noise_between_words_down():
+    # 20 ms chunks at 1 kS/s; speech at 0.5, the band between words 30 dB under it
+    agc = Agc(target=0.25, rate_hz=1000.0)
+    agc.set("med", attack_ms=5, decay_ms=100, hang_ms=0)
+    assert agc.status()["threshold_db"] == 20.0
+    rng = np.random.default_rng(1)
+    noise = 0.5 * 10 ** (-30 / 20) * rng.standard_normal(20)
+    for _ in range(20):
+        agc.process(noise)                                  # the floor tracker learns the band
+    for _ in range(10):
+        agc.process(np.full(20, 0.5))
+    g_speech = agc.gain
+    out = None
+    for _ in range(60):                                     # 1.2 s of silence: the decay runs out
+        out = agc.process(noise)
+    floor_out = float(np.sqrt(np.mean(out * out)))
+    # the noise is not levelled up to the target: it stays >= 20 dB under it
+    assert floor_out < 0.25 * 10 ** (-20 / 20) * 1.3
+    assert agc.gain < g_speech * 10 ** (30 / 20)          # a leveller would have gone the full 30 dB
+    agc.set(threshold_db=0)
+    for _ in range(60):
+        out = agc.process(noise)
+    assert float(np.sqrt(np.mean(out * out))) > 0.15      # 0 IS the leveller: noise up to target
+    with pytest.raises(ValueError):
+        agc.set(threshold_db=90)
 
 
 def test_blanker_removes_the_impulses_and_keeps_the_tone():

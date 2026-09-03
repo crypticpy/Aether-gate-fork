@@ -24,7 +24,8 @@ import math
 
 import numpy as np
 
-SHAPES = {"soft": 127, "sharp": 1023}
+SHAPES = {"soft": 255, "sharp": 1023}   # soft: 196 Hz transition at 25 kS/s; 127 taps ate
+                                        # 400 Hz of a 2.4 k passband and sounded muffled
 DESIGN_N = 4096                      # frequency-sampling grid for the design
 SPEC_N = 1024                        # analysis FFT (24 Hz/bin at 25 kS/s)
 SPEC_TC_S = 1.0
@@ -42,7 +43,12 @@ AUTO_EDGE_DB = 8.0                   # occupied where the spectrum clears the fl
 AUTO_LOW_MARGIN_HZ = 50.0
 AUTO_HIGH_MARGIN_HZ = 100.0
 AUTO_MIN_WIDTH_HZ = 300.0
-EQ_MAX_DB = 12.0
+AUTO_MIN_HIGH_HZ = 2400.0            # AUTO never closes the top below this: a voice's own
+                                     # spectrum falls 20 dB by 2 kHz, but the consonants that
+                                     # carry intelligibility live above it
+EQ_MAX_DB = 6.0
+EQ_REFERENCE_TILT_DB = -6.0          # a normally set-up SSB station: highs ~6 dB under the lows
+EQ_STRENGTH = 0.5                    # take half the deviation out, never all of it
 EQ_LOW_CENTRE_HZ = 550.0             # the print's tilt is 1.5-2.5 k over 300-800 Hz
 EQ_HIGH_CENTRE_HZ = 2000.0
 
@@ -54,6 +60,8 @@ AGC_MODES = {                        # attack_ms, decay_ms, hang_ms
     "off": None,
 }
 AGC_MAX_GAIN = 1000.0                # 60 dB
+AGC_THRESHOLD_DB = 20.0              # the floor between words is held this far under the target
+AGC_FLOOR_RISE_MS = 8000.0           # the floor tracker follows speech up this slowly
 
 
 def _kaiser(n, beta):
@@ -95,6 +103,7 @@ class FilterSpec:
         self.nb_db = 12.0
         self.agc_mode = "med"
         self.agc_attack_ms, self.agc_decay_ms, self.agc_hang_ms = AGC_MODES["med"]
+        self.agc_threshold_db = AGC_THRESHOLD_DB
 
     def copy(self):
         c = FilterSpec()
@@ -173,9 +182,22 @@ class Agc:
         self.level = 0.05
         self.gain = None
         self.hang_left_ms = 0.0
+        # THRESHOLD (a radio's AGC-T). Without it this is a leveller: between
+        # words the decay winds the gain up until the band noise sits at the
+        # same loudness as the voice did, and speech comes out soft and
+        # mumbling with the noise pumping up around every gap. The floor
+        # tracker follows the quietest recent chunks; the gain may never lift
+        # that floor above target - threshold_db. 0 is the old leveller.
+        self.threshold_db = AGC_THRESHOLD_DB
+        self.floor = None
         self.set("med")
 
-    def set(self, mode=None, attack_ms=None, decay_ms=None, hang_ms=None):
+    def set(self, mode=None, attack_ms=None, decay_ms=None, hang_ms=None, threshold_db=None):
+        if threshold_db is not None:
+            v = float(threshold_db)
+            if not (0.0 <= v <= 60.0):
+                raise ValueError("threshold_db must be 0..60")
+            self.threshold_db = v
         if mode is not None:
             if mode not in AGC_MODES:
                 raise ValueError(f"agc mode must be one of {sorted(AGC_MODES)}")
@@ -199,6 +221,10 @@ class Agc:
             return np_.clip(audio * g, -1.0, 1.0)
         chunk_ms = 1000.0 * n / self.rate_hz
         rms = float(np_.sqrt(np_.mean(audio * audio)) + 1e-9)
+        if self.floor is None or rms < self.floor:
+            self.floor = rms if self.floor is None else self.floor + 0.5 * (rms - self.floor)
+        else:
+            self.floor += (1.0 - math.exp(-chunk_ms / AGC_FLOOR_RISE_MS)) * (rms - self.floor)
         if rms > self.level:
             a = 1.0 - math.exp(-chunk_ms / max(self.attack_ms, 1e-3))
             self.level += a * (rms - self.level)
@@ -209,6 +235,8 @@ class Agc:
             a = 1.0 - math.exp(-chunk_ms / max(self.decay_ms, 1e-3))
             self.level += a * (rms - self.level)
         g_new = min(self.target / max(self.level, 1e-4), AGC_MAX_GAIN)
+        floor_target = self.target * 10 ** (-self.threshold_db / 20.0)
+        g_new = min(g_new, floor_target / max(self.floor, 1e-5))
         g_old = self.gain if self.gain is not None else g_new
         ramp = np_.linspace(g_old, g_new, n)
         out = audio * (ramp[:, None] if audio.ndim == 2 else ramp)
@@ -217,7 +245,7 @@ class Agc:
 
     def status(self):
         return {"mode": self.mode, "attack_ms": self.attack_ms, "decay_ms": self.decay_ms,
-                "hang_ms": self.hang_ms,
+                "hang_ms": self.hang_ms, "threshold_db": self.threshold_db,
                 "gain_db": round(20 * math.log10(self.gain), 1) if self.gain else None}
 
 
@@ -241,7 +269,8 @@ class SliceFilter:
         self.auto_high = None
         self.auto_source = None
         self.anf_found = []                       # [(signed hz, width)]
-        self.eq_tilt_db = 0.0
+        self.eq_tilt_db = 0.0                     # the tilt measured (print or spectrum)
+        self.eq_lean_db = 0.0                     # the correction in the taps
         self.blanked_pct = 0.0
         self._blocks = 0
 
@@ -284,7 +313,7 @@ class SliceFilter:
             elif k == "auto_eq":
                 s.auto_eq = bool(v)
                 if not s.auto_eq:
-                    self.eq_tilt_db = 0.0
+                    self.eq_tilt_db = self.eq_lean_db = 0.0
             elif k == "nb":
                 s.nb_on = bool(v)
             elif k == "nb_db":
@@ -297,7 +326,7 @@ class SliceFilter:
                 s.agc_mode = self.agc.mode
                 s.agc_attack_ms, s.agc_decay_ms, s.agc_hang_ms = \
                     self.agc.attack_ms, self.agc.decay_ms, self.agc.hang_ms
-            elif k in ("attack_ms", "decay_ms", "hang_ms"):
+            elif k in ("attack_ms", "decay_ms", "hang_ms", "threshold_db"):
                 self.agc.set(**{k: v})
                 setattr(s, "agc_" + k, getattr(self.agc, k))
             else:
@@ -352,7 +381,7 @@ class SliceFilter:
         contour = (sgn * s.contour_hz, s.contour_db, s.contour_width_hz) if s.contour_on else None
         apf = (sgn * s.apf_hz, s.apf_width_hz) if s.apf_on else None
         taps = design_taps(self.rate_hz, lo, hi, s.shape, notches, contour, apf,
-                           self.eq_tilt_db if s.auto_eq else 0.0)
+                           self.eq_lean_db if s.auto_eq else 0.0)
         if self.taps is None or len(taps) != len(self.taps):
             self.state = {}
         self.taps = taps
@@ -406,31 +435,38 @@ class SliceFilter:
         if self._blocks < SPEC_WARMUP_BLOCKS:
             return
         sgn = self._sign()
+        # The occupied run of the 1 s spectrum around its peak, read against
+        # the noise floor: where the station actually reaches. This is the
+        # fit. The voice print's edges are its -20 dB points -- a fingerprint,
+        # stable across signal strength, and 400-800 Hz INSIDE where a voice
+        # still carries its consonants -- so the print may only ever WIDEN the
+        # fit (a quiet over must not close the door on the next loud one),
+        # never narrow it, and the top never closes below AUTO_MIN_HIGH_HZ.
+        f = self.spec_f * sgn
+        sel = (f >= 0) & (f <= AUTO_SEARCH_HZ)
+        d = self.spec_db[sel]
+        fr = f[sel]
+        floor = float(np.percentile(d, 10))
+        if float(d.max()) < floor + AUTO_EDGE_DB + 2.0:
+            return                                # nobody there: hold the edges
+        # the occupied run around the peak, not the first and last bin
+        # anywhere above the line: one noise bin at 3.9 kHz is not a voice
+        occ = d > floor + AUTO_EDGE_DB
+        peak = int(np.argmax(d))
+        i0 = i1 = peak
+        while i0 > 0 and occ[max(0, i0 - AUTO_GAP_BINS - 1):i0].any():
+            i0 -= 1
+        while i1 < len(d) - 1 and occ[i1 + 1:i1 + AUTO_GAP_BINS + 2].any():
+            i1 += 1
+        lo = max(AUTO_LOW_MARGIN_HZ, float(fr[i0]) - AUTO_LOW_MARGIN_HZ)
+        hi = float(fr[i1]) + AUTO_HIGH_MARGIN_HZ
+        source = "spectrum"
         pr = self._print()
         if pr and pr.get("low_hz") is not None and pr.get("high_hz") is not None:
-            lo = max(AUTO_LOW_MARGIN_HZ, float(pr["low_hz"]) - AUTO_LOW_MARGIN_HZ)
-            hi = float(pr["high_hz"]) + AUTO_HIGH_MARGIN_HZ
+            lo = min(lo, max(AUTO_LOW_MARGIN_HZ, float(pr["low_hz"]) - AUTO_LOW_MARGIN_HZ))
+            hi = max(hi, float(pr["high_hz"]) + AUTO_HIGH_MARGIN_HZ)
             source = "print"
-        else:
-            f = self.spec_f * sgn
-            sel = (f >= 0) & (f <= AUTO_SEARCH_HZ)
-            d = self.spec_db[sel]
-            fr = f[sel]
-            floor = float(np.percentile(d, 10))
-            if float(d.max()) < floor + AUTO_EDGE_DB + 2.0:
-                return                            # nobody there: hold the edges
-            # the occupied run around the peak, not the first and last bin
-            # anywhere above the line: one noise bin at 3.9 kHz is not a voice
-            occ = d > floor + AUTO_EDGE_DB
-            peak = int(np.argmax(d))
-            i0 = i1 = peak
-            while i0 > 0 and occ[max(0, i0 - AUTO_GAP_BINS - 1):i0].any():
-                i0 -= 1
-            while i1 < len(d) - 1 and occ[i1 + 1:i1 + AUTO_GAP_BINS + 2].any():
-                i1 += 1
-            lo = max(AUTO_LOW_MARGIN_HZ, float(fr[i0]) - AUTO_LOW_MARGIN_HZ)
-            hi = float(fr[i1]) + AUTO_HIGH_MARGIN_HZ
-            source = "spectrum"
+        hi = max(hi, AUTO_MIN_HIGH_HZ)
         if hi - lo < AUTO_MIN_WIDTH_HZ:
             hi = lo + AUTO_MIN_WIDTH_HZ
         if self.auto_low is None:
@@ -485,9 +521,16 @@ class SliceFilter:
             hi_b = (f >= 1500) & (f <= 2500)
             lo_p, hi_p = float(np.mean(self.spec_db[lo_b])), float(np.mean(self.spec_db[hi_b]))
             tilt = hi_p - lo_p
-        tilt = max(-EQ_MAX_DB, min(EQ_MAX_DB, float(tilt)))
-        if abs(tilt - self.eq_tilt_db) > 0.5:
+        # A voice is SUPPOSED to tilt down: flattening it to 0 dB/octave puts
+        # 6-10 dB on the highs of a normal station and it comes out thin and
+        # hissy. Lean against the deviation from a normal station's tilt, and
+        # only half of it, so a bassy station gets a little top and a tinny
+        # one a little bottom.
+        tilt = float(tilt)
+        lean = max(-EQ_MAX_DB, min(EQ_MAX_DB, EQ_STRENGTH * (tilt - EQ_REFERENCE_TILT_DB)))
+        if abs(lean - self.eq_lean_db) > 0.5:
             self.eq_tilt_db = tilt
+            self.eq_lean_db = lean
             self.dirty = True
 
     # ----- reporting ------------------------------------------------------
@@ -517,7 +560,8 @@ class SliceFilter:
             "auto": {"enabled": s.auto, "source": self.auto_source,
                      "low_hz": round(self.auto_low) if self.auto_low is not None else None,
                      "high_hz": round(self.auto_high) if self.auto_high is not None else None},
-            "auto_eq": {"enabled": s.auto_eq, "tilt_db": round(self.eq_tilt_db, 1)},
+            "auto_eq": {"enabled": s.auto_eq, "tilt_db": round(self.eq_tilt_db, 1),
+                        "lean_db": round(self.eq_lean_db, 1)},
             "nb": {"enabled": s.nb_on, "threshold_db": s.nb_db,
                    "blanked_pct": round(self.blanked_pct, 2)},
             "agc": self.agc.status(),
