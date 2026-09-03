@@ -314,7 +314,8 @@ def meter_packet(stream_id, seq, meter_id, dbm):
     return vita_header(stream_id, PCC_METER, seq, len(payload)) + payload
 
 
-_FILTER_FLAGS = ("anf", "contour", "apf", "auto", "auto_eq", "auto_contour", "nb", "talker")
+_FILTER_FLAGS = ("anf", "contour", "apf", "auto", "auto_eq", "auto_contour", "nb",
+                 "talker", "bypass", "notches")
 _FILTER_WORDS = ("shape", "agc", "talker_snap")
 
 
@@ -3932,7 +3933,9 @@ def start_control_server(radio, port):
             #                                auto, auto_eq, NB, AGC, response)
             # GET /filter/set?low=&high=&shape=soft|sharp&anf=&contour=&contour_hz=&
             #     contour_db=&contour_width=&apf=&apf_hz=&apf_width=&auto=&auto_eq=&
-            #     nb=&nb_db=&agc=fast|med|slow|long|off&attack_ms=&decay_ms=&hang_ms=
+            #     nb=&nb_db=&agc=fast|med|slow|long|off&attack_ms=&decay_ms=&hang_ms=&
+            #     bypass=  (the whole slice FIR out) &notches=  (held out, table kept) &
+            #     roof_hz= (the analogue IF filter) &digital_roof_hz= (the digital one)
             # GET /filter/notch?add=<hz>&width=<hz> | ?clear=1 | ?clear=<hz>
             if u.path in ("/filter", "/filter/set", "/filter/notch"):
                 a = radio.adapter

@@ -106,6 +106,8 @@ class FilterSpec:
         self.high_hz = 2900.0
         self.shape = "soft"
         self.notches = []                         # [{"hz", "width_hz"}]
+        self.notches_on = True                    # notches held out of the taps, table kept
+        self.bypass = False                       # the whole slice FIR out of circuit
         self.anf = False
         self.contour_on = False
         self.contour_hz = 1200.0
@@ -246,6 +248,17 @@ class SliceFilter:
                 if v not in SHAPES:
                     raise ValueError(f"shape must be one of {sorted(SHAPES)}")
                 s.shape = v
+            elif k == "bypass":
+                # THE WHOLE FILTER OUT. "Turn all the different filters on and
+                # off" taken literally: the operator hears the digital roofing
+                # bandwidth with nothing designed on top of it, and every
+                # setting is still here when they switch back.
+                s.bypass = bool(v)
+                if s.bypass != self.spec.bypass:
+                    self.state = {}               # a stale overlap would splice
+            elif k == "notches":
+                # An A/B for the notch table that does not make them retype it.
+                s.notches_on = bool(v)
             elif k == "anf":
                 s.anf = bool(v)
                 if not s.anf:
@@ -345,7 +358,7 @@ class SliceFilter:
         s = self.spec
         lo, hi = self.edges()
         sgn = self._sign()
-        notches = [(sgn * n["hz"], n["width_hz"]) for n in s.notches]
+        notches = [(sgn * n["hz"], n["width_hz"]) for n in s.notches] if s.notches_on else []
         notches += [(hz, w) for hz, w in self.anf_found]
         contour = self._contour()
         if contour is not None:
@@ -366,6 +379,11 @@ class SliceFilter:
         if ch == 0 and len(sig):
             self._follow_talker()
             self._observe(sig)
+        if self.spec.bypass:
+            # Bypassed AFTER the measurement, not before: the spectrum, the
+            # automatics and the talker's memory stay warm, so switching back
+            # does not land on a cold filter.
+            return sig
         if self.dirty or self.taps is None:
             self._redesign()
         n = len(self.taps)
@@ -674,7 +692,7 @@ class SliceFilter:
             "shape": s.shape, "taps": SHAPES[s.shape],
             "transition_hz": round(2.0 * self.rate_hz / SHAPES[s.shape]),
             "sideband": "lsb" if self.lsb else "usb",
-            "notches": notches,
+            "notches": notches, "notches_on": s.notches_on, "bypass": s.bypass,
             "anf": {"enabled": s.anf,
                     "found_hz": [round(abs(hz)) for hz, _w in self.anf_found],
                     "depth_db": [round(-response_at(self.taps, self.rate_hz, hz), 1)

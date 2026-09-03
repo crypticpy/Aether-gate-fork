@@ -105,6 +105,8 @@ _RECOVER_RETRY_MAX_S = 30.0
 _ERR_GIVE_UP = 2000
 from ..core.fft import dbm_offset_for, dbfs_to_dbm_for
 from ..core.filter import SliceFilter, blank_impulses
+from ..core.roofing import DigitalRoof, snap_analogue_hz
+from .chainstatus import chain_rows
 
 # Bin powers in a noise-only FFT are exponentially distributed; their median is
 # ln(2) times their mean. read_meters divides by this to turn a robust median
@@ -184,6 +186,8 @@ class SoapyAdapter(RadioAdapter):
 
     provides = "iq"
 
+    CHAIN_DEVICE_TTL_S = 2.0            # see _chain_device
+
     # Demod-chain fields, exposed as properties backed by self._chain (see
     # _DemodChain / _chain_field above).
     _stage_firs = _chain_field("stage_firs")
@@ -253,6 +257,13 @@ class SoapyAdapter(RadioAdapter):
         self._nco_ramp_n = 0                # block length the cached ramp was built for
         self._nco_ramp_step = None          # phase step the cached ramp was built for
         self._decim = None                  # samp_rate / AUDIO_RATE (integer-ish); set in open()
+        self._pd_rate = 0.0                 # post-decimation rate; set in _init_demod
+        self._dev_cache = None              # (t, device_controls()) for the chain rows
+        self._bw_options = None             # listBandwidths(), asked once (see roof_options)
+        self._roof_hz = None                # the operator's analogue roofing choice, or None
+        self._roof_to = None                # pending setBandwidth (ditto — see set_roof_hz)
+        self._roof_got = None               # what getBandwidth read back after the write
+        self._roof = None                   # DigitalRoof at _pd_rate; built in _init_demod
         self._stages = []                   # decimation factors per stage
         self._iq_resid = None               # leftover IQ samples between audio calls
         self._audio_gain = 60.0             # post-demod fixed gain (SSB baseband is small)
@@ -571,6 +582,14 @@ class SoapyAdapter(RadioAdapter):
             got = prev
         self.samp_rate = got if got > 0 else prev
         self._init_demod()                  # decimation chain is a function of the rate
+        # RE-APPLY THE ROOFING CHOICE. setSampleRate re-derives bwType from the
+        # new rate and overwrites whatever setBandwidth set (SoapySDRPlay3
+        # Settings.cpp: `bwType = getBwEnumForRate(...)`), so without this a pan
+        # zoom silently reverts the operator's roofing filter — and the status
+        # would go on reporting the old one. Here, with the stream stopped, is
+        # the safe place: after the chain is rebuilt, before it restarts.
+        if self._roof_hz is not None:
+            self._apply_roof_hz(self._roof_hz)
         self._iq_resid = None               # leftovers are at the OLD rate: they would click
         self._audio_q.clear()               # ditto for anything already queued
         with self._lock:
@@ -626,6 +645,12 @@ class SoapyAdapter(RadioAdapter):
         # complex FIR carrying the operator's edges, shape, notches, contour,
         # APF and auto-EQ. Its settings and AGC survive a rate change; only
         # the taps and overlap state are rebuilt for the new _pd_rate.
+        # The DIGITAL ROOFING FILTER sits in front of the slice filter at this
+        # same rate (core/roofing.py). Rebuilt for the new rate like the slice
+        # filter is, carrying the operator's width across.
+        prev_roof = self._roof
+        self._roof = DigitalRoof(self._pd_rate,
+                                 prev_roof.hz if prev_roof is not None else None)
         prev = self._filt
         self._filt = SliceFilter(self._pd_rate, spec=prev.spec if prev is not None else None,
                                  print_source=self._active_print)
@@ -798,6 +823,11 @@ class SoapyAdapter(RadioAdapter):
             else:
                 chain.fm_state_b = tail
             return z
+        # the digital roofing filter first: it is the stage the operator can
+        # actually make narrow, and it stays in circuit when the slice filter
+        # is bypassed (that is the point of it being a separate stage)
+        if self._roof is not None:
+            sig = self._roof.apply(sig, ch)
         # the operator's passband (core/filter.py): edges, shape, notches,
         # contour, APF, auto width and auto EQ, one complex FIR per channel
         return self._filt.apply(sig, ch, lsb=self._mode.startswith("LSB"))
@@ -1035,9 +1065,14 @@ class SoapyAdapter(RadioAdapter):
                     if abs(want - self.samp_rate) > 1.0:
                         self._apply_samp_rate(want)
                     self._rate_to = None            # cleared LAST: it is set_samp_rate's done-signal
-                # Device settings + antenna port, same thread for the same reason.
-                # No debounce: these are discrete toggles, not a drag, and none of
-                # them restarts the stream.
+                # The analogue roofing filter, device settings and the antenna
+                # port: same thread for the same reason. No debounce -- these are
+                # discrete toggles, not a drag, and none of them restarts the
+                # stream (setBandwidth is a live Update_Tuner_BwType).
+                if self._roof_to is not None:
+                    want = self._roof_to
+                    self._roof_to = None
+                    self._apply_roof_hz(want)
                 if self._antenna_to is not None:
                     want = self._antenna_to
                     self._antenna_to = None
@@ -1392,6 +1427,63 @@ class SoapyAdapter(RadioAdapter):
             out["settings"] = settings
         return out
 
+    def roof_options(self):
+        """The analogue IF bandwidths this device offers, from the driver.
+
+        NEVER a hardcoded table: SoapySDRPlay3 drops the 5-8 MHz filters in the
+        RSPduo's dual-tuner/master/slave modes and would advertise them on a
+        single-tuner RSPdx, so a table copied out of its source is wrong for
+        half the devices this gate fronts. Asked once — the list is a property
+        of the device and the mode it was opened in.
+        """
+        if self._sdr is None:
+            return []
+        if self._bw_options is None:
+            try:
+                self._bw_options = sorted(
+                    float(b) for b in self._sdr.listBandwidths(self._SOAPY_SDR_RX, 0))
+            except Exception:
+                self._bw_options = []
+        return list(self._bw_options)
+
+    def set_roof_hz(self, hz):
+        """Ask for an analogue IF bandwidth; the reader thread applies it.
+
+        Snapped against the driver's own list here so the caller is told what
+        it will actually get, then queued: setBandwidth touches the device
+        while readStream is running, which is the same reason retune() and
+        set_gain() defer (see set_gain).
+        """
+        want = snap_analogue_hz(hz, self.roof_options())
+        self._roof_hz = want
+        self._roof_to = want
+        return want
+
+    def set_digital_roof_hz(self, hz):
+        """The digital roofing filter's width (100 Hz .. 25 kHz, free entry).
+
+        No device call, no restart: the reader thread redesigns the taps on the
+        next block, the same way the slice filter picks up an edge change.
+        """
+        if self._roof is None:
+            raise ValueError("no audio chain yet")
+        return self._roof.set(hz)
+
+    def _apply_roof_hz(self, want):
+        """READER THREAD ONLY. Write the bandwidth and READ IT BACK: this
+        driver's setters lie (see _verify_stream), so the status reports
+        getBandwidth, never the request."""
+        try:
+            for ch in self._channels:
+                self._sdr.setBandwidth(self._SOAPY_SDR_RX, ch, float(want))
+            got = float(self._sdr.getBandwidth(self._SOAPY_SDR_RX, 0))
+        except Exception as e:
+            print(f"[soapy] SET IF BANDWIDTH FAILED at {want:.0f} Hz: {e!r}", flush=True)
+            return None
+        self._roof_got = got
+        print(f"[soapy] IF bandwidth -> {got:.0f} Hz (asked {want:.0f})", flush=True)
+        return got
+
     def set_antenna(self, name):
         """Queue an antenna-port change; the reader thread applies it.
 
@@ -1470,20 +1562,63 @@ class SoapyAdapter(RadioAdapter):
         st = self._filt.status()
         st["available"] = True
         st["mode"] = self._mode
-        if self._div is not None:
+        div = self._div.status() if self._div is not None else None
+        if div is not None:
             # /filter's NB is the pair's blanker (the same knob as /diversity/set)
-            st["nb"] = {"enabled": bool(self._div.nb_on),
-                        "threshold_db": float(self._div.nb_db),
-                        "blanked_pct": round(float(self._div.blanked_pct), 2)}
+            st["nb"] = {k: div["nb"][k]
+                        for k in ("enabled", "threshold_db", "blanked_pct")}
         st["roofing"]["analogue_hz"] = self._analogue_if_hz()
+        st["roofing"]["analogue_options"] = self.roof_options()
+        st["roofing"]["analogue_source"] = "operator" if self._roof_hz is not None else "rate"
+        st["roofing"]["samp_rate_hz"] = float(self.samp_rate)
+        st["roofing"]["digital_full_hz"] = float(self._pd_rate or 0.0)
+        if self._roof is not None:
+            r = self._roof.status()
+            st["roofing"].update({"digital_hz": r["hz"], "digital_full_hz": r["full_hz"],
+                                  "digital_taps": r["taps"], "digital_active": r["active"],
+                                  "digital_options": r["options"]})
+        # THE CHAIN. One row per stage in signal order, assembled in
+        # chainstatus.py from the dicts above and nothing else -- see there for
+        # why the gate authors these rows rather than the app.
+        st["chain"] = chain_rows(st, div, self._chain_device(), self._chain_frontend())
         st["response"] = self._filt.response_db()
         st["spectrum"] = self._filt.spectrum_db()
         return st
 
+    def _chain_device(self):
+        """device_controls() for the chain's front-end rows, memoised.
+
+        Those rows are read-only ("set on the setup page") and every
+        device_controls() call is one readSetting per key straight at the
+        driver, on the HTTP thread. /filter is polled continuously, so a value
+        up to CHAIN_DEVICE_TTL_S old is worth far more than that much extra
+        chatter at a device that is mid-readStream.
+        """
+        now = time.monotonic()
+        if self._dev_cache is not None and now - self._dev_cache[0] < self.CHAIN_DEVICE_TTL_S:
+            return self._dev_cache[1]
+        try:
+            out = self.device_controls()
+        except Exception:                     # a driver that will not be asked
+            out = {}
+        self._dev_cache = (now, out)
+        return out
+
+    def _chain_frontend(self):
+        """The front-end numbers Soapy carries as a gain element rather than a
+        setting (IFGR and its range), plus whether the hardware AGC is on."""
+        lo, hi, _step = self.gain_range()
+        return {"gain_db": self.gain_db, "gain_range": (lo, hi), "agc": bool(self.agc)}
+
     def _analogue_if_hz(self):
         """The RSP's analogue IF filter, which SoapySDRPlay3 picks from the
         sample rate (Settings.cpp getBwEnumForRate): the closest thing this
-        hardware has to a roofing filter, and 200 kHz is its narrowest."""
+        hardware has to a roofing filter, and 200 kHz is its narrowest.
+
+        Once the operator has chosen one, this is what the DEVICE read back
+        after the write, not the request and not the derivation."""
+        if self._roof_got is not None:
+            return self._roof_got
         r = float(self.samp_rate)
         for limit, bw in ((300e3, 200e3), (600e3, 300e3), (1536e3, 600e3), (5e6, 1536e3),
                           (6e6, 5e6), (7e6, 6e6), (8e6, 7e6)):
@@ -1494,6 +1629,10 @@ class SoapyAdapter(RadioAdapter):
     def filter_set(self, **kw):
         if self._filt is None:
             return {"available": False}
+        if "roof_hz" in kw:
+            self.set_roof_hz(kw.pop("roof_hz"))
+        if "digital_roof_hz" in kw:
+            self.set_digital_roof_hz(kw.pop("digital_roof_hz"))
         if self._div is not None and ("nb" in kw or "nb_db" in kw):
             self._div.set(nb=kw.pop("nb", None), nb_db=kw.pop("nb_db", None))
         if kw:

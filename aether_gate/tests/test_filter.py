@@ -254,6 +254,47 @@ def test_settings_are_validated():
     assert sf.spec.notches == []
 
 
+def test_bypass_takes_the_whole_filter_out_and_gives_every_setting_back():
+    """The literal reading of "turn all the different filters on and off": one
+    switch, the operator hears the digital roofing bandwidth raw, and nothing
+    they had set has to be typed again."""
+    sf = SliceFilter(RATE)
+    sf.set(low=300, high=2700, shape="sharp", anf=True)
+    sf.notch_add(1000.0)
+    sig = (np.exp(2j * np.pi * 1000.0 * np.arange(4096) / RATE)
+           + np.exp(-2j * np.pi * 1000.0 * np.arange(4096) / RATE))
+    assert not np.allclose(sf.apply(sig.copy()), sig)
+    sf.set(bypass=True)
+    out = sf.apply(sig.copy())
+    assert out is not None and np.array_equal(out, sig)
+    assert sf.status()["bypass"] is True
+    sf.set(bypass=False)
+    assert sf.spec.shape == "sharp" and len(sf.spec.notches) == 1
+    assert sf.status()["bypass"] is False
+    assert not np.allclose(sf.apply(sig.copy()), sig)
+
+
+def test_the_notch_flag_keeps_the_table_and_only_holds_it_out_of_the_taps():
+    """A heterodyne notch can be A/B'd without retyping its frequency."""
+    sf = SliceFilter(RATE)
+    sf.set(low=300, high=2700, shape="sharp")
+    sf.notch_add(1000.0)
+    block = np.zeros(2048, dtype=np.complex128)
+
+    def depth():                      # the taps in force, not the ones asked for
+        sf.apply(block.copy())
+        return sf.status()["notches"][0]["depth_db"]
+
+    assert depth() > 25
+    sf.set(notches=False)
+    assert abs(depth()) < 1.0
+    st = sf.status()
+    assert st["notches_on"] is False
+    assert [n["hz"] for n in sf.spec.notches] == [1000.0]
+    sf.set(notches=True)
+    assert depth() > 25
+
+
 # ----- through the adapter's audio path ---------------------------------------
 SAMP = 125_000.0
 CHUNK = 480

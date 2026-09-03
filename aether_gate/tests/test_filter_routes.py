@@ -91,6 +91,28 @@ def test_bad_values_are_errors_not_tracebacks():
     assert _get(port, "/filter/notch?width=100")["error"].startswith("bad value")   # no add
 
 
+def test_bypass_and_the_notch_flag_arrive_as_flags_not_as_floats():
+    """Both are new entries in _FILTER_FLAGS; without them "bypass=on" would
+    reach the adapter as float("on") and answer with a bad-value error."""
+    a = FakeFilterAdapter()
+    _, port = _start(a)
+    assert _get(port, "/filter/set?bypass=on")["available"]
+    assert a.calls[-1] == ("set", {"bypass": True})
+    _get(port, "/filter/set?bypass=off&notches=0")
+    assert a.calls[-1] == ("set", {"bypass": False, "notches": False})
+    assert _get(port, "/filter/set?bypass=maybe")["error"].startswith("bad value")
+
+
+def test_the_two_roofing_widths_pass_through_as_plain_numbers():
+    """Neither needs an engine change: _filter_kwargs floats anything that is
+    not a flag or a word, and the adapter is the one that validates them."""
+    a = FakeFilterAdapter()
+    _, port = _start(a)
+    _get(port, "/filter/set?roof_hz=300000&digital_roof_hz=3000")
+    assert a.calls[-1] == ("set", {"roof_hz": 300000.0, "digital_roof_hz": 3000.0})
+    assert _get(port, "/filter/set?roof_hz=wide")["error"].startswith("bad value")
+
+
 def test_notch_add_and_clear_forward():
     a = FakeFilterAdapter()
     _, port = _start(a)
