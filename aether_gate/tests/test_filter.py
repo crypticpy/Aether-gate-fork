@@ -134,6 +134,27 @@ def test_auto_width_follows_the_occupied_spectrum_then_the_print():
     assert sf.status()["low_hz"] == 100 and sf.status()["auto"]["low_hz"] is None
 
 
+def test_auto_width_never_closes_the_bottom_onto_a_thin_channel():
+    # 80 m at night, 2026-09-02: the 1 s average only cleared the floor from
+    # 1.2 kHz up and AUTO put the low edge at 1233 Hz, taking the
+    # fundamentals and first formant with it. The bottom never closes above
+    # AUTO_MAX_LOW_HZ, as the top never closes below AUTO_MIN_HIGH_HZ.
+    sf = SliceFilter(RATE)
+    sf.set(low=100, high=3200, auto=True)
+    rng = np.random.default_rng(5)
+    n = 819
+    total = (int(3.0 * RATE) // n) * n
+    w = 0.05 * (rng.standard_normal(total + 1100) + 1j * rng.standard_normal(total + 1100))
+    thin = np.convolve(w, design_taps(RATE, 1200, 2100, "sharp"), mode="valid")[:total]
+    thin = thin + 0.0005 * (rng.standard_normal(total) + 1j * rng.standard_normal(total))
+    for i in range(0, total, n):
+        sf.apply(thin[i:i + n], 0)
+    st = sf.status()
+    assert st["auto"]["source"] == "spectrum"
+    assert st["auto"]["low_hz"] <= 350, st["auto"]
+    assert 2400 <= st["auto"]["high_hz"] <= 2450
+
+
 def test_auto_eq_leans_against_the_prints_tilt():
     sf = SliceFilter(RATE, print_source=lambda: {"low_hz": 300, "high_hz": 2700, "tilt_db": 5.0})
     sf.set(low=300, high=2700, shape="sharp", auto_eq=True)

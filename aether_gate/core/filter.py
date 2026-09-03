@@ -46,6 +46,8 @@ AUTO_MIN_WIDTH_HZ = 300.0
 AUTO_MIN_HIGH_HZ = 2400.0            # AUTO never closes the top below this: a voice's own
                                      # spectrum falls 20 dB by 2 kHz, but the consonants that
                                      # carry intelligibility live above it
+AUTO_MAX_LOW_HZ = 350.0              # ...nor the bottom above this: the fundamentals and
+                                     # first formant sit below it whatever the 1 s average says
 EQ_MAX_DB = 6.0
 EQ_REFERENCE_TILT_DB = -6.0          # a normally set-up SSB station: highs ~6 dB under the lows
 EQ_STRENGTH = 0.5                    # take half the deviation out, never all of it
@@ -467,6 +469,7 @@ class SliceFilter:
             hi = max(hi, float(pr["high_hz"]) + AUTO_HIGH_MARGIN_HZ)
             source = "print"
         hi = max(hi, AUTO_MIN_HIGH_HZ)
+        lo = min(lo, AUTO_MAX_LOW_HZ)
         if hi - lo < AUTO_MIN_WIDTH_HZ:
             hi = lo + AUTO_MIN_WIDTH_HZ
         if self.auto_low is None:
