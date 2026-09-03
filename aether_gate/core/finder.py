@@ -21,7 +21,11 @@
                 modulation spectrum) and keeps ten minutes of those scores,
                 so the answer to "where was someone in the last ten minutes"
                 comes from stored data rather than from sitting on each
-                frequency in turn. Each candidate carries the pair's phase,
+                frequency in turn. Every scored window also gets a verdict
+                on what it IS (voice, cw, data, carrier, noise) from the
+                same frames -- see kinds.py -- because "there is something
+                here" and "there is somebody talking here" are different
+                pieces of news. Each candidate carries the pair's phase,
                 coherence and level ratio there, and the diversity gain the
                 pair could earn on it (signal coherent, noise not).
 
@@ -31,6 +35,8 @@ SpatialMap gets; everything else runs on demand from the control port.
 import math
 
 import numpy as np
+
+from . import kinds
 
 SPATIAL_TC_S = 0.25
 SPATIAL_POINTS = 512
@@ -136,6 +142,9 @@ class Finder:
         # what the score was made of, per row, so a candidate can be described
         # as it was at its best rather than as it is right now
         self.slow_terms = np.zeros((SLOW_ROWS, 3, self.nwin), dtype=np.float32)
+        # and what each window looked like: voice, cw, data, carrier or noise
+        self.slow_kind = np.full((SLOW_ROWS, self.nwin), kinds.NOISE, dtype=np.int8)
+        self.slow_kconf = np.zeros((SLOW_ROWS, self.nwin), dtype=np.float32)
         self.slow_t = np.zeros(SLOW_ROWS)
         self.slow_i = 0
         self.slow_n = 0
@@ -203,26 +212,43 @@ class Finder:
         pb_w = np.mean(self._window_sums(F[:, 1]), axis=0)
         na_w = np.mean(np.median(F[:, 0], axis=1)) * self.win
         nb_w = np.mean(np.median(F[:, 1], axis=1)) * self.win
+        mean_points = np.mean(both, axis=0)
+        # what each window is, from the same frames the score came from
+        kind, kconf = kinds.classify(W, floor, mean_points, snr_db, depth, syllabic,
+                                     occupancy, self.win, WINDOW_STEP_POINTS,
+                                     self.step_hz)
         self.slow[self.slow_i] = score
         self.slow_terms[self.slow_i] = np.stack([snr_db, depth, syllabic])
+        self.slow_kind[self.slow_i] = kind
+        self.slow_kconf[self.slow_i] = kconf
         self.slow_t[self.slow_i] = self.elapsed
         self.slow_i = (self.slow_i + 1) % SLOW_ROWS
         self.slow_n = min(self.slow_n + 1, SLOW_ROWS)
         self._last = {
             "score": score, "snr_db": snr_db, "depth": depth, "syllabic": syllabic,
             "pa": pa_w, "pb": pb_w, "na": na_w, "nb": nb_w,
-            "mean_points": np.mean(both, axis=0), "floor": float(np.mean(floor)),
+            "kind": kind, "kind_conf": kconf,
+            "mean_points": mean_points, "floor": float(np.mean(floor)),
         }
 
     # --- on demand -----------------------------------------------------------
     def _slow_rows(self):
         """The slow ring in time order: scores (n, nwin), their terms
-        (n, 3, nwin) = snr_db/depth/syllabic, times (n,)."""
+        (n, 3, nwin) = snr_db/depth/syllabic, the kind code and its
+        confidence (n, nwin) each, times (n,)."""
         if self.slow_n < SLOW_ROWS:
             idx = np.arange(self.slow_n)
         else:
             idx = np.concatenate([np.arange(self.slow_i, SLOW_ROWS), np.arange(self.slow_i)])
-        return self.slow[idx], self.slow_terms[idx], self.slow_t[idx]
+        return (self.slow[idx], self.slow_terms[idx], self.slow_kind[idx],
+                self.slow_kconf[idx], self.slow_t[idx])
+
+    def window_kinds(self):
+        """The latest verdict per window: (codes into kinds.KINDS,
+        confidences), or None before the first analysis."""
+        if self._last is None:
+            return None
+        return self._last["kind"], self._last["kind_conf"]
 
     def _point_hz(self, i, center_hz):
         return center_hz - self.rate_hz / 2 + (i + 0.5) * self.step_hz
@@ -249,7 +275,7 @@ class Finder:
         last = self._last
         if last is None:
             return {"available": False}
-        rows, terms, times = self._slow_rows()
+        rows, terms, kind_rows, kconf_rows, times = self._slow_rows()
         is_recent = (self.elapsed - times) <= CANDIDATE_RECENT_S
         recent = rows[is_recent]
         if len(recent):
@@ -278,13 +304,19 @@ class Finder:
             # the last over "now" is the floor
             if best is not None:
                 snr_w, depth_w, syl_w = (float(x) for x in terms[best[w], :, w])
+                kind_w, kconf_w = int(kind_rows[best[w], w]), float(kconf_rows[best[w], w])
             else:
                 snr_w, depth_w, syl_w = (float(last[k][w]) for k in ("snr_db", "depth", "syllabic"))
+                kind_w, kconf_w = int(last["kind"][w]), float(last["kind_conf"][w])
             c = {
                 "_w": int(w), "hz": round(float(hz), 1), "hz_raw": round(float(hz_raw), 1),
                 "mode": mode,
                 "width_hz": round(self.win * self.step_hz, 1),
                 "score": round(float(rec[w]), 2),
+                # what the gate thinks it is, and how sure: a row that says
+                # "cw 0.9" saves the operator the trip
+                "kind": kinds.name(kind_w),
+                "kind_conf": round(kconf_w, 2),
                 "snr_db": round(snr_w, 1),
                 "syllabic": round(syl_w, 2),
                 "depth": round(depth_w, 2),

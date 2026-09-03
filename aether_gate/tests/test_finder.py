@@ -5,15 +5,16 @@
 """Synthetic frames straight into LiveSpatial and Finder: a voice-shaped
 patch (syllabic modulation, both loops, fixed inter-loop phase), a steady
 carrier, and band noise. The finder must rank the voice first, refuse the
-carrier and the noise, put the dial just below the energy for USB, and
-carry the pair's phase there; the spatial rows must show that phase only
-where the source is.
+carrier and the noise, say of every candidate WHAT it thinks it is, put the
+dial just below the energy for USB, and carry the pair's phase there; the
+spatial rows must show that phase only where the source is.
 
 Run:  python -m pytest aether_gate/tests/test_finder.py
 """
 import numpy as np
 import pytest
 
+from aether_gate.core.kinds import KINDS
 from aether_gate.core.finder import (Finder, LiveSpatial, VOICE_SCORE, FAST_FRAMES,
                                      SLOW_PERIOD_S)
 
@@ -81,6 +82,10 @@ def test_voice_is_found_first_and_the_carrier_and_noise_are_not():
     assert top["hz"] % 500 == 0 and abs(top["hz_raw"] - top["hz"]) <= 250, top
     assert top["syllabic"] >= 0.6 and top["depth"] >= 0.4 and top["snr_db"] >= 5.0
     assert top["active_s"] >= 3 * SLOW_PERIOD_S and top["last_s"] is not None
+    # and it says so: a phone-wide patch swinging at syllable rate is voice
+    assert top["kind"] == "voice" and top["kind_conf"] >= 0.5
+    # every row carries a verdict, and no verdict is off the five-name list
+    assert all(c["kind"] in KINDS and 0.0 <= c["kind_conf"] <= 1.0 for c in cands)
     # the carrier (steady) and the noise never make the list
     for c in cands[1:]:
         assert not (CENTER - 32_000 <= c["hz"] <= CENTER - 28_000), c
@@ -140,3 +145,5 @@ def test_a_conversation_that_stopped_is_still_listed_with_its_age():
     assert top["active_s"] >= 3 * SLOW_PERIOD_S
     # the row describes the conversation as it was, not the silence now
     assert top["snr_db"] >= 5.0 and top["syllabic"] >= 0.6 and top["depth"] >= 0.4, top
+    # including what it was: silence is noise-shaped, the conversation was not
+    assert top["kind"] == "voice" and top["kind_conf"] >= 0.5, top
