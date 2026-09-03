@@ -4111,6 +4111,33 @@ def start_control_server(radio, port):
                     return self._json({"error": str(e)})
                 log(f"[ctl] diversity capture ({seconds}s) -> {path}")
                 return self._json({"ok": True, "path": path})
+            if u.path == "/diversity/dig":
+                # "dig this out": ?seconds=60|180|300 starts, bare is status,
+                # ?verdict=better|worse|keep labels it, ?cancel=1 stops
+                a = radio.adapter
+                fn = (getattr(a, "diversity_dig", None)
+                      if getattr(a, "diversity_available", False) else None)
+                if fn is None:
+                    return self._json({"available": False})
+                q = urllib.parse.parse_qs(u.query)
+                try:
+                    kw = {}
+                    if "seconds" in q:
+                        kw["seconds"] = int(q["seconds"][0])
+                    if "verdict" in q:
+                        kw["verdict"] = q["verdict"][0]
+                    if "hz" in q:
+                        kw["hz"] = float(q["hz"][0])
+                    if q.get("cancel", ["0"])[0] not in ("0", "off", "no"):
+                        kw["cancel"] = True
+                    out = fn(**kw)
+                except (ValueError, TypeError) as e:
+                    return self._json({"error": f"bad value: {e}"})
+                except RuntimeError as e:          # already running, no pair yet
+                    return self._json({"error": str(e)})
+                if kw:
+                    log(f"[ctl] diversity dig {kw} -> {out.get('phase')}")
+                return self._json(out)
             if u.path == "/diversity/memory/clear":
                 a = radio.adapter
                 fn = (getattr(a, "diversity_memory_clear", None)

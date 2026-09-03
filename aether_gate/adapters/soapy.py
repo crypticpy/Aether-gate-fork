@@ -247,6 +247,7 @@ class SoapyAdapter(RadioAdapter):
         self._b_tmp = None                  # scratch for channel B reads
         self.diversity_available = False    # True once two channels flow (see _open_hw)
         self._div = None                    # _DiversityState, dual-tuner only
+        self._dig = None                    # DigRunner, built on the first dig
         self._device = (None, 0.0)          # device_block() and when it was made
         # Staged-decimation + SSB/FM state for both channels, one object so a
         # rate change can never hand A and B different generations mid-call;
@@ -1749,6 +1750,23 @@ class SoapyAdapter(RadioAdapter):
         if self._div is None:
             raise RuntimeError("no dual-tuner stream")
         return self._div.capture(seconds)
+
+    def diversity_dig(self, seconds=None, verdict=None, cancel=False, hz=None):
+        """Dig this out: start a timed search over the knobs, ask how it is
+        going, say better/worse/keep, or stop it. One runner, built on first
+        use so an adapter that never digs never makes one."""
+        if self._div is None:
+            return {"available": False}
+        if self._dig is None:
+            from .diversity_dig import DigRunner
+            self._dig = DigRunner(self)
+        if cancel:
+            return self._dig.cancel()
+        if verdict is not None:
+            return self._dig.verdict(verdict)
+        if seconds is not None:
+            return self._dig.start(seconds, hz=hz)
+        return self._dig.status()
 
     def diversity_memory_clear(self):
         if self._div is not None:

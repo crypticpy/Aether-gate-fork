@@ -61,6 +61,11 @@ class FakeDiversityAdapter:
             "rn_source": "inband", "talk_mod": 0.4,
             "capture": {"active": False, "path": None},
         }
+        self._dig = {"available": True, "running": False, "phase": "idle",
+                     "verdict": None, "record": None, "error": None,
+                     "cancelled": False, "gain_db": 0.0, "steps": [], "best": {},
+                     "started": None, "ends": None, "elapsed_s": None,
+                     "seconds": 0.0}
 
     def diversity_status(self, slice_id=None):
         self.calls.append(("status", {"slice_id": slice_id}))
@@ -148,6 +153,33 @@ class FakeDiversityAdapter:
             raise RuntimeError("capture already active")
         return f"/tmp/aether-gate-capture-{seconds}s.wav"
 
+    def diversity_dig(self, seconds=None, verdict=None, cancel=False, hz=None):
+        """The "dig this out" runner's four buttons, faked: the route's job is
+        to parse the query and pass the errors through, not to search."""
+        self.calls.append(("dig", {"seconds": seconds, "verdict": verdict,
+                                    "cancel": cancel, "hz": hz}))
+        d = self._dig
+        if cancel:
+            d.update(running=False, phase="done", cancelled=True)
+        elif verdict is not None:
+            if verdict not in ("better", "worse", "keep"):
+                raise ValueError("verdict must be one of ('better', 'worse', 'keep')")
+            if d["phase"] != "done":
+                raise RuntimeError("the dig is still running")
+            d["verdict"] = verdict
+            d["record"] = {"kind": "dig", "t": 1.0, "gain_db": d["gain_db"],
+                           "verdict": verdict, "best": {}, "seconds": d["seconds"],
+                           "objective_before": 10.0, "objective_after": 12.0}
+        elif seconds is not None:
+            if int(seconds) not in (60, 180, 300):
+                raise ValueError("seconds must be one of (60, 180, 300)")
+            if d["running"]:
+                raise RuntimeError("a dig is already running")
+            d.update(running=True, phase="sampling", seconds=int(seconds),
+                     started=1.0, ends=1.0 + int(seconds), gain_db=2.0,
+                     verdict=None, record=None, cancelled=False)
+        return dict(d)
+
     def diversity_memory_clear(self):
         self.calls.append(("memory_clear", {}))
         self._status["memory"] = []
@@ -186,6 +218,7 @@ class FakeDiversityAdapterNoV2(FakeDiversityAdapter):
     diversity_capture = None
     diversity_memory_clear = None
     diversity_memory_name = None
+    diversity_dig = None
 
 
 class FakeSingleChannelAdapter:
