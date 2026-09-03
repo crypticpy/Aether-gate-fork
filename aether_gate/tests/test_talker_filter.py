@@ -214,3 +214,22 @@ def test_the_summary_for_the_memory_table():
 def test_the_query_keys():
     assert _filter_kwargs({"talker": ["on"], "talker_snap": ["Smooth"]}) == \
         {"talker": True, "talker_snap": "smooth"}
+
+
+def test_auto_fits_once_per_over_and_holds_while_the_voice_is_live():
+    # 2026-09-03: AUTO refitted every 130 ms to the running spectrum, so a
+    # filter morphed under one talker ("distorts, goes in and out, gets deep
+    # and low, crispy"). Now: one fit per over, then the edges hold.
+    mic = _Mic()
+    sf = _filter(mic, low=100, high=3400, auto=True)
+    mic.talker = 1
+    _run(sf, _voice(2.0, 350, 2100))              # the fit for this over
+    hi = sf.status()["auto"]["high_hz"]
+    assert 2400 <= hi <= 2450
+    _run(sf, _voice(3.0, 350, 3100, seed=5))      # same over, the voice opens up
+    assert sf.status()["auto"]["high_hz"] == hi   # ...and the filter does not chase it
+    mic.talker = None                             # the over ends
+    _blocks(sf)
+    mic.talker = 1                                # the next over gets a fresh fit
+    _run(sf, _voice(2.0, 350, 3100, seed=6))
+    assert sf.status()["auto"]["high_hz"] >= 3100

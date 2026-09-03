@@ -24,6 +24,7 @@ import math
 
 import numpy as np
 
+from .agc import AGC_MODES, AGC_THRESHOLD_DB, Agc
 from .contour import PROFILE_BAND_HZ, fit_contour
 
 SHAPES = {"soft": 255, "sharp": 1023}   # soft: 196 Hz transition at 25 kS/s; 127 taps ate
@@ -55,15 +56,6 @@ EQ_REFERENCE_TILT_DB = -6.0          # a normally set-up SSB station: highs ~6 d
 EQ_STRENGTH = 0.5                    # take half the deviation out, never all of it
 EQ_LOW_CENTRE_HZ = 550.0             # the print's tilt is 1.5-2.5 k over 300-800 Hz
 EQ_HIGH_CENTRE_HZ = 2000.0
-AGC_MODES = {                        # attack_ms, decay_ms, hang_ms
-    "fast": (2.0, 100.0, 0.0),
-    "med": (5.0, 250.0, 250.0),
-    "slow": (5.0, 500.0, 500.0),
-    "long": (5.0, 2000.0, 1000.0),
-    "off": None,
-}
-AGC_MAX_GAIN = 1000.0                # 60 dB
-AGC_THRESHOLD_DB = 20.0
 # THE FILTER PER TALKER. The tracker's talker memory recognises a known
 # talker by their spatial signature within TALK_HOLD_S (50 ms) of them
 # keying up, long before their voice print could. The filter rides on that:
@@ -86,8 +78,7 @@ TALKER_GLIDE_UPDATES = 8             # smooth: the narrowing rate is lifted for 
 # After a talker change the spectrum is this talker's from the first block
 # (a running mean, not the old EMA) and the automatics that read it hold
 # their edges for SPEC_WARMUP_BLOCKS (~1 s) so one noisy block cannot undo a
-# restored filter; the print, when there is one, has already been applied.              # the floor between words is held this far under the target
-AGC_FLOOR_RISE_MS = 8000.0           # the floor tracker follows speech up this slowly
+# restored filter; the print, when there is one, has already been applied.
 
 
 def _kaiser(n, beta):
@@ -199,83 +190,6 @@ def blank_impulses(x, db, hold=4):
     return out, float(mask.mean())
 
 
-class Agc:
-    """Chunk-rate AGC with attack, decay and hang in milliseconds. The gain
-    is ramped across each chunk so a level step never clicks."""
-
-    def __init__(self, target=0.25, rate_hz=24000.0):
-        self.target = float(target)
-        self.rate_hz = float(rate_hz)
-        self.level = 0.05
-        self.gain = None
-        self.hang_left_ms = 0.0
-        # THRESHOLD (a radio's AGC-T). Without it this is a leveller: between
-        # words the decay winds the gain up until the band noise sits at the
-        # same loudness as the voice did, and speech comes out soft and
-        # mumbling with the noise pumping up around every gap. The floor
-        # tracker follows the quietest recent chunks; the gain may never lift
-        # that floor above target - threshold_db. 0 is the old leveller.
-        self.threshold_db = AGC_THRESHOLD_DB
-        self.floor = None
-        self.set("med")
-
-    def set(self, mode=None, attack_ms=None, decay_ms=None, hang_ms=None, threshold_db=None):
-        if threshold_db is not None:
-            v = float(threshold_db)
-            if not (0.0 <= v <= 60.0):
-                raise ValueError("threshold_db must be 0..60")
-            self.threshold_db = v
-        if mode is not None:
-            if mode not in AGC_MODES:
-                raise ValueError(f"agc mode must be one of {sorted(AGC_MODES)}")
-            self.mode = mode
-            if AGC_MODES[mode] is not None:
-                self.attack_ms, self.decay_ms, self.hang_ms = AGC_MODES[mode]
-        for name, v in (("attack_ms", attack_ms), ("decay_ms", decay_ms), ("hang_ms", hang_ms)):
-            if v is not None:
-                v = float(v)
-                if not (0.0 <= v <= 10000.0):
-                    raise ValueError(f"{name} must be 0..10000")
-                setattr(self, name, v)
-
-    def process(self, audio):
-        np_ = np
-        n = len(audio)
-        if n == 0:
-            return audio
-        if self.mode == "off":
-            g = self.target / max(self.level, 1e-4)
-            return np_.clip(audio * g, -1.0, 1.0)
-        chunk_ms = 1000.0 * n / self.rate_hz
-        rms = float(np_.sqrt(np_.mean(audio * audio)) + 1e-9)
-        if self.floor is None or rms < self.floor:
-            self.floor = rms if self.floor is None else self.floor + 0.5 * (rms - self.floor)
-        else:
-            self.floor += (1.0 - math.exp(-chunk_ms / AGC_FLOOR_RISE_MS)) * (rms - self.floor)
-        if rms > self.level:
-            a = 1.0 - math.exp(-chunk_ms / max(self.attack_ms, 1e-3))
-            self.level += a * (rms - self.level)
-            self.hang_left_ms = self.hang_ms
-        elif self.hang_left_ms > 0:
-            self.hang_left_ms -= chunk_ms
-        else:
-            a = 1.0 - math.exp(-chunk_ms / max(self.decay_ms, 1e-3))
-            self.level += a * (rms - self.level)
-        g_new = min(self.target / max(self.level, 1e-4), AGC_MAX_GAIN)
-        floor_target = self.target * 10 ** (-self.threshold_db / 20.0)
-        g_new = min(g_new, floor_target / max(self.floor, 1e-5))
-        g_old = self.gain if self.gain is not None else g_new
-        ramp = np_.linspace(g_old, g_new, n)
-        out = audio * (ramp[:, None] if audio.ndim == 2 else ramp)
-        self.gain = g_new
-        return np_.clip(out, -1.0, 1.0)
-
-    def status(self):
-        return {"mode": self.mode, "attack_ms": self.attack_ms, "decay_ms": self.decay_ms,
-                "hang_ms": self.hang_ms, "threshold_db": self.threshold_db,
-                "gain_db": round(20 * math.log10(self.gain), 1) if self.gain else None}
-
-
 class SliceFilter:
     """The passband filter of one slice, with the analysis that drives its
     automatic parts. `apply(sig, ch)` filters one channel's decimated IQ;
@@ -292,6 +206,13 @@ class SliceFilter:
         self.talker_filters = {}                  # id -> snapshot (see _talker_store)
         self._glide_until = 0                     # smooth: fits with the quick narrowing rate
         self._auto_hold_until = 0                 # the auto width/EQ wait for the spectrum
+        # ONE FIT PER OVER. With a talker live the automatics fit once the
+        # spectrum is warm (at once from a print) and hold until the over
+        # ends: refitted every 130 ms they morphed under the voice ("goes in
+        # and out, deep and low, crispy", 2026-09-03). Every over gets one
+        # fresh fit. Without a talker source they follow the spectrum as before.
+        self._live = False                        # a talker is keyed up now
+        self._over_fit_done = False               # this over's fit has been made
         self._spec_n = 0                          # blocks in the spectrum since its restart
         self.agc = Agc()
         self.lsb = False
@@ -461,11 +382,19 @@ class SliceFilter:
         if not self.talker_on or self.talker_source is None:
             return
         tid = self.talker_source()
+        if tid is None:
+            self._live = False
+            return
+        if not self._live:                                   # a new over: this
+            self._live, self._over_fit_done = True, False     # over's spectrum,
+            if tid == self.talker_id:                        # one fit of it
+                self._spectrum_restart()
         # Between overs the filter stays whoever's it was: an edit made in
         # the silence after an over belongs to the voice just heard, and
-        # that talker keying up again changes nothing.
-        if tid is None or tid == self.talker_id:
+        # that talker keying up again changes nothing but this over's fit.
+        if tid == self.talker_id:
             return
+        self._over_fit_done = False                          # a new voice: fit once
         if self.talker_id is not None:
             self._talker_store(self.talker_id)
         self.talker_id = tid
@@ -581,14 +510,17 @@ class SliceFilter:
         if self._blocks % 4:
             return
         hold = self._blocks < self._auto_hold_until
-        if self.spec.auto and not hold:
+        frozen = self._live and self._over_fit_done
+        if self.spec.auto and not hold and not frozen:
             self._auto_width()
         if self.spec.anf:
             self._auto_notch()
-        if self.spec.auto_eq and not hold:
+        if self.spec.auto_eq and not hold and not frozen:
             self._auto_eq()
-        if self.spec.auto_contour and not hold:
+        if self.spec.auto_contour and not hold and not frozen:
             self._auto_contour()
+        if self._live and not hold and self._blocks >= max(SPEC_WARMUP_BLOCKS, self._glide_until):
+            self._over_fit_done = True
 
     def _print(self):
         try:
@@ -640,9 +572,11 @@ class SliceFilter:
         else:
             # widen quickly, narrow slowly: a syllable that reaches further
             # must not be clipped while one quiet over must not close the door
-            slow = 0.5 if self._blocks < self._glide_until else 0.05
-            new_lo = self.auto_low + (0.5 if lo < self.auto_low else slow) * (lo - self.auto_low)
-            new_hi = self.auto_high + (0.5 if hi > self.auto_high else slow) * (hi - self.auto_high)
+            # ...and the one fit of an over takes the whole step out, half in
+            fast = 1.0 if self._live else 0.5
+            slow = 0.5 if self._live or self._blocks < self._glide_until else 0.05
+            new_lo = self.auto_low + (fast if lo < self.auto_low else slow) * (lo - self.auto_low)
+            new_hi = self.auto_high + (fast if hi > self.auto_high else slow) * (hi - self.auto_high)
         if (self.auto_low is None or abs(new_lo - self.auto_low) > 25.0
                 or abs(new_hi - self.auto_high) > 25.0):
             self.dirty = True
