@@ -69,6 +69,14 @@ def _pf():
     return postfilter
 
 
+def _voice_key(summary):
+    """What of a print summary is persisted with a name: enough for
+    VoicePrint.distance, nothing that grows."""
+    if summary is None:
+        return None
+    return {k: summary.get(k) for k in ("centroid_hz", "high_hz", "tilt_db", "overs")}
+
+
 def _bc():
     from ..core import beacons
     return beacons
@@ -85,6 +93,13 @@ def _is_fm(mode):
 
 class _DiversityState:
     CAL_SECONDS = 0.5          # of raw IQ cross-correlated to find the lag
+    # A quiet half second of band noise from two loops a few metres apart
+    # peaks at only 6-10x the floor (measured 2026-09-03: 34x and 49x with a
+    # talker, 9x and 10x without, on the same capture), so one window is not
+    # a verdict. Keep measuring, up to ALIGN_TRIES windows, and adopt the
+    # best; a peak past ALIGN_STRONG_PEAK ends the search early.
+    ALIGN_TRIES = 8
+    ALIGN_STRONG_PEAK = 30.0
     CAL_SAMPLES_MAX = 1 << 17  # 131072 — caps the FFT at 2.04 MS/s to ~64 ms of
                                 # reader-thread stall instead of the 103 ms a
                                 # full 0.5 s (2^21-point FFT) costs, which was
@@ -120,6 +135,8 @@ class _DiversityState:
         # the reader thread, and an empty list handed to np.concatenate raises.
         self._cal_lock = threading.Lock()
         self._realign = None                # why a measurement is owed, or None
+        self._align_try = 0                 # windows measured for the realign in progress
+        self._align_best = None             # (lag, peak) of the best window so far
         self.last_align = {"lag": 0, "peak": 0.0, "ok": False, "why": None}
         # noise blanker
         self.nb_on = False
@@ -160,6 +177,7 @@ class _DiversityState:
     def request_realign(self, why):
         with self._cal_lock:
             self._cal_a, self._cal_b, self._cal_n = [], [], 0
+        self._align_try, self._align_best = 0, None
         self._realign = str(why)
 
     def _configured_weight(self, sid):
@@ -187,6 +205,29 @@ class _DiversityState:
             return 0j
         return self._configured_weight(sid)
 
+    def _align_window(self, A, B, why):
+        """One calibration window measured: adopt the best lag so far when
+        it is credible, and keep measuring while it is not yet strong."""
+        dv = _dv()
+        lag, peak = dv.find_lag(A, B, min(8192, len(A) // 4))
+        self._align_try += 1
+        best = self._align_best
+        if best is None or peak > best[1]:
+            best = self._align_best = (int(lag), float(peak))
+        ok = best[1] >= dv.ALIGN_MIN_PEAK
+        if best == (int(lag), float(peak)) or self._align_try == 1:
+            # first window, or a better one: the aligner follows it (an
+            # unchanged best is left alone -- set_lag restarts the delay line)
+            self.aligner.set_lag(best[0] if ok else 0, best[1], ok)
+        more = best[1] < self.ALIGN_STRONG_PEAK and self._align_try < self.ALIGN_TRIES
+        self.last_align = {"lag": best[0] if ok else 0, "peak": best[1], "ok": ok, "why": why}
+        if more:
+            self._realign = why             # keep collecting
+        verdict = ("locked" if ok else "NOT credible; holding lag 0") + (
+            f"; measuring on ({self._align_try}/{self.ALIGN_TRIES})" if more else "")
+        print(f"[diversity] alignment ({why}): lag {lag:+d} samples, correlation "
+              f"peak {peak:.1f}x the floor — {verdict}", flush=True)
+
     def _window(self, n):
         w = self._win.get(n)
         if w is None:
@@ -209,11 +250,7 @@ class _DiversityState:
             if snapshot is not None:
                 cal_a, cal_b, why = snapshot
                 A = np.concatenate(cal_a); B = np.concatenate(cal_b)
-                lag, peak, ok = self.aligner.calibrate(A, B, min(8192, len(A) // 4))
-                self.last_align = {"lag": int(lag), "peak": float(peak), "ok": bool(ok), "why": why}
-                print(f"[diversity] alignment ({why}): lag {lag:+d} samples, correlation "
-                      f"peak {peak:.1f}x the floor — "
-                      f"{'locked' if ok else 'NOT credible; holding lag 0'}", flush=True)
+                self._align_window(A, B, why)
         a, b = self.aligner.apply(a, b)
         if self.aligner.aligned:
             # before the blanker: the profile must see the impulses it counts
@@ -377,7 +414,9 @@ class _DiversityState:
             vp.forget()
 
     def memory_name(self, talker_id, name):
-        if not self.memory.name(talker_id, name):
+        vp = self.prints.get(self.active_slice)
+        voice = _voice_key(vp.summary(int(talker_id))) if vp is not None else None
+        if not self.memory.name(talker_id, name, voice):
             raise ValueError(f"unknown talker id {talker_id}")
 
     # --- control port ----------------------------------------------------
@@ -558,6 +597,8 @@ class _DiversityState:
             vp.forget(keep_ids={e["id"] for e in mem})
         for e in mem:
             e["voice"] = vp.summary(e["id"]) if vp is not None else None
+            if e.get("name") and e["voice"] is not None:
+                self.memory.note_voice(e["id"], _voice_key(e["voice"]))
         return mem
 
     def _print_feed(self, sid, y, pa, rate_hz):
@@ -585,6 +626,17 @@ class _DiversityState:
         self._voice_checked = True
         v = _vp()
         mine = vp.summary(active)
+        if mine is None:
+            # no print of their own yet: a name inherited from the bearing is
+            # checked against the voice the name was given for
+            e = self.memory.entry(active) or {}
+            known = self.memory.named_voice(e["name"], e["s"]) if e.get("name") else None
+            dn = vp.distance(cur, known)
+            if dn is not None and dn >= v.DIFFERENT_VOICE:
+                name = self.memory.disown(active)
+                print(f"[diversity] #{active} has {name}'s bearing but not their voice "
+                      f"(d={dn:.2f}) -> unnamed", flush=True)
+            return
         d = vp.distance(cur, mine)
         if d is None or d < v.DIFFERENT_VOICE:
             return

@@ -289,6 +289,7 @@ def test_observe_feeds_the_tracker_and_ramps_between_weights():
     assert set(s) >= {"nb", "pan", "sources", "memory", "capture", "rn_source", "talk_mod",
                       "talker"}
     assert s["memory"] and all("id" in e and "name" in e for e in s["memory"])
+    st.memory.names_path = None                  # never the operator's names file
     st.memory_name(s["memory"][0]["id"], "Ted")
     assert st.status()["memory"][0]["name"] == "Ted"
     with pytest.raises(ValueError):

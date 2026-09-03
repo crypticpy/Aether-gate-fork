@@ -27,6 +27,7 @@ BEARING = BEARING / np.linalg.norm(BEARING)
 
 def _state():
     st = _DiversityState(_FakeAdapter(mode="USB"))
+    st.memory.names_path, st.memory._named = None, []      # never the operator's names file
     st.aligner.set_lag(0, 20.0, True)
     st.set(mode="track", subband=False)
     rng = np.random.default_rng(1)
@@ -47,6 +48,50 @@ def _speak(st, x, talking=True):
 
 def _silence(st):
     _speak(st, np.zeros(BLOCK, dtype=np.complex128), talking=False)
+
+
+VOICE_A = {"centroid_hz": 800.0, "high_hz": 2500.0, "tilt_db": -5.0, "overs": 4}
+VOICE_B = {"centroid_hz": 2000.0, "high_hz": 2900.0, "tilt_db": 8.0, "overs": 3}
+
+
+def test_a_name_is_persisted_with_the_voice_it_was_given_for(tmp_path):
+    path = tmp_path / "names.json"
+    mem = TalkerMemory(names_path=str(path))
+    now = time.monotonic()
+    mem.store(BEARING, 0.7 + 0j, now)
+    assert mem.name(1, "Ted", VOICE_A)
+    assert mem.named_voice("Ted") == VOICE_A
+    # the print grows: the persisted voice follows it
+    grown = dict(VOICE_A, overs=5, centroid_hz=810.0)
+    mem.note_voice(1, grown)
+    assert mem.named_voice("Ted") == grown
+    # and it comes back from disk with the name
+    again = TalkerMemory(names_path=str(path))
+    assert again.named_voice("Ted") == grown
+    again.store(BEARING, 0.7 + 0j, time.monotonic())
+    assert again.entry(1)["name"] == "Ted"
+    # disown takes the name off the entry, not off the disk
+    assert again.disown(1) == "Ted"
+    assert again.entry(1)["name"] is None and again.named_voice("Ted") == grown
+    assert again.disown(1) is None
+
+
+def test_a_stranger_with_teds_bearing_does_not_keep_teds_name():
+    """Ted was named while his print said voice B. A new entry at his
+    bearing inherits the name by signature; a second into its first over the
+    voice is A, not B: the name comes off, the entry stays."""
+    st = _state()
+    st.memory.store(BEARING, 0.7 + 0j, time.monotonic())
+    st.memory.name(1, "Ted", VOICE_B)
+    st.memory.release()
+    st.memory.entries.clear()
+    st.memory.store(BEARING, 0.7 + 0j, time.monotonic())     # inherits "Ted"
+    e = st.memory.entry(st.memory.active)
+    assert e["name"] == "Ted" and st.prints.get(0) is None
+    rng = np.random.default_rng(3)
+    _speak(st, _over(rng, 2.0, 300.0, 2400.0, 3.0))
+    assert st.memory.entry(e["id"])["name"] is None
+    assert st.memory.named_voice("Ted") == VOICE_B
 
 
 def test_memory_reassign_moves_the_over_to_a_fitting_talker_or_a_new_one():

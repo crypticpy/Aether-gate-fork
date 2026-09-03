@@ -286,6 +286,31 @@ def test_null_declines_when_it_would_cost_signal():
     assert tr.refit("null") is True        # with no signal knowledge it is a valid null
 
 
+def test_inband_noise_model_stays_in_force_through_a_long_over():
+    """The in-band Rn is learned only between overs. A talker who holds the
+    key for longer than RN_INBAND_FRESH_S must not lose the null it gives
+    on a co-channel station five seconds into the over: freshness is
+    measured to the start of the over, not to now."""
+    from aether_gate.core.diversity import RN_INBAND_FRESH_S
+    rng = np.random.default_rng(22)
+    tr = Tracker(RATE)
+    block = 1024
+    t = 0.0
+    while t < 1.0:                                       # quiet: guard noise learned
+        R_in, R_g = _scene_tone(rng, block, False, None, 0.5, t)
+        tr.update(R_in, R_g, block, "track"); t += block / RATE
+    while t < 4.0:                                       # the tone parks in the passband
+        R_in, R_g = _scene_tone(rng, block, True, None, 0.5, t)
+        tr.update(R_in, R_g, block, "track"); t += block / RATE
+    assert tr.steady and tr.rn_source == "inband"
+    t_key = t
+    while t < t_key + 2.0 * RN_INBAND_FRESH_S:           # one long over, twice the window
+        R_in, R_g = _scene_tone(rng, block, True, (-0.7, 1.1), 0.5, t)
+        tr.update(R_in, R_g, block, "track"); t += block / RATE
+        assert tr.rn_source == "inband", (t - t_key, "the null on the tone was dropped mid-over")
+    assert tr.talking and not tr.steady
+
+
 def test_weak_signal_below_the_vad_is_not_learned_as_noise():
     rng = np.random.default_rng(13)
     tr = Tracker(RATE)

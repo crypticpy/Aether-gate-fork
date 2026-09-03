@@ -290,7 +290,10 @@ def _to_multiplier(w):
 
 
 # The in-band noise covariance learned between overs is preferred over the
-# guard-band one (it alone sees co-channel QRM) while it is this fresh.
+# guard-band one (it alone sees co-channel QRM) while it is this fresh --
+# measured to the START of the over in progress, not to now: the model
+# cannot be refreshed while someone talks, and a long over under a
+# co-channel station must not lose its null five seconds in.
 RN_INBAND_FRESH_S = 5.0
 
 # A talker's spatial signature is recognised again when the squared cosine
@@ -414,7 +417,9 @@ class TalkerMemory:
                 v = np.array(e["s"], dtype=float)
                 s = v[0::2] + 1j * v[1::2]
                 if len(s) >= 2 and e.get("name"):
-                    out.append({"s": s / max(np.linalg.norm(s), 1e-12), "name": str(e["name"])})
+                    voice = e.get("voice")
+                    out.append({"s": s / max(np.linalg.norm(s), 1e-12), "name": str(e["name"]),
+                                "voice": dict(voice) if isinstance(voice, dict) else None})
             except (KeyError, TypeError, ValueError):
                 continue
         return out
@@ -422,7 +427,8 @@ class TalkerMemory:
     def _save_names(self):
         if not self.names_path:
             return
-        raw = [{"s": [float(x) for c in e["s"] for x in (c.real, c.imag)], "name": e["name"]}
+        raw = [{"s": [float(x) for c in e["s"] for x in (c.real, c.imag)], "name": e["name"],
+                "voice": e.get("voice")}
                for e in self._named]
         try:
             os.makedirs(os.path.dirname(self.names_path) or ".", exist_ok=True)
@@ -433,13 +439,45 @@ class TalkerMemory:
         except OSError:
             pass
 
-    def _remember_name(self, s, name):
-        """Persist (or drop) the label for the signature s."""
+    def _remember_name(self, s, name, voice=None):
+        """Persist (or drop) the label for the signature s, with the voice
+        it was given for, if there is one yet."""
         kept = [e for e in self._named if abs(np.vdot(e["s"], s)) ** 2 < self.match]
         if name:
-            kept.append({"s": s, "name": name})
+            kept.append({"s": s, "name": name, "voice": voice})
         self._named = kept
         self._save_names()
+
+    def named_voice(self, name, s=None):
+        """The voice persisted with a name (at the signature s, when given:
+        one name can be on file at more than one bearing), or None."""
+        for e in self._named:
+            if e["name"] == name and (s is None or abs(np.vdot(e["s"], s)) ** 2 >= self.match):
+                return e.get("voice")
+        return None
+
+    def note_voice(self, talker_id, voice):
+        """A named talker's print has grown: keep the persisted voice current,
+        so the name is given by the voice next time, not the bearing alone."""
+        e = self.entry(talker_id)
+        if e is None or not e.get("name") or voice is None:
+            return
+        for n in self._named:
+            if n["name"] == e["name"] and abs(np.vdot(n["s"], e["s"])) ** 2 >= self.match:
+                if n.get("voice") != voice:
+                    n["voice"] = dict(voice)
+                    self._save_names()
+                return
+
+    def disown(self, talker_id):
+        """This entry wears a name it inherited from its bearing, and the
+        voice says it is somebody else: take the name off the entry (the
+        persisted name keeps its bearing and voice)."""
+        e = self.entry(talker_id)
+        if e is None or not e.get("name"):
+            return None
+        name, e["name"] = e["name"], None
+        return name
 
     def _known_name(self, s):
         best, best_c = None, self.match
@@ -521,12 +559,13 @@ class TalkerMemory:
         # the name belongs to the voice, not the bearing: a stranger there is unnamed
         return self._add(cur["s"].copy(), cur["m"], now, None)["id"]
 
-    def name(self, talker_id, name):
-        """Label an entry; '' or None clears. False when the id is unknown."""
+    def name(self, talker_id, name, voice=None):
+        """Label an entry; '' or None clears. False when the id is unknown.
+        voice: the entry's print summary, persisted beside the name."""
         for e in self.entries:
             if e["id"] == int(talker_id):
                 e["name"] = (str(name).strip() or None) if name is not None else None
-                self._remember_name(e["s"], e["name"])
+                self._remember_name(e["s"], e["name"], voice if e["name"] else None)
                 return True
         return False
 
@@ -612,6 +651,7 @@ class Tracker:
                                             # (t0 = a shared clock, so several
                                             # trackers can stamp one TalkerMemory)
         self._rn_in_t = -1e9
+        self._over_t0 = None                # tracker time the over in progress began
         self._since_fit = 0.0
         self._talk_s = 0.0
         self._quiet_s = 0.0
@@ -631,7 +671,8 @@ class Tracker:
 
     @property
     def rn_source(self):
-        if self.Rn_in is not None and self.t - self._rn_in_t <= RN_INBAND_FRESH_S:
+        ref = self._over_t0 if (self._onset_done and self._over_t0 is not None) else self.t
+        if self.Rn_in is not None and ref - self._rn_in_t <= RN_INBAND_FRESH_S:
             return "inband"
         return "guard" if self.Rn_guard is not None else None
 
@@ -682,6 +723,8 @@ class Tracker:
                 self.Rn_in = R_in if self.Rn_in is None else (1 - al) * self.Rn_in + al * R_in
                 self._rn_in_t = self.t
             else:
+                if self.steady:
+                    self._over_t0 = self.t  # a voice over the carrier: the over begins here
                 self.steady = False
             if self._talk_s >= TALK_HOLD_S and not steady:
                 if not self._onset_done:
@@ -690,6 +733,7 @@ class Tracker:
                     # running mean until a time constant's worth has been
                     # seen, so the beam can settle within a few syllables.
                     self._onset_done = True
+                    self._over_t0 = self.t
                     self._rs_n = 0
                     self._rs_half = [None, None]
                     self._fade_s = 0.0

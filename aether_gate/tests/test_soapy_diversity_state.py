@@ -36,6 +36,7 @@ class _FakeAdapter:
     def __init__(self, samp_rate):
         self._np = np
         self.samp_rate = float(samp_rate)
+        self.center_hz = 3_900_000.0
 
 
 def _noise(n, rng):
@@ -120,9 +121,58 @@ def test_ingest_completes_calibration_at_the_capped_length_not_at_0_5s():
         a, b = _noise(block, rng), _noise(block, rng)
         state.ingest(a, b)
         fed += block
-    assert state._realign is None, (
+    assert state.last_align["why"] == "test", (
         "calibration did not complete at the capped sample count — "
         "CAL_SECONDS*samp_rate is still being used uncapped")
+
+
+def _feed_window(state, rng, lag=None, seed_b=None):
+    """One calibration window of noise; with lag, B is A delayed by lag."""
+    n_cal = min(int(state.CAL_SECONDS * state.a.samp_rate), state.CAL_SAMPLES_MAX)
+    n = n_cal + 8192
+    a = _noise(n, rng)
+    if lag is None:
+        b = _noise(n, rng)
+    else:
+        b = np.concatenate([_noise(lag, rng), a[:n - lag]])
+    fed = 0
+    while fed < n_cal:
+        state.ingest(a[fed:fed + 4096], b[fed:fed + 4096])
+        fed += 4096
+
+
+def test_a_quiet_window_is_not_a_verdict_the_realign_keeps_measuring():
+    """Uncorrelated windows: no lock, but the measurement goes on up to
+    ALIGN_TRIES windows before it gives up; then a correlated window locks
+    the right lag and, being strong, ends the search."""
+    rng = np.random.default_rng(7)
+    state = _DiversityState(_FakeAdapter(125_000.0))
+    state.request_realign("test")
+    for i in range(state.ALIGN_TRIES - 1):
+        _feed_window(state, rng)
+        assert state._realign == "test" and not state.aligner.aligned, i
+    _feed_window(state, rng)
+    assert state._realign is None and not state.aligner.aligned
+    assert state.last_align["ok"] is False and state._align_try == state.ALIGN_TRIES
+    # a talker keys up during the next request: locked on the first window
+    state.request_realign("operator request")
+    _feed_window(state, rng, lag=63)
+    assert state.aligner.aligned and state.aligner.lag == 63
+    assert state._realign is None, "a strong peak should end the search"
+    assert state.last_align == {"lag": 63, "peak": state.aligner.peak, "ok": True,
+                                "why": "operator request"}
+    assert state.last_align["peak"] >= state.ALIGN_STRONG_PEAK
+
+
+def test_a_credible_lag_is_adopted_at_once_and_only_replaced_by_a_better_window():
+    rng = np.random.default_rng(8)
+    state = _DiversityState(_FakeAdapter(125_000.0))
+    state.request_realign("test")
+    _feed_window(state, rng)                      # quiet: nothing yet
+    assert not state.aligner.aligned
+    _feed_window(state, rng, lag=40)              # strong: adopted, search over
+    assert state.aligner.aligned and state.aligner.lag == 40 and state._realign is None
+    assert state._align_try == 2
 
 
 # --- F8: request_realign() and ingest() must not race on the accumulators --
