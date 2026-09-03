@@ -484,8 +484,11 @@ class TalkerMemory:
                 e["m"], e["last_seen"] = m, now
                 self._activate(e, now)
                 return
+        self._add(s, m, now, self._known_name(s))
+
+    def _add(self, s, m, now, name):
         e = {"id": self._next_id, "s": s, "m": m, "hits": 0,
-             "first_seen": now, "last_seen": now, "name": self._known_name(s)}
+             "first_seen": now, "last_seen": now, "name": name}
         self._next_id += 1
         self.entries.append(e)
         self._activate(e, now)
@@ -495,6 +498,28 @@ class TalkerMemory:
             dropped = self.entries.pop(i)
             if dropped["id"] == self.active:
                 self.release()
+        return e
+
+    def reassign(self, now, unlike):
+        """The live over came from the active talker's bearing but is not
+        their voice (the print said so). Move it to a remembered talker at
+        the same bearing whose print it does fit -- unlike(entry) False --
+        or to a new talker there. Returns the id now live, None if nobody
+        was live."""
+        cur = self.entry(self.active)
+        if cur is None:
+            return None
+        same = [e for e in self.entries
+                if e is not cur and abs(np.vdot(e["s"], cur["s"])) ** 2 >= self.match]
+        fit = [e for e in same if not unlike(e)]
+        if fit:
+            e = max(fit, key=lambda e: e["last_seen"])
+            e["hits"] += 1
+            e["last_seen"] = now
+            self._activate(e, now)
+            return e["id"]
+        # the name belongs to the voice, not the bearing: a stranger there is unnamed
+        return self._add(cur["s"].copy(), cur["m"], now, None)["id"]
 
     def name(self, talker_id, name):
         """Label an entry; '' or None clears. False when the id is unknown."""

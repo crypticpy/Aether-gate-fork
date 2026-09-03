@@ -46,6 +46,9 @@ VOICE_SCORE = 0.5            # a window at or above this is "voice"
 CANDIDATE_MAX = 12
 CANDIDATE_RECENT_S = 30.0    # a candidate must have scored within this long
 EDGE_MARGIN_HZ = 150.0       # dial sits this far outside the voice energy
+DIAL_GRID_HZ = 500.0         # phone sits on whole and half kilohertz; the map's
+                             # points are ~244 Hz apart, so the raw dial estimate
+                             # is snapped to the grid (hz) and kept beside it (hz_raw)
 USB_ABOVE_HZ = 10_000_000.0  # band convention: USB above 10 MHz, LSB below
 
 
@@ -237,8 +240,10 @@ class Finder:
         else:
             edge = lo + (above[0] if usb else above[-1])
         if usb:
-            return self._point_hz(edge, center_hz) - self.step_hz / 2 - EDGE_MARGIN_HZ, "USB"
-        return self._point_hz(edge, center_hz) + self.step_hz / 2 + EDGE_MARGIN_HZ, "LSB"
+            raw = self._point_hz(edge, center_hz) - self.step_hz / 2 - EDGE_MARGIN_HZ
+        else:
+            raw = self._point_hz(edge, center_hz) + self.step_hz / 2 + EDGE_MARGIN_HZ
+        return DIAL_GRID_HZ * round(raw / DIAL_GRID_HZ), ("USB" if usb else "LSB"), raw
 
     def candidates(self, center_hz=0.0, live=None):
         last = self._last
@@ -267,7 +272,7 @@ class Finder:
                 continue
             hit = np.nonzero(voiced[:, w])[0]
             last_s = float(self.elapsed - times[hit[-1]]) if len(hit) else None
-            hz, mode = self._dial_hz(w, center_hz)
+            hz, mode, hz_raw = self._dial_hz(w, center_hz)
             # the terms as they were when the window scored best, not now:
             # a row must describe the conversation it lists, and 20 s after
             # the last over "now" is the floor
@@ -276,7 +281,8 @@ class Finder:
             else:
                 snr_w, depth_w, syl_w = (float(last[k][w]) for k in ("snr_db", "depth", "syllabic"))
             c = {
-                "_w": int(w), "hz": round(float(hz), 1), "mode": mode,
+                "_w": int(w), "hz": round(float(hz), 1), "hz_raw": round(float(hz_raw), 1),
+                "mode": mode,
                 "width_hz": round(self.win * self.step_hz, 1),
                 "score": round(float(rec[w]), 2),
                 "snr_db": round(snr_w, 1),

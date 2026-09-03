@@ -35,6 +35,15 @@ ENV_MAX_S = 20.0         # envelope kept per over for the syllabic rate
 SYL_LO, SYL_HI = 2.0, 8.0
 MIN_OVER_S = 1.5
 MERGE = 0.3              # a new over's weight in the talker's print
+# THE SECOND OPINION, USED. The memory recalls a talker by bearing within
+# 50 ms; two people from one bearing are one talker to it. From VOICE_CHECK_S
+# into an over the running print is compared with the recalled talker's,
+# and a distance of DIFFERENT_VOICE or more (centroid 250 Hz, top edge
+# 400 Hz, tilt 4 dB each count as one) says this is somebody else at that
+# bearing. An over that ends unlike the print it was headed for does not
+# teach it either.
+VOICE_CHECK_S = 1.0
+DIFFERENT_VOICE = 0.9
 
 
 class _Over:
@@ -97,6 +106,10 @@ class VoicePrint:
             self.prints[cur.talker] = {"bands": bands, "syllabic": syl,
                                        "over_s": cur.seconds, "overs": 1}
             return
+        d = self.distance(self._summarise(bands, syl, cur.seconds, 0),
+                          self._summarise(p["bands"], p["syllabic"], p["over_s"], p["overs"]))
+        if d is not None and d >= DIFFERENT_VOICE:
+            return                                # somebody else's over: not this print's
         p["bands"] = (1 - MERGE) * p["bands"] + MERGE * bands
         if syl is not None:
             p["syllabic"] = syl if p["syllabic"] is None else (1 - MERGE) * p["syllabic"] + MERGE * syl
@@ -120,7 +133,31 @@ class VoicePrint:
         p = self.prints.get(talker_id)
         if p is None:
             return None
-        b = p["bands"]
+        return self._summarise(p["bands"], p["syllabic"], p["over_s"], p["overs"])
+
+    def current(self):
+        """The running over so far, once it is long enough to be judged
+        (VOICE_CHECK_S); None otherwise."""
+        cur = self._cur
+        if cur is None or cur.n == 0 or cur.seconds < VOICE_CHECK_S:
+            return None
+        return self._summarise(cur.bands / cur.n, self._syllabic(np.asarray(cur.env)),
+                               cur.seconds, 0)
+
+    @staticmethod
+    def distance(a, b):
+        """How unlike two summaries are; DIFFERENT_VOICE and up is another
+        person (or another rig). None when either is missing."""
+        if a is None or b is None:
+            return None
+        d = ((a["centroid_hz"] - b["centroid_hz"]) / 250.0) ** 2 \
+            + ((a["high_hz"] - b["high_hz"]) / 400.0) ** 2
+        if a["tilt_db"] is not None and b["tilt_db"] is not None:
+            d += ((a["tilt_db"] - b["tilt_db"]) / 4.0) ** 2
+        return math.sqrt(d)
+
+    @staticmethod
+    def _summarise(b, syllabic, over_s, overs):
         centres = (np.arange(BANDS) + 0.5) * BAND_HZ
         total = float(b.sum())
         if total <= 0:
@@ -134,8 +171,8 @@ class VoicePrint:
         return {"centroid_hz": round(float((centres * b).sum() / total)),
                 "low_hz": round(lo_hz), "high_hz": round(hi_hz),
                 "tilt_db": None if tilt is None else round(tilt, 1),
-                "syllabic_hz": None if p["syllabic"] is None else round(p["syllabic"], 1),
-                "over_s": round(p["over_s"], 1), "overs": int(p["overs"])}
+                "syllabic_hz": None if syllabic is None else round(syllabic, 1),
+                "over_s": round(over_s, 1), "overs": int(overs)}
 
     def forget(self, keep_ids=None):
         """Drop every print, or every print whose talker is not in keep_ids."""

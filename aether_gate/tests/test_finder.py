@@ -76,6 +76,9 @@ def test_voice_is_found_first_and_the_carrier_and_noise_are_not():
     assert top["score"] >= VOICE_SCORE and top["mode"] == "USB"
     # USB: the dial sits just below the energy, which starts 20 kHz up
     assert CENTER + 19_000 <= top["hz"] <= CENTER + 20_100, top
+    # phone sits on whole and half kilohertz: the dial is snapped to 500 Hz
+    # and the estimate it came from rides beside it
+    assert top["hz"] % 500 == 0 and abs(top["hz_raw"] - top["hz"]) <= 250, top
     assert top["syllabic"] >= 0.6 and top["depth"] >= 0.4 and top["snr_db"] >= 5.0
     assert top["active_s"] >= 3 * SLOW_PERIOD_S and top["last_s"] is not None
     # the carrier (steady) and the noise never make the list

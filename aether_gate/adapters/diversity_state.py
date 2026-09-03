@@ -125,6 +125,8 @@ class _DiversityState:
         self.subband_on = True
         self.subbands = {}                  # sid -> SubbandCombiner
         self.prints = {}                    # sid -> VoicePrint (per talker voice/rig prints)
+        self._voice_checked = False         # the running over has been judged against its print
+        self.voice_splits = 0               # overs moved off a recalled talker by their voice
         self.profile = None                 # what kind of noise this is (core.noiseprofile)
         self.beacons = None                 # the NCDXF beacons on the pair (core.beacons)
         # spatial map: rebuilt whenever the hardware centre or rate moves,
@@ -448,6 +450,7 @@ class _DiversityState:
             "noise_profile": self._noise_profile(t),
             "memory": self._memory_status(sid),
             "talker": self.memory.talker(time.monotonic()),
+            "voice_splits": self.voice_splits,
             "loops": self.balance.status(time.monotonic()),
             "focus": self.memory.focus_status(time.monotonic(),
                                               nulling=bool(t.interferer) if t is not None else False),
@@ -554,6 +557,31 @@ class _DiversityState:
         talking = t is not None and bool(t.talking) and not bool(t.steady)
         active = self.memory.active if talking else None
         vp.feed(y if getattr(y, "ndim", 1) == 1 else pa, talking, active)
+        if not talking:
+            self._voice_checked = False
+        elif active is not None and not self._voice_checked:
+            self._voice_check(vp, active)
+
+    def _voice_check(self, vp, active):
+        """Once per over, as soon as the running print can be judged: an
+        over recalled by bearing that is not that talker's voice goes to
+        whoever at that bearing it is, or to a new talker."""
+        cur = vp.current()
+        if cur is None:
+            return
+        self._voice_checked = True
+        v = _vp()
+        mine = vp.summary(active)
+        d = vp.distance(cur, mine)
+        if d is None or d < v.DIFFERENT_VOICE:
+            return
+
+        def unlike(e):
+            s = vp.summary(e["id"])
+            dd = vp.distance(cur, s)
+            return dd is not None and dd >= v.DIFFERENT_VOICE
+        if self.memory.reassign(time.monotonic(), unlike) is not None:
+            self.voice_splits += 1
 
     def _monitor(self, pa, pb):
         if self.hear == "a":

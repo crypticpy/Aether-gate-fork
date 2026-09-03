@@ -10,7 +10,8 @@ Run:  python -m pytest aether_gate/tests/test_voiceprint.py
 """
 import numpy as np
 
-from aether_gate.core.voiceprint import VoicePrint, MIN_OVER_S
+from aether_gate.core.voiceprint import (VoicePrint, MIN_OVER_S, VOICE_CHECK_S,
+                                         DIFFERENT_VOICE)
 
 RATE = 25_000.0
 BLOCK = 2000
@@ -74,3 +75,40 @@ def test_short_and_anonymous_overs_teach_nothing_and_forget_works():
     assert 7 in vp.prints
     vp.forget()
     assert vp.prints == {} and vp.summary(7) is None
+
+
+def test_running_over_can_be_judged_against_a_print_and_a_stranger_is_far():
+    rng = np.random.default_rng(5)
+    vp = VoicePrint(RATE)
+    _feed(vp, _over(rng, 4.0, 300.0, 2400.0, 3.0), 1)
+    _silence(vp)
+    mine = vp.summary(1)
+    # too early to judge, then the running over of the same voice sits close
+    x = _over(rng, 2.0, 300.0, 2400.0, 3.0)
+    n_early = int(0.5 * RATE)
+    _feed(vp, x[:n_early], 1)
+    assert vp.current() is None
+    _feed(vp, x[n_early:int(VOICE_CHECK_S * RATE) + BLOCK], 1)
+    same = vp.current()
+    assert same is not None and vp.distance(same, mine) < DIFFERENT_VOICE
+    _silence(vp)
+    # another rig and voice from the same talker id reads as somebody else
+    _feed(vp, _over(rng, 1.2, 100.0, 2900.0, 5.0), 1)
+    other = vp.current()
+    assert other is not None and vp.distance(other, mine) >= DIFFERENT_VOICE
+    assert vp.distance(None, mine) is None
+
+
+def test_an_over_that_is_not_this_voice_does_not_teach_the_print():
+    rng = np.random.default_rng(6)
+    vp = VoicePrint(RATE)
+    _feed(vp, _over(rng, 4.0, 300.0, 2400.0, 3.0), 1)
+    _silence(vp)
+    before = vp.summary(1)
+    _feed(vp, _over(rng, 3.0, 100.0, 2900.0, 5.0), 1)      # a stranger, filed under 1
+    _silence(vp)
+    after = vp.summary(1)
+    assert after["overs"] == 1 and after["high_hz"] == before["high_hz"]
+    _feed(vp, _over(rng, 3.0, 300.0, 2400.0, 3.0), 1)      # the talker again
+    _silence(vp)
+    assert vp.summary(1)["overs"] == 2
