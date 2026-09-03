@@ -22,8 +22,8 @@ import pytest
 
 from aether_gate.adapters.soapy import AUDIO_RATE, SoapyAdapter
 from aether_gate.core.roofing import (DIGITAL_ROOF_PRESETS, DigitalRoof,
-                                      ROOF_MAX_TAPS, roof_ntaps, roof_taps,
-                                      validate_digital_roof_hz)
+                                      ROOF_MAX_TAPS, offset_max_hz, roof_ntaps,
+                                      roof_taps, validate_digital_roof_hz)
 
 RATE = 25000.0
 BLOCK = 410            # a 4096-sample read at 250 kS/s, decimated by 10
@@ -213,3 +213,147 @@ def test_the_width_survives_a_sample_rate_change():
     assert a._pd_rate == 25000.0
     assert a._roof.hz == 1800.0
     assert a.filter_status()["roofing"]["digital_hz"] == 1800
+
+
+# ----- PEAK OFFSET -------------------------------------------------------
+# The roof's centre dragged off the slice centre: a strong neighbour lands
+# on the skirt instead of inside the roof, without moving anything the
+# slice filter (downstream) sees. core/roofing.py's own docstring has the
+# proof that the shift-down/filter/shift-back implementation is exactly a
+# redesigned, shifted-centre filter -- these tests are the behaviour that
+# proof is for.
+
+def test_the_offset_shift_leaves_a_tone_at_the_slice_centre_where_it_is():
+    """A frequency SHIFT, not a redesign that moves content: a tone at the
+    slice's own +500 Hz stays at +500 Hz whichever way the roof is offset."""
+    t = np.arange(4 * BLOCK) / RATE
+    tone = np.exp(2j * np.pi * 500.0 * t)
+    for off in (800.0, -800.0):
+        roof = DigitalRoof(RATE, 3000.0, offset_hz=off, offset_on=True)
+        out = np.concatenate([roof.apply(tone[i:i + BLOCK].copy())
+                              for i in range(0, len(tone), BLOCK)])
+        tail = out[-BLOCK:]
+        tt = np.arange(len(tail)) / RATE
+        at_500 = abs(np.mean(tail * np.exp(-2j * np.pi * 500.0 * tt)))
+        assert 20 * np.log10(at_500) > -1.0, (off, at_500)
+
+
+def test_offset_moves_a_neighbour_from_inside_the_roof_to_its_skirt():
+    """Just outside the OFFSET roof, inside the CENTRED one: >= 40 dB down
+    with the check mark on, < 3 dB down with it off -- the whole point of
+    dragging the roof's centre away from a neighbour the passband edges
+    alone cannot exclude."""
+    hz = 2000.0
+    tone_hz = hz / 2.0 + 200.0                          # 1200 Hz
+    t = np.arange(8192) / RATE
+    tone = np.exp(2j * np.pi * tone_hz * t)
+
+    centred = DigitalRoof(RATE, hz, offset_hz=0.0, offset_on=False)
+    for _ in range(2):
+        out = centred.apply(tone)
+    atten_off = -20 * np.log10(np.mean(abs(out)))
+    assert atten_off < 3.0, atten_off
+
+    offset = DigitalRoof(RATE, hz, offset_hz=-2200.0, offset_on=True)
+    for _ in range(2):
+        out = offset.apply(tone)
+    atten_on = -20 * np.log10(np.mean(abs(out)))
+    assert atten_on >= 40.0, atten_on
+
+
+def test_apply_ignores_the_remembered_offset_while_the_check_mark_is_off():
+    """The check mark, not just the status dict: apply() itself must not
+    shift when offset_on is False, even though a nonzero offset_hz is sat
+    there remembered -- the same neighbour that the offset roof would spare
+    (see test_offset_moves_a_neighbour_from_inside_the_roof_to_its_skirt)
+    must still be caught the way a centred roof catches it."""
+    hz = 2000.0
+    tone_hz = hz / 2.0 + 200.0
+    t = np.arange(8192) / RATE
+    tone = np.exp(2j * np.pi * tone_hz * t)
+
+    remembered_but_off = DigitalRoof(RATE, hz, offset_hz=-2200.0, offset_on=False)
+    for _ in range(2):
+        out = remembered_but_off.apply(tone)
+    atten = -20 * np.log10(np.mean(abs(out)))
+    assert atten < 3.0, atten          # NOT spared -- the offset is not in force
+
+
+def test_offset_max_hz_is_the_clamp_formula_and_zero_when_the_roof_cannot_cover_it():
+    assert offset_max_hz(3000.0, 2000.0) == pytest.approx(500.0)     # (3000-2000)/2
+    assert offset_max_hz(2050.0, 2050.0) == 0.0                      # exactly no room
+    assert offset_max_hz(1500.0, 2000.0) == 0.0                      # too narrow: never negative
+    assert offset_max_hz(None, 2000.0) == 0.0
+    assert offset_max_hz(3000.0, None) == 0.0
+
+
+def test_the_check_mark_remembers_the_offset_while_off():
+    roof = DigitalRoof(RATE, 2000.0)
+    roof.set_offset_hz(900.0)
+    assert roof.offset_hz == 900.0 and not roof.offset_on
+    assert roof.status(offset_max_hz=1000.0)["offset_applied_hz"] == 0
+    roof.set_offset_on(True)
+    assert roof.status(offset_max_hz=1000.0)["offset_applied_hz"] == 900
+    roof.set_offset_on(False)                      # back off: still remembers 900
+    st = roof.status(offset_max_hz=1000.0)
+    assert st["offset_hz"] == 900 and st["offset_applied_hz"] == 0
+
+
+def test_the_status_carries_exactly_the_four_new_roofing_keys():
+    roof = DigitalRoof(RATE, 1200.0, offset_hz=300.0, offset_on=True)
+    st = roof.status(offset_max_hz=450.0)
+    for k in ("offset_hz", "offset_enabled", "offset_applied_hz", "offset_max_hz"):
+        assert k in st, k
+    assert st["offset_hz"] == 300 and st["offset_enabled"] is True
+    assert st["offset_applied_hz"] == 300 and st["offset_max_hz"] == 450
+    # too narrow for the passband it was asked about: held at 0 either way
+    off_roof = DigitalRoof(RATE, 1200.0, offset_hz=300.0, offset_on=True)
+    st2 = off_roof.status(offset_max_hz=0.0)
+    assert st2["offset_hz"] == 300              # the raw value is not mutated by status()
+    assert st2["offset_applied_hz"] == 300       # status() reports what apply() would do,
+    # -- the "hold at 0" for a too-narrow roof is set_digital_roof_offset_hz's
+    # job (it clamps what gets INTO offset_hz); status() never invents a
+    # value it was not given, it only decides whether offset_hz counts as
+    # applied.
+
+
+# ----- through the adapter: the routes, the clamp, and the chain card ----
+
+def test_the_route_clamps_a_requested_offset_into_range():
+    a = _adapter()
+    a.filter_set(low=350.0, high=2400.0)            # width 2050
+    a.filter_set(digital_roof_hz=3000.0)            # max = (3000-2050)/2 = 475
+    st = a.filter_set(roof_offset_hz=900.0, roof_offset=True)
+    r = st["roofing"]
+    assert r["offset_max_hz"] == 475
+    assert r["offset_hz"] == 475 and r["offset_applied_hz"] == 475
+    st = a.filter_set(roof_offset_hz=-9000.0)
+    assert st["roofing"]["offset_hz"] == -475
+
+
+def test_the_route_holds_the_offset_at_0_when_the_roof_is_too_narrow_for_the_passband():
+    a = _adapter()
+    a.filter_set(low=100.0, high=2900.0)            # width 2800 (SliceFilter's own default)
+    a.filter_set(digital_roof_hz=1200.0)            # narrower than the passband
+    st = a.filter_set(roof_offset_hz=5000.0, roof_offset=True)
+    r = st["roofing"]
+    assert r["offset_max_hz"] == 0
+    assert r["offset_hz"] == 0 and r["offset_applied_hz"] == 0
+
+
+def test_the_chain_cards_check_mark_and_its_detail_once_applied():
+    a = _adapter()
+    a.filter_set(low=350.0, high=2400.0)
+    a.filter_set(digital_roof_hz=3000.0, roof_offset_hz=400.0)
+    st = a.filter_set(roof_offset=False)
+    row = next(r for r in st["chain"] if r["id"] == "roof_digital")
+    checks = {c["key"]: c for c in row["checks"]}
+    assert checks["roof_offset"]["on"] is False
+    assert checks["roof_offset"]["route"] == "/filter/set"
+    assert checks["roof_offset"]["query_on"] == "roof_offset=on"
+    assert checks["roof_offset"]["query_off"] == "roof_offset=off"
+    assert "offset" not in row["detail"]
+    st = a.filter_set(roof_offset=True)
+    row = next(r for r in st["chain"] if r["id"] == "roof_digital")
+    assert row["checks"][0]["on"] is True
+    assert "offset +400 Hz" in row["detail"]

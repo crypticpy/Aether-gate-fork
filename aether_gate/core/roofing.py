@@ -24,6 +24,22 @@ and the rest). It is deliberately NOT the slice filter: it sits in front of
 it, so bypassing the slice FIR still leaves the operator hearing a roofing
 bandwidth rather than the whole 25 kHz.
 
+PEAK OFFSET is the digital roof's centre dragged off the slice centre, the
+Icom "VC-Tune" / Kenwood "Digi-Sel" move: park a strong neighbour on the
+roof's skirt instead of inside it, which the passband edges alone cannot do
+once the neighbour is inside THEIR span. Implemented as a frequency shift,
+not a redesign: the block is shifted down by the offset, run through the
+existing (unshifted, real-tapped) lowpass, then shifted back up, with the
+same index-matched phase both ways. That is exactly equivalent to designing
+the taps with a shifted centre (h[k]*exp(j*2*pi*offset*k/rate) commutes
+through the convolution the same way -- see test_the_offset_shift_is_exactly_
+a_centre_shifted_filter) but far cheaper: two O(N) complex multiplies per
+block against taps that stay real, rather than doubling every multiply in
+the O(N*taps) convolution by making the taps complex. The shift is a
+continuous NCO (phase carried in `_shift_phase`, per channel, across
+blocks) so a preset or offset change clicks once at the change and nothing
+else does.
+
 numpy only -- no scipy on the gate hosts (see core/filter.py).
 """
 import numpy as np
@@ -110,6 +126,20 @@ def roof_taps(rate_hz, hz):
     return (h / h.sum()).astype(np.float64)
 
 
+def offset_max_hz(roof_hz, passband_width_hz):
+    """The widest PEAK OFFSET may move the roof's centre and still cover the
+    whole slice passband: |offset| <= (roof_hz - passband_width) / 2, where
+    roof_hz is the roof's own radius (its `hz`, "3 kHz roof passes +/-3 kHz")
+    and passband_width_hz is the slice filter's own high_hz - low_hz. 0 --
+    never negative -- when the roof itself is too narrow for the passband it
+    is meant to carry, or either number is unknown; the caller holds the
+    offset at 0 in that case rather than clamping into a negative range.
+    """
+    if roof_hz is None or passband_width_hz is None:
+        return 0.0
+    return max(0.0, (float(roof_hz) - float(passband_width_hz)) / 2.0)
+
+
 class DigitalRoof:
     """The digital roofing filter, one per audio chain, state per channel.
 
@@ -120,12 +150,15 @@ class DigitalRoof:
     out identical.
     """
 
-    def __init__(self, rate_hz, hz=None):
+    def __init__(self, rate_hz, hz=None, offset_hz=0.0, offset_on=False):
         self.rate_hz = float(rate_hz)
         self.hz = None if hz is None else validate_digital_roof_hz(hz)
         self.taps = None
         self.state = {}
         self.dirty = True
+        self.offset_hz = float(offset_hz)         # PEAK OFFSET, signed, from the slice centre
+        self.offset_on = bool(offset_on)           # the check mark; remembered while off
+        self._shift_phase = {}                     # per-channel NCO phase, cycles, carried across blocks
 
     @property
     def active(self):
@@ -140,7 +173,28 @@ class DigitalRoof:
         self.taps = None
         self.state = {}
         self.dirty = True
+        self._shift_phase = {}
         return self.hz
+
+    def set_offset_hz(self, hz):
+        """PEAK OFFSET's Hz. Clamping against the current passband is the
+        caller's job (soapy.py -- it alone knows the slice filter's edges);
+        this just stores what it is given. Resets the NCO phase and the
+        roof's overlap state so a change does not blend the old shift into
+        the new one -- one click at the change, same as a width change."""
+        self.offset_hz = float(hz)
+        self.state = {}
+        self._shift_phase = {}
+        return self.offset_hz
+
+    def set_offset_on(self, on):
+        """The check mark. Off leaves `offset_hz` exactly as it was --
+        remembered, not applied -- so flipping it back on does not lose the
+        operator's setting."""
+        self.offset_on = bool(on)
+        self.state = {}
+        self._shift_phase = {}
+        return self.offset_on
 
     def apply(self, sig, ch=0):
         if not self.active:
@@ -149,20 +203,48 @@ class DigitalRoof:
             self.taps = roof_taps(self.rate_hz, self.hz)
             self.state = {}
             self.dirty = False
+        sig = np.asarray(sig, dtype=np.complex128)
+        shifting = self.offset_on and self.offset_hz != 0.0
+        if shifting:
+            # Shift down by the offset, filter with the existing (real-tap,
+            # centred-at-0) lowpass, shift back up -- with the SAME
+            # index-matched phase both times. For an FIR h and a per-sample
+            # phasor m[n] = exp(-j*2*pi*offset*n/rate), m[n-k] = m[n] *
+            # exp(j*2*pi*offset*k/rate), so filtering (sig*m) with h and then
+            # multiplying by conj(m) is exactly filtering sig with
+            # h[k]*exp(j*2*pi*offset*k/rate) -- the shifted-centre taps this
+            # module deliberately does NOT build, because that would double
+            # every multiply the O(N*taps) convolution below does.
+            step = self.offset_hz / self.rate_hz            # cycles per sample
+            phase0 = self._shift_phase.get(ch, 0.0)
+            ph = phase0 + step * np.arange(len(sig))
+            sig = sig * np.exp(-2j * np.pi * ph)
+            self._shift_phase[ch] = (phase0 + step * len(sig)) % 1.0
         n = len(self.taps)
         st = self.state.get(ch)
         if st is None:
             st = np.zeros(n - 1, dtype=np.complex128)
-        x = np.concatenate([st, np.asarray(sig, dtype=np.complex128)])
+        x = np.concatenate([st, sig])
         y = np.convolve(x, self.taps, mode="valid")
         self.state[ch] = x[len(x) - (n - 1):]
+        if shifting:
+            y = y * np.exp(2j * np.pi * ph)
         return y
 
-    def status(self):
+    def status(self, offset_max_hz=0.0):
         """`hz` is what the operator chose (or the full band when they have
-        chosen nothing), never a width that is silently different."""
+        chosen nothing), never a width that is silently different.
+        `offset_max_hz` is the caller's -- see core/roofing.offset_max_hz --
+        because only it knows the current slice passband."""
+        applied = (round(self.offset_hz)
+                   if self.offset_on and self.active and self.offset_hz != 0.0
+                   else 0)
         return {"hz": round(self.hz) if self.hz is not None else round(self.rate_hz),
                 "full_hz": float(self.rate_hz),
                 "taps": roof_ntaps(self.rate_hz, self.hz) if self.active else 0,
                 "active": self.active,
-                "options": list(DIGITAL_ROOF_PRESETS)}
+                "options": list(DIGITAL_ROOF_PRESETS),
+                "offset_hz": round(self.offset_hz),
+                "offset_enabled": self.offset_on,
+                "offset_applied_hz": applied,
+                "offset_max_hz": round(float(offset_max_hz))}

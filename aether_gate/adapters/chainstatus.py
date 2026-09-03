@@ -37,10 +37,13 @@ SHAPE_ORDER = ["soft", "sharp"]
 
 
 def _row(row_id, name, kind, detail, enabled=True, fixed=False,
-         value=None, options=None, action=None, why=None, measured=None):
+         value=None, options=None, action=None, why=None, measured=None,
+         checks=None):
     """One chain row. `action` and `why` are both always present with one of
     them None — the SITE page's rows have that shape and the app already
-    reads it."""
+    reads it. `checks` is a card's own check marks (PEAK OFFSET on
+    ROOFING · DIGITAL is the first) -- a list of {key, label, on, route,
+    query_on, query_off}, present only where a card has one."""
     out = {"id": row_id, "name": name, "kind": kind, "fixed": bool(fixed),
            "enabled": bool(enabled), "detail": detail,
            "action": action, "why": why}
@@ -50,6 +53,8 @@ def _row(row_id, name, kind, detail, enabled=True, fixed=False,
         out["options"] = list(options)
     if measured is not None:
         out["measured"] = measured
+    if checks is not None:
+        out["checks"] = list(checks)
     return out
 
 
@@ -162,14 +167,20 @@ def _roof_digital_row(roofing):
     on = roofing.get("digital_active")
     if on is None:                       # a gate that has no digital roof stage
         on = bool(hz) and bool(full) and float(hz) * 2.0 < float(full)
-    detail = (_dot(_khz(hz), f"{taps} taps" if taps else None) if on
+    applied = roofing.get("offset_applied_hz") or 0
+    offset_note = f"offset {applied:+.0f} Hz" if applied else None
+    detail = (_dot(_khz(hz), f"{taps} taps" if taps else None, offset_note) if on
               else _dot("off", f"the full {_khz(full)}" if full else None))
     if not opts:
         return _row("roof_digital", "ROOFING · DIGITAL", "value", detail,
                     enabled=on, value=hz,
                     why="this gate has no digital roofing filter")
+    checks = [{"key": "roof_offset", "label": "PEAK OFFSET",
+               "on": bool(roofing.get("offset_enabled")),
+               "route": "/filter/set",
+               "query_on": "roof_offset=on", "query_off": "roof_offset=off"}]
     return _row("roof_digital", "ROOFING · DIGITAL", "select", detail,
-                enabled=on, value=hz, options=opts,
+                enabled=on, value=hz, options=opts, checks=checks,
                 action=_set("/filter/set", "digital_roof_hz="))
 
 

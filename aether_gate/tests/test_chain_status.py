@@ -35,7 +35,8 @@ def _validate(row):
     """The §0.1 contract, as a function. Returns the row so it can be chained
     into an assert."""
     assert set(row) <= {"id", "name", "kind", "fixed", "enabled", "detail",
-                        "value", "options", "action", "why", "measured"}, row
+                        "value", "options", "action", "why", "measured",
+                        "checks"}, row
     for k in ("id", "name", "kind", "detail"):
         assert isinstance(row[k], str) and row[k], (k, row)
     assert row["kind"] in CHAIN_KINDS, row

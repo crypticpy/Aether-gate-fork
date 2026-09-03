@@ -105,7 +105,7 @@ _RECOVER_RETRY_MAX_S = 30.0
 _ERR_GIVE_UP = 2000
 from ..core.fft import dbm_offset_for, dbfs_to_dbm_for
 from ..core.filter import SliceFilter, blank_impulses
-from ..core.roofing import DigitalRoof, snap_analogue_hz
+from ..core.roofing import DigitalRoof, offset_max_hz, snap_analogue_hz
 from .chainstatus import chain_rows
 from .device_info import device_block
 from .frontend_guard import FrontEndGuard
@@ -710,7 +710,9 @@ class SoapyAdapter(RadioAdapter):
         # filter is, carrying the operator's width across.
         prev_roof = self._roof
         self._roof = DigitalRoof(self._pd_rate,
-                                 prev_roof.hz if prev_roof is not None else None)
+                                 prev_roof.hz if prev_roof is not None else None,
+                                 offset_hz=prev_roof.offset_hz if prev_roof is not None else 0.0,
+                                 offset_on=prev_roof.offset_on if prev_roof is not None else False)
         prev = self._filt
         self._filt = SliceFilter(self._pd_rate, spec=prev.spec if prev is not None else None,
                                  print_source=self._active_print)
@@ -1599,6 +1601,36 @@ class SoapyAdapter(RadioAdapter):
             raise ValueError("no audio chain yet")
         return self._roof.set(hz)
 
+    def digital_roof_offset_max_hz(self):
+        """How far PEAK OFFSET may move the roof's centre and still cover the
+        whole slice passband -- see core.roofing.offset_max_hz. Lives here,
+        not in roofing.py, because it is the one number that needs both the
+        roof's own width (self._roof.hz) and the slice filter's current
+        passband (self._filt.status()['width_hz'])."""
+        if self._roof is None or self._filt is None:
+            return 0.0
+        width = self._filt.status().get("width_hz")
+        return offset_max_hz(self._roof.hz, width)
+
+    def set_digital_roof_offset_hz(self, hz):
+        """PEAK OFFSET's Hz, clamped here -- where the current passband is
+        known -- so what DigitalRoof stores is always one the roof can carry.
+        A roof too narrow for the passband at all (max == 0) holds the offset
+        at 0 rather than clamping into a negative range."""
+        if self._roof is None:
+            raise ValueError("no audio chain yet")
+        mx = self.digital_roof_offset_max_hz()
+        want = float(hz)
+        clamped = max(-mx, min(mx, want)) if mx > 0.0 else 0.0
+        return self._roof.set_offset_hz(clamped)
+
+    def set_digital_roof_offset(self, on):
+        """The check mark itself: remembered while off, applied while on --
+        see DigitalRoof.apply."""
+        if self._roof is None:
+            raise ValueError("no audio chain yet")
+        return self._roof.set_offset_on(on)
+
     def _apply_roof_hz(self, want):
         """READER THREAD ONLY. Write the bandwidth and READ IT BACK: this
         driver's setters lie (see _verify_stream), so the status reports
@@ -1758,10 +1790,15 @@ class SoapyAdapter(RadioAdapter):
         st["roofing"]["samp_rate_hz"] = float(self.samp_rate)
         st["roofing"]["digital_full_hz"] = float(self._pd_rate or 0.0)
         if self._roof is not None:
-            r = self._roof.status()
+            offmax = self.digital_roof_offset_max_hz()
+            r = self._roof.status(offset_max_hz=offmax)
             st["roofing"].update({"digital_hz": r["hz"], "digital_full_hz": r["full_hz"],
                                   "digital_taps": r["taps"], "digital_active": r["active"],
-                                  "digital_options": r["options"]})
+                                  "digital_options": r["options"],
+                                  "offset_hz": r["offset_hz"],
+                                  "offset_enabled": r["offset_enabled"],
+                                  "offset_applied_hz": r["offset_applied_hz"],
+                                  "offset_max_hz": r["offset_max_hz"]})
         # THE CHAIN. One row per stage in signal order, assembled in
         # chainstatus.py from the dicts above and nothing else -- see there for
         # why the gate authors these rows rather than the app.
@@ -1827,6 +1864,10 @@ class SoapyAdapter(RadioAdapter):
             self.set_roof_hz(kw.pop("roof_hz"))
         if "digital_roof_hz" in kw:
             self.set_digital_roof_hz(kw.pop("digital_roof_hz"))
+        if "roof_offset_hz" in kw:
+            self.set_digital_roof_offset_hz(kw.pop("roof_offset_hz"))
+        if "roof_offset" in kw:
+            self.set_digital_roof_offset(kw.pop("roof_offset"))
         if self._div is not None and ("nb" in kw or "nb_db" in kw):
             self._div.set(nb=kw.pop("nb", None), nb_db=kw.pop("nb_db", None))
         if kw:
