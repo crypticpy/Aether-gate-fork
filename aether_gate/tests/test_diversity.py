@@ -11,9 +11,10 @@ import numpy as np
 import pytest
 
 from aether_gate.core.diversity import (
-    ALIGN_MIN_PEAK, REFIT_MIN_GAIN_DB, TALK_HOLD_S, WEIGHT_MAX_ABS, Aligner,
-    TalkerMemory, Tracker, _snr_of, blank_impulses, combine, combine_ramp, find_lag,
-    fit_max_snr, fit_null, weight_from_polar, weight_to_polar,
+    ALIGN_MIN_PEAK, REFIT_MIN_GAIN_DB, RING_FOLD_MIN_PACKETS, TALK_HOLD_S,
+    WEIGHT_MAX_ABS, Aligner, TalkerMemory, Tracker, _snr_of, blank_impulses,
+    combine, combine_ramp, find_lag, fit_max_snr, fit_null, fold_ring_skew,
+    ring_packet_samples, weight_from_polar, weight_to_polar,
 )
 
 RATE = 25_000.0
@@ -729,3 +730,63 @@ def test_a_focus_keeps_its_beam_through_idle_time():
         R_in, R_g = _scene(rng, block, None, 0.5)
         tr.update(R_in, R_g, block, "track")
     assert tr.idle_null is False and tr.m == m_beam
+
+
+# --- fold_ring_skew: the driver's FIFO skew is packets, not delay ----------
+# Every figure below is a real stream-start or post-fault lag out of the gate
+# logs (three nights, four sample rates). They are all whole 504 us driver
+# packets, which is what makes them the FIFO and not the antennas.
+
+@pytest.mark.parametrize("rate,q", [(62_500.0, 31.5), (125_000.0, 63.0),
+                                    (250_000.0, 126.0), (500_000.0, 252.0),
+                                    (2_000_000.0, 1008.0)])
+def test_a_driver_packet_is_504_microseconds_at_every_rate(rate, q):
+    assert ring_packet_samples(rate) == q
+    assert ring_packet_samples(rate) / rate == pytest.approx(1008 / 2e6)
+
+
+@pytest.mark.parametrize("lag,rate,packets", [
+    (-4158, 125_000.0, -66),         # stream start, 43 times in the logs
+    (-4221, 125_000.0, -67),         # ...and 10 times
+    (-4284, 125_000.0, -68),         # ...and 3
+    (-2079, 62_500.0, -66),          # the same 33.264 ms at a quarter the rate
+    (-8316, 250_000.0, -66),
+    (-16632, 500_000.0, -66),
+    (4032, 125_000.0, 64),           # after an overflow on A: B is the one ahead
+])
+def test_a_whole_packet_skew_folds_to_its_residual(lag, rate, packets):
+    assert fold_ring_skew(lag, rate) == (0, packets)
+
+
+@pytest.mark.parametrize("lag", [0, -1, 5, -63, -126, -252, -441])
+def test_a_small_lag_is_left_exactly_as_measured(lag):
+    """Requirement: the ordinary case must not move. Anything under
+    RING_FOLD_MIN_PACKETS is the aligner's delay line to hold, including the
+    one- and two-packet residuals the reader leaves behind after a fault."""
+    assert abs(lag) < RING_FOLD_MIN_PACKETS * 63
+    assert fold_ring_skew(lag, 125_000.0) == (lag, 0)
+
+
+def test_the_fold_threshold_is_where_it_says_it_is():
+    """Mutation check on RING_FOLD_MIN_PACKETS: seven packets is held, eight
+    is folded, and the boundary is the constant rather than a coincidence."""
+    q = int(ring_packet_samples(125_000.0))
+    held = -q * (RING_FOLD_MIN_PACKETS - 1)
+    folded = -q * RING_FOLD_MIN_PACKETS
+    assert fold_ring_skew(held, 125_000.0) == (held, 0)
+    assert fold_ring_skew(folded, 125_000.0) == (0, -RING_FOLD_MIN_PACKETS)
+
+
+@pytest.mark.parametrize("resid,folds", [(-10, True), (-15, True),
+                                         (-16, False), (-30, False)])
+def test_only_a_lag_that_lands_on_a_packet_boundary_is_claimed(resid, folds):
+    """Mutation check on RING_FOLD_TOL: a quarter of a packet (15 samples at
+    125 kS/s) is as far off a whole number of packets as a skew is allowed to
+    be. Further out we cannot tell skew from delay, so we report what we
+    measured and drop nothing."""
+    lag = -66 * 63 + resid
+    assert fold_ring_skew(lag, 125_000.0) == ((resid, -66) if folds else (lag, 0))
+
+
+def test_the_fold_survives_a_nonsense_rate():
+    assert fold_ring_skew(-4158, 0.0) == (-4158, 0)

@@ -135,6 +135,51 @@ FADE_HOLD_S = 0.2
 # candidate too, and the candidate nearest zero lag wins (ring aliases)
 ALIAS_PEAK_FRAC = 0.5
 
+# --- the driver's FIFO skew, which is not a delay ------------------------
+# The RSPduo streams both tuners at a fixed 2 MS/s IF in dual-tuner mode and
+# the API hands the driver one packet of 1008 samples at a time: 504 us of
+# air, whatever output rate the operator asked for. SoapySDRPlay3 keeps a
+# separate FIFO per channel and flushes each one LAZILY, on that channel's
+# next read, so the two flushes land a whole driver buffer apart and the
+# pair comes up a fixed 66 packets out of step. Measured over three nights:
+# -4158 at 125 kS/s, -2079 at 62.5, -8316 at 250, -16632 at 500 -- every one
+# of them exactly -66 packets. adapters/stream_sync.py squares the FIFOs up
+# at the source; this is the arithmetic its defensive fold uses.
+RING_IF_RATE_HZ = 2_000_000.0
+RING_PACKET_IF = 1008
+# Fold only a skew of at least this many packets. One packet is 504 us --
+# 150 km of propagation -- so even two is already far outside anything two
+# antennas at one site can be apart, but the residual the reader leaves
+# behind is a packet or two and has to be MEASURED, not folded away.
+RING_FOLD_MIN_PACKETS = 8
+# ...and only when the lag lands this close to a whole number of packets.
+RING_FOLD_TOL = 0.25
+
+
+def ring_packet_samples(rate):
+    """One driver packet in samples at this output rate (63 at 125 kS/s)."""
+    return RING_PACKET_IF * float(rate) / RING_IF_RATE_HZ
+
+
+def fold_ring_skew(lag, rate):
+    """(folded_lag, packets): a whole-packet FIFO skew split off the lag.
+
+    Returns the lag unchanged and 0 packets when it is not one -- which is
+    every ordinary measurement, including the one- and two-packet residuals
+    (-63, -126) that the reader leaves behind for the aligner to hold.
+    """
+    lag = int(lag)
+    q = ring_packet_samples(rate)
+    if q <= 0:
+        return lag, 0
+    packets = int(round(lag / q))
+    if abs(packets) < RING_FOLD_MIN_PACKETS:
+        return lag, 0
+    resid = lag - int(round(packets * q))
+    if abs(resid) > RING_FOLD_TOL * q:
+        return lag, 0
+    return resid, packets
+
 
 def find_lag(a, b, max_lag):
     """Integer offset between two coherent channels.
@@ -167,11 +212,13 @@ def find_lag(a, b, max_lag):
     win = np.concatenate([xc[m - max_lag:], xc[:max_lag + 1]]) if max_lag else xc[:1]
     mag = np.abs(win)
     i = int(np.argmax(mag))
-    # The two tuners share a chip: the true lag is tens of samples. A
-    # calibration window that straddles a ring-buffer wrap also shows a
-    # peak one ring length away (seen live: 4032 = -63 + 4095, held for
+    # The two tuners share a chip and a clock, so the lag they SHOULD show
+    # is a fraction of a sample; anything bigger is the driver's per-channel
+    # FIFO skew, in whole 504 us packets (see fold_ring_skew above, and the
+    # 4032 = 64 packets that was once read here as a ring wrap and held for
     # half an hour). Among peaks within ALIAS_PEAK_FRAC of the strongest,
-    # take the one nearest zero.
+    # take the one nearest zero -- a tie-break, not the cure: the cure is
+    # adapters/stream_sync.py squaring the two FIFOs up at the driver.
     strong = np.flatnonzero(mag >= ALIAS_PEAK_FRAC * mag[i])
     if len(strong) > 1:
         i = int(strong[np.argmin(np.abs(strong - max_lag))])

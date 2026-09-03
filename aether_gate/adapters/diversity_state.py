@@ -234,8 +234,8 @@ class _DiversityState:
         """One calibration window measured: adopt the best lag so far when
         it is credible, and keep measuring while it is not yet strong."""
         dv = _dv()
-        from ..core.alignsearch import measure_lag      # numpy: first use only
-        lag, peak = measure_lag(A, B, self.a.samp_rate)
+        from .stream_sync import measured_lag           # numpy: first use only
+        lag, peak = measured_lag(A, B, self.a)
         self._align_try += 1
         best = self._align_best
         if best is None or peak > best[1]:

@@ -139,6 +139,7 @@ def _dv():
 # The adapter's dual-tuner state lives in its own module; re-exported here
 # because tests and the engine reach it as soapy._DiversityState.
 from .diversity_state import _DiversityState  # noqa: E402,F401
+from .stream_sync import prime_rings  # noqa: E402
 
 
 def rtl_bufflen(samp_rate, target_s=0.030):
@@ -522,6 +523,12 @@ class SoapyAdapter(RadioAdapter):
         for st in self._streams:
             self._sdr.activateStream(st)
         if self._div is not None:
+            # Both `reset` flags are pending right now and each is consumed by
+            # ITS channel's next read, so consume them here, back to back,
+            # microseconds apart -- otherwise B's FIFO is flushed one whole
+            # driver buffer after A's and the pair starts 66 packets (33 ms)
+            # out of step. See adapters/stream_sync.py.
+            prime_rings(self, "stream start")
             # The driver's per-channel buffering restarts with the stream, so
             # the offset between the tuners must be measured afresh.
             self._div.request_realign("stream start")
@@ -1348,6 +1355,12 @@ class SoapyAdapter(RadioAdapter):
                             # silence with /status still reporting healthy, and the
                             # realign is re-requested every iteration without ever
                             # tripping device_lost (F5).
+                            # B's FIFO was flushed (or went short) while A's
+                            # kept its backlog: square them up before measuring,
+                            # so the realign sees the residual and not the
+                            # backlog. Without this the pair simply re-locks at
+                            # whatever whole-packet skew the fault left behind.
+                            prime_rings(self, "channel B read failed")
                             self._div.request_realign("channel B read failed")
                             _note_read_error()
                             continue
@@ -1359,6 +1372,9 @@ class SoapyAdapter(RadioAdapter):
                     self._queue_audio(audio)        # for the demod (continuous — every block consumed)
                 elif n < 0:
                     if self._div is not None and n == -4:   # SOAPY_SDR_OVERFLOW: A's ring was flushed
+                        # ...and B's was not, so B is now a backlog ahead of A
+                        # (seen live as +4032 = +64 packets). Drop it.
+                        prime_rings(self, "overflow on channel A")
                         self._div.request_realign("overflow on channel A")
                     # BACK OFF ON A PERSISTENT ERROR, AND GIVE UP ON A DEAD DEVICE
                     # (_note_read_error): a 1 ms retry is right for a transient
