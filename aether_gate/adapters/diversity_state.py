@@ -92,6 +92,16 @@ def _bc():
     return beacons
 
 
+def _sl():
+    from ..core import sitelog
+    return sitelog
+
+
+def _cp():
+    from ..core import compass
+    return compass
+
+
 def _balance():
     from ..core import balance
     return balance
@@ -122,6 +132,7 @@ class _DiversityState:
     CAPTURE_DIR = "~/aether-gate-captures"
     NAMES_PATH = "~/.aether-gate/diversity-names.json"   # talker labels, by signature
     BEACONS_PATH = "~/.aether-gate/beacons.json"          # beacon samples + station grid
+    SITELOG_PATH = "~/.aether-gate/site-log.jsonl"        # every beacon score and noise verdict, kept
     NULLABLE_COHERENCE = 0.4     # below this the noise has no direction to null
 
     def __init__(self, adapter):
@@ -161,6 +172,10 @@ class _DiversityState:
         self._voice_checked = False         # the running over has been judged against its print
         self.voice_splits = 0               # overs moved off a recalled talker by their voice
         self.profile = None                 # what kind of noise this is (core.noiseprofile)
+        # what this site measures is KEPT: the compass fit, the loops' installed
+        # patterns and the propagation table are all read back out of this
+        self.sitelog = _sl().SiteLog(os.path.expanduser(self.SITELOG_PATH))
+        self._last_beacon = None
         self.beacons = None                 # the NCDXF beacons on the pair (core.beacons)
         # spatial map: rebuilt whenever the hardware centre or rate moves,
         # since its bins are absolute frequencies
@@ -274,6 +289,10 @@ class _DiversityState:
             if self.beacons is None or self.beacons.rate_hz != float(self.a.samp_rate):
                 self.beacons = self._beacon_watch()
             self.beacons.update(a, b, float(self.a.center_hz), time.time())
+            last = self.beacons.last
+            if last is not self._last_beacon:       # one slot scored: keep it
+                self._last_beacon = last
+                self.sitelog.beacon_result(last)
         if self.nb_on:
             a, b, frac = _dv().blank_impulses(a, b, self.nb_db)
             self.blanked_pct = 0.9 * self.blanked_pct + 0.1 * 100.0 * frac
@@ -554,7 +573,15 @@ class _DiversityState:
         st["kinds"] = _npk().noise_kinds(
             st, coh, self.mode, self.nb_on, self.blanked_pct,
             self.NULLABLE_COHERENCE, filt.status() if filt is not None else None)
+        self.sitelog.noise_status(st, self.a.samp_rate, self.a.center_hz, coh)
         return st
+
+    def compass_json(self):
+        """The pair's array response fitted from the beacons it has heard, and
+        the bearing(s) the active slice's configured phase points at. The log
+        keeps B relative to A; the tracker reports the opposite sign."""
+        ph, _ra = _dv().weight_to_polar(self._configured_weight(self.active_slice))
+        return _cp().compass_json(self.sitelog, phase_deg=-ph)
 
     def _memory_status(self, sid):
         """The memory's entries with each talker's voice/rig print attached."""

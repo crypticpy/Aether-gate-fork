@@ -607,3 +607,15 @@ def test_the_profile_arms_the_blanker_unless_the_operator_says_on_or_off():
     assert st.status()["nb"]["auto"]["mode"] == "auto"
     with pytest.raises(ValueError):
         st.set(nb="sometimes")
+
+
+def test_a_polled_noise_verdict_is_kept_in_the_site_log_and_the_compass_says_why_not_yet():
+    st = _aligned_state()
+    rng = np.random.default_rng(3)
+    for _ in range(3):
+        st.ingest(_white(rng, BLOCK), _white(rng, BLOCK))
+    st.status()                                     # the poll is what writes
+    kinds = [e["kind"] for e in st.sitelog.read()]
+    assert kinds.count("noise") == 1
+    cp = st.compass_json()
+    assert cp["available"] is False and "3" in cp["reason"]

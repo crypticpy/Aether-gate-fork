@@ -1572,6 +1572,11 @@ class SoapyAdapter(RadioAdapter):
             return {"available": False}
         return self._div.beacons_json()
 
+    def diversity_compass(self):
+        if self._div is None:
+            return {"available": False}
+        return self._div.compass_json()
+
     def diversity_finder(self):
         if self._div is None:
             return {"available": False}

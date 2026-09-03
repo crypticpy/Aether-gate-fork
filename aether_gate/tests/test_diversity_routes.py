@@ -106,6 +106,10 @@ class FakeDiversityAdapter:
                 "phase_deg": [0.0, 90.0, -120.0, 10.0], "coherence": [0.1, 0.9, 0.8, 0.2],
                 "level_db": [-90.0, -70.0, -72.0, -88.0], "passband_hz": None}
 
+    def diversity_compass(self):
+        self.calls.append(("compass", {}))
+        return {"available": False, "reason": "2 beacon(s) with a bearing and a ratio, 3 needed"}
+
     def diversity_beacons(self):
         self.calls.append(("beacons", {}))
         return {"available": True, "band_hz": 14100000.0, "slot": 3,
@@ -657,6 +661,14 @@ def test_beacons_route_passes_the_adapter_answer_through():
     assert bc["available"] and bc["now"]["call"] == "KH6RS"
     assert bc["results"][0]["call"] == "W6WX" and bc["results"][0]["lowest_w"] == 1.0
     assert ("beacons", {}) in a.calls
+
+
+def test_compass_route_passes_the_adapter_answer_through():
+    a = FakeDiversityAdapter()
+    _, port = _start(a)
+    cp = _get(port, "/diversity/compass")
+    assert cp["available"] is False and "3" in cp["reason"]
+    assert ("compass", {}) in a.calls
 
 
 def test_stereo_is_a_source_the_route_accepts():

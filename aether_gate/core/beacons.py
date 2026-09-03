@@ -11,9 +11,10 @@ known directions, every three minutes, for free.
 
 For a two-loop pair that is a calibration lab. Per beacon and band:
 
-  * SNR on each loop (in a 500 Hz bandwidth, the CW convention) and the
-    pair's phase difference and coherence at the beacon's frequency (the
-    phase from a known direction is what a geometry solve wants);
+  * SNR on each loop (in a 500 Hz bandwidth, the CW convention), each
+    loop's noise floor, and the pair's complex ratio and coherence at the
+    beacon's frequency (the ratio from a known direction is what a geometry
+    solve wants -- see core/compass.py, which fits the array from these);
   * which of the four power steps was still heard: the band's real reach in
     dB, not a guess from the noise floor;
   * how much the second loop would add (the MRC bound from the two SNRs).
@@ -242,6 +243,11 @@ class BeaconWatch:
         k = int(np.argmax(np.where(search, mean_spec, -np.inf)))
         others = ~search
         floor_a = float(np.median(Paa[:, others])); floor_b = float(np.median(Pbb[:, others]))
+        # each loop's own floor, in the same REF_BW_HZ convention as the SNRs
+        # and in dBFS: an unwindowed c-point FFT of a signal of power P has
+        # E|X_k|^2 = c*P per bin, so per-bin power -> power in REF_BW_HZ is
+        # ref - 20 log10 c. snr_a + floor_a_db is then the beacon's level.
+        floor_ref = ref - 20.0 * math.log10(c)
         pa = Paa[:, k]; pb = Pbb[:, k]; p = pa + pb
         floor = floor_a + floor_b
         # 1 s moving average, the 100 W dash is the strongest second
@@ -272,6 +278,11 @@ class BeaconWatch:
             saa = float(np.sum(pa[strong])); sbb = float(np.sum(pb[strong]))
             phase = math.degrees(math.atan2(xab.imag, xab.real))
             coh = min(1.0, abs(xab) ** 2 / max(saa * sbb, 1e-30))
+            # B relative to A, COMPLEX: the least-squares S_ba / S_aa over the
+            # strong chunks. phase_deg below is the cross-spectrum's angle and
+            # so the NEGATIVE of this one's; the pair keeps both because an
+            # N-element array wants a steering vector, not an angle.
+            ratio = complex(np.conj(xab) / max(saa, 1e-30))
             sa = max(float(np.mean(pa[strong])) - floor_a, 0.0)
             sb = max(float(np.mean(pb[strong])) - floor_b, 0.0)
             snr_a = 10.0 * math.log10(max(sa, 1e-30) / max(floor_a, 1e-30)) - ref
@@ -279,7 +290,7 @@ class BeaconWatch:
             r = min(sa / sb, sb / sa) if sa > 0 and sb > 0 else 0.0
             gain = 10.0 * math.log10(1.0 + r)
         else:
-            phase = coh = None
+            phase = coh = ratio = None
             snr_a = snr_b = gain = None
         call, loc = BEACONS[(idx - BANDS_HZ.index(band)) % SLOTS]
         res = {
@@ -290,6 +301,9 @@ class BeaconWatch:
             "snr_b": None if snr_b is None else round(snr_b, 1),
             "phase_deg": None if phase is None else round(phase, 1),
             "coherence": None if coh is None else round(coh, 2),
+            "ratio": None if ratio is None else [round(ratio.real, 4), round(ratio.imag, 4)],
+            "floor_a_db": round(10.0 * math.log10(max(floor_a, 1e-30)) + floor_ref, 1),
+            "floor_b_db": round(10.0 * math.log10(max(floor_b, 1e-30)) + floor_ref, 1),
             "gain_db": None if gain is None else round(gain, 1),
             "steps_db": [round(d - ref, 1) for d in steps],
             "steps_heard": int(steps_heard),
