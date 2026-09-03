@@ -44,6 +44,11 @@ def _sp():
     return spatial
 
 
+def _nba():
+    from ..core import nbarm
+    return nbarm
+
+
 def _fd():
     from ..core import finder
     return finder
@@ -143,6 +148,7 @@ class _DiversityState:
         self.last_align = {"lag": 0, "peak": 0.0, "ok": False, "why": None}
         # noise blanker
         self.nb_on = False
+        self.nbarm = _nba().NbArm()      # the profile arms it until the operator says on/off
         self.balance = _balance().LoopBalance()   # G7: a sick loop, said out loud
         self.nb_db = self.NB_DEFAULT_DB
         self.blanked_pct = 0.0
@@ -261,6 +267,10 @@ class _DiversityState:
             if self.profile is None or self.profile.rate_hz != float(self.a.samp_rate):
                 self.profile = _npf().NoiseProfile(self.a.samp_rate)
             self.profile.update(a, b)
+            d = self.nbarm.update(self.profile.status(), time.time())
+            self.nb_on = d.nb_on
+            if d.threshold is not None:
+                self.nb_db = d.threshold
             if self.beacons is None or self.beacons.rate_hz != float(self.a.samp_rate):
                 self.beacons = self._beacon_watch()
             self.beacons.update(a, b, float(self.a.center_hz), time.time())
@@ -511,7 +521,8 @@ class _DiversityState:
                                 if t is not None and t.Rn is not None else None),
             "updates": int(t.updates) if t is not None else 0,
             "nb": {"enabled": self.nb_on, "threshold_db": self.nb_db,
-                   "blanked_pct": round(self.blanked_pct, 2)},
+                   "blanked_pct": round(self.blanked_pct, 2),
+                   "auto": self.nbarm.status()},
             "subband": {"enabled": self.subband_on,
                         **(self.subbands[sid].status() if sid in self.subbands
                            else {"bins": 0, "extra_db": 0.0})},
@@ -722,7 +733,11 @@ class _DiversityState:
                 raise ValueError(f"pan must be one of {self.PANS}")
             self.pan = pan
         if nb is not None:
-            self.nb_on = bool(nb)
+            # True/False are the old callers; "auto" hands it to the profile
+            mode = nb if isinstance(nb, str) else ("on" if nb else "off")
+            self.nbarm.set_mode(mode)           # ValueError on junk
+            if mode != "auto":
+                self.nb_on = mode == "on"
         if nb_db is not None:
             nb_db = float(nb_db)
             if not (0.0 <= nb_db <= 40.0):

@@ -75,8 +75,10 @@ def test_blanker_zeroes_an_impulse_on_both_channels_and_reports_it():
     assert a2[1000] == 0 and b2[1000] == 0
     assert a2[998] == 0 and b2[1002] == 0                    # widened by 2 samples
     assert np.count_nonzero(a2 == 0) <= 5
-    assert st.status()["nb"] == {"enabled": True, "threshold_db": 12.0,
-                                 "blanked_pct": pytest.approx(100 * 5 / BLOCK * 0.1, rel=0.2)}
+    nb = st.status()["nb"]
+    assert (nb["enabled"], nb["threshold_db"]) == (True, 12.0)
+    assert nb["blanked_pct"] == pytest.approx(100 * 5 / BLOCK * 0.1, rel=0.2)
+    assert nb["auto"]["mode"] == "on"
     st.set(nb=False)
     _pan, (a3, b3) = st.ingest(a, b)
     assert a3[1000] == a[1000]                               # off: untouched
@@ -590,3 +592,18 @@ def test_the_station_grid_builds_the_beacon_watch_and_rides_in_its_status(tmp_pa
     assert st.beacons_json()["station_grid"] == "EM10"
     st.set(grid="")
     assert st.beacons_json()["station_grid"] is None
+
+
+def test_the_profile_arms_the_blanker_unless_the_operator_says_on_or_off():
+    st = _aligned_state()
+    assert st.status()["nb"]["auto"]["mode"] == "auto"
+    st.set(nb="on")
+    assert st.nb_on is True
+    assert st.status()["nb"]["auto"]["mode"] == "on"
+    st.set(nb=False)                    # the old boolean callers still work
+    assert st.nb_on is False
+    assert st.status()["nb"]["auto"]["mode"] == "off"
+    st.set(nb="auto")
+    assert st.status()["nb"]["auto"]["mode"] == "auto"
+    with pytest.raises(ValueError):
+        st.set(nb="sometimes")

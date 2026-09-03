@@ -3989,9 +3989,9 @@ def start_control_server(radio, port):
                         kwargs["slice_id"] = int(q["slice"][0])
                     if "nb" in q:
                         nb = q["nb"][0]
-                        if nb not in ("on", "off"):
+                        if nb not in ("auto", "on", "off"):
                             raise ValueError(f"nb={nb!r}")
-                        kwargs["nb"] = nb == "on"
+                        kwargs["nb"] = nb if nb == "auto" else nb == "on"
                     if "nb_db" in q:
                         nb_db = float(q["nb_db"][0])
                         if not math.isfinite(nb_db) or not (0.0 <= nb_db <= 40.0):
