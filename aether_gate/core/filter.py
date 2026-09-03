@@ -227,6 +227,7 @@ class SliceFilter:
         self.auto_high = None
         self.auto_source = None
         self.anf_found = []                       # [(signed hz, width)]
+        self.squeeze_notches = []                 # [(signed hz, width)], SQUEEZE's own table
         self.eq_tilt_db = 0.0                     # the tilt measured (print or spectrum)
         self.auto_bell = None                     # (hz, db, width) fitted to the talker
         self.auto_bell_source = None              # "print" while a bell is fitted
@@ -332,6 +333,20 @@ class SliceFilter:
             self.spec.notches = [n for n in self.spec.notches if abs(n["hz"] - float(hz)) > 1.0]
         self.dirty = True
 
+    def set_squeeze_notches(self, notches):
+        """SQUEEZE's own notch table (core.squeeze/adapters.diversity_squeeze,
+        the target's bins when coherence has it on the notch tool rather than
+        the null) -- kept apart from the operator's own table and the ANF's:
+        released with squeeze=off, never touched by notch_add/notch_clear or
+        counted in their status. A no-op when the table has not actually
+        changed -- called every combined block while the notch tool holds,
+        and a redesign (DESIGN_N=4096) is not free."""
+        new = [(round(float(hz), 1), round(float(w), 1)) for hz, w in notches]
+        if new == [(round(hz, 1), round(w, 1)) for hz, w in self.squeeze_notches]:
+            return
+        self.squeeze_notches = new
+        self.dirty = True
+
     # ----- the sideband's sign ------------------------------------------
     def _sign(self):
         return -1.0 if self.lsb else 1.0
@@ -360,6 +375,7 @@ class SliceFilter:
         sgn = self._sign()
         notches = [(sgn * n["hz"], n["width_hz"]) for n in s.notches] if s.notches_on else []
         notches += [(hz, w) for hz, w in self.anf_found]
+        notches += list(self.squeeze_notches)
         contour = self._contour()
         if contour is not None:
             contour = (sgn * contour[0], contour[1], contour[2])

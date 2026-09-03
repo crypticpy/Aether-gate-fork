@@ -70,6 +70,7 @@ class SubbandCombiner:
         self.refined_bins = 0
         self.extra_db = 0.0               # noise the per-bin weights remove beyond the wideband one
         self.post = None                  # PostFilter, when the coherence post-filter is on
+        self._squeeze = None              # ([(hz, width_hz), ...], null_m), while a SQUEEZE is forcing bins
 
     def set_post(self, on, floor_db=None):
         if not on:
@@ -77,6 +78,34 @@ class SubbandCombiner:
         elif self.post is None or (floor_db is not None and self.post.floor_db != floor_db):
             self.post = PostFilter(self.rate_hz, self.n, self.h,
                                    **({} if floor_db is None else {"floor_db": floor_db}))
+
+    def set_squeeze(self, held, targets, null_m):
+        """A held core.squeeze target forces its own bins to its null (see
+        _force_null); anything else here leaves every bin to the MVDR fit
+        below, same as before SQUEEZE existed. targets: [(hz, width_hz),
+        ...] -- one region for a signal target, one per tooth for a comb,
+        all forced to the SAME null_m: one source, one steering vector."""
+        self._squeeze = (list(targets), complex(null_m)) if held and targets else None
+
+    def _force_null(self, v, s):
+        """Overwrite v's bins in every target's span -- each dilated by two
+        bins either side, the same padding the tracker's own null gets
+        nulling an interferer's over -- with the squeeze's null,
+        distortionless on s like every other bin (see _weights): the talker
+        still passes at unit gain everywhere the squeeze itself is not."""
+        targets, m_null = self._squeeze
+        bin_hz = self.rate_hz / self.n
+        freqs = np.fft.fftfreq(self.n, 1.0 / self.rate_hz)
+        mask = np.zeros(self.n, dtype=bool)
+        for hz, width in targets:
+            mask |= np.abs(freqs - hz) <= width / 2.0 + 2.0 * bin_hz
+        if not mask.any():
+            return v
+        vt = np.array([1.0, m_null], dtype=np.complex128)
+        g = vt @ s
+        v = v.copy()
+        v[mask] = vt / (g if abs(g) > 1e-9 else 1.0)
+        return v
 
     # --- the noise model -------------------------------------------------------
     def _learn(self, Xa, Xb):
@@ -151,6 +180,8 @@ class SubbandCombiner:
             if not talking:
                 self._learn(Xa, Xb)
             v, self.refined_bins, self.extra_db = self._weights(m, s)
+            if self._squeeze is not None:
+                v = self._force_null(v, s)
             v = np.stack([_smooth_bins(v[:, 0]), _smooth_bins(v[:, 1])], axis=1)
             if self.v is None:
                 self.v = v

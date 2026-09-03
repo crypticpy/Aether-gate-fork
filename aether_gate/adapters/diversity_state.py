@@ -4,22 +4,16 @@
 #
 """_DiversityState: everything the Soapy adapter keeps for an RSPduo whose two
 tuners flow on one stream. core/diversity and core/spatial hold the maths;
-this module wires them to the adapter's three threads:
-
-  READER   ingest(a, b): alignment measurement, the noise blanker, the raw
-           two-channel capture, the per-bin spatial map, and the block the
-           panadapter and meters see (A, B, the slice's beam, or the map's
-           per-bin nulls).
-  AUDIO    observe(sid, xa, xb): the slice's tracker sees the in-band and
-           guard-band covariances of the mixed blocks and hands back the
-           (previous, new) weight pair the demod ramps between.
-  CONTROL  status()/set()/map()/capture()/memory_clear().
+this module wires them to the adapter's three threads: READER ingest(a, b)
+(alignment, blanker, raw capture, spatial map, pan block); AUDIO
+observe(sid, xa, xb) (the tracker's covariances, the (previous, new) weight
+pair the demod ramps between); CONTROL status()/set()/map()/capture().
 
 Every shared value is a scalar, a small dict swapped whole, or an object
-replaced atomically, so readers need no lock; the two accumulations two
-threads share (calibration, capture) take one. The optional stages live in
-diversity_enhance. Weights are PER SLICE (the beam is arithmetic on the same
-two streams); the panadapter and S-meter follow active_slice.
+replaced atomically, so readers need no lock; calibration/capture share one.
+Optional stages live in diversity_enhance (post/mrc/compass) and
+diversity_squeeze (SQUEEZE). Weights are PER SLICE; the panadapter and
+S-meter follow active_slice.
 """
 import os
 import threading
@@ -113,6 +107,16 @@ def _balance():
     return balance
 
 
+def _sq():
+    from ..core import squeeze
+    return squeeze
+
+
+def _dsq():
+    from . import diversity_squeeze
+    return diversity_squeeze
+
+
 def _is_fm(mode):
     return (mode or "").upper() in ("FM", "NFM", "DFM")
 
@@ -172,6 +176,7 @@ class _DiversityState:
         self.post_on = True                 # the coherence post-filter (core.postfilter)
         self.post_floor_db = None           # None = the module's default
         self.enh = _en().Enhancers()        # post=v2, mrc, time signals, the compass cache
+        self.squeeze = _sq().Squeeze()      # SQUEEZE: hold a null on one chosen signal
         self.prints = {}                    # sid -> VoicePrint (per talker voice/rig prints)
         self._voice_checked = False         # the running over has been judged against its print
         self.voice_splits = 0               # overs moved off a recalled talker by their voice
@@ -206,9 +211,8 @@ class _DiversityState:
 
     def _configured_weight(self, sid):
         """What the operator has dialled in for slice sid, regardless of
-        whether the aligner currently trusts the two channels enough to
-        combine them. Used by status() so the UI shows what is set even
-        while weight_for() is holding at 0j."""
+        whether the aligner trusts the two channels enough to combine them --
+        status() uses this so the UI shows what is set while weight_for() holds at 0j."""
         if self.mode == "off":
             return 0j
         if self.mode == "manual":
@@ -218,13 +222,10 @@ class _DiversityState:
 
     def weight_for(self, sid):
         """The complex weight ACTUALLY used to combine A and B for slice sid.
-
         0j (channel A alone) whenever the aligner is not aligned, in every
-        mode — including manual m=1. Combining two streams the aligner has
+        mode -- including manual m=1: combining two streams the aligner has
         not credibly locked adds a decorrelated copy of the same signal,
-        which costs ~3 dB SNR rather than gaining anything (found in review,
-        F10).
-        """
+        costing ~3 dB SNR rather than gaining anything (found in review, F10)."""
         if not self.aligner.aligned:
             return 0j
         return self._configured_weight(sid)
@@ -374,9 +375,8 @@ class _DiversityState:
 
     def _bands(self, n, rate, mode):
         """(in-band index, guard index) for a length-n spectrum of the MIXED
-        block: the slice sits at DC, so the passband is what _init_demod
-        builds around it. The guard bands sit GUARD_GAP_HZ beyond each edge
-        and are as wide as the passband."""
+        block: the slice sits at DC, the passband is what _init_demod builds
+        around it; the guard bands sit GUARD_GAP_HZ beyond each edge, equally wide."""
         np = self.a._np
         f = np.fft.fftfreq(n, 1.0 / rate)
         lo, hi = self._pass_edges(mode)
@@ -399,15 +399,16 @@ class _DiversityState:
             w = self._window(n)
             X = np.fft.fft(np.stack([xa[:n], xb[:n]]) * w, axis=1)
             idx_in, idx_g = self._bands(n, rate, getattr(self.a, "_mode", "USB"))
+            f = np.fft.fftfreq(n, 1.0 / rate)
+            sq = _dsq().observe(self, t, X, f, n, rate, time.time())
             rc = _sp().region_covariance
-            t.update(rc(X, idx_in), rc(X, idx_g, trim=True), n, self.mode)
+            t.update(rc(X, idx_in), rc(X, idx_g, trim=True), n, self.mode, squeeze=sq)
             if t.Rn is not None:
                 self.balance.update(t.Rn, time.monotonic())
             pb = self.passband.get(sid)
             if pb is None:
                 from ..core.passband import PassbandPhase
                 pb = self.passband[sid] = PassbandPhase(rate)
-            f = np.fft.fftfreq(n, 1.0 / rate)
             pb.update(X[0][idx_in], X[1][idx_in], f[idx_in], n, t.talking)
         m1 = self.weight_for(sid)
         m0 = self.last_m.get(sid, m1)
@@ -454,8 +455,8 @@ class _DiversityState:
         return out
 
     def _passband_hz(self):
-        """Where the receiver's passband sits inside the span, so a strip can
-        mark it: absolute Hz, or None when the adapter has no slice yet."""
+        """Where the passband sits inside the span (absolute Hz), or None
+        when the adapter has no slice yet -- so a strip can mark it."""
         slice_hz = getattr(self.a, "_slice_hz", None)
         if slice_hz is None:
             return None
@@ -534,14 +535,14 @@ class _DiversityState:
                                               nulling=bool(t.interferer) if t is not None else False),
             "capture": self._cap.status(),
             "sitelog": self.sitelog.status(),
+            "squeeze": _dsq().status(self, sid),
             "slice_id": sid,
         }
 
     def _noise_profile(self, t):
         """The profile's numbers plus `kinds`: one row per thing found, each
-        naming what it is, how long it was measured over, and the one
-        control-port call that does something about it (or why nothing can).
-        The kinds themselves are built in noise_kinds.py (see there)."""
+        naming what it is, how long it was measured, and the one control-port
+        call that does something about it (or why nothing can; built in noise_kinds.py)."""
         if self.profile is None:
             return None
         st = self.profile.status()
@@ -558,9 +559,8 @@ class _DiversityState:
         return st
 
     def compass_json(self):
-        """The pair fitted from the beacons, the bearing(s) the active slice's
-        phase points at (log: B rel. A; tracker: the opposite sign), and under
-        "noise" which way the noise floor itself points (core.noisebearing)."""
+        """The beacon fit, the bearing(s) the active slice's phase points at (log:
+        B rel. A; tracker: opposite sign), and "noise": the floor's own bearing."""
         ph, _ra = _dv().weight_to_polar(self._configured_weight(self.active_slice))
         slice_hz = getattr(self.a, "_slice_hz", None)        # where the phase was measured
         out = dict(self.enh.compass(self.sitelog, -ph,
@@ -668,18 +668,14 @@ class _DiversityState:
         return y
 
     def _combine(self, sid, pa, pb, m0, m1, rate_hz):
-        """The demod passband pair of slice sid -> one combined block.
-
-        In null/track with the sub-band refinement on, every bin gets its own
-        weight (core.subband): the tracker's wideband weight, refined to a
-        per-bin null wherever the learned noise has a direction, with the
-        talker's steering vector held distortionless. Otherwise, and whenever
-        the pair is not aligned, the wideband combiner with its click-free
-        ramp from m0 to m1.
-
-        HEAR a / b hands that loop's passband straight through; stereo hands
-        both as an (n, 2) array, A left and B right. The tracker keeps
-        learning from observe() either way, so a comparison costs nothing."""
+        """The demod passband pair of slice sid -> one combined block. In
+        null/track with the sub-band refinement on: core.subband's per-bin
+        MVDR, forced to SQUEEZE's own null in its own bins while one holds
+        there (core.squeeze; the wideband m untouched). Otherwise, or
+        whenever the pair is not aligned: the wideband combiner's
+        click-free ramp from m0 to m1. HEAR a/b passes straight through;
+        stereo hands (n, 2), A left, B right -- observe() still learns."""
+        _dsq().sync_notches(self, self.squeeze)   # the notch tool: filter.py, any combine path
         if self.hear != "combined":
             return self._monitor(pa, pb)
         if self.enh.post_v2 and self.aligner.aligned and self.mode != "off":
@@ -696,6 +692,7 @@ class _DiversityState:
         if sb is None or sb.rate_hz != float(rate_hz):
             sb = self.subbands[sid] = _sb().SubbandCombiner(rate_hz)
         sb.set_post(self.post_on, self.post_floor_db)
+        _dsq().subband_squeeze(self.squeeze, sb)
         s = None
         if t.Rs is not None and t.Rn is not None:
             S = t.Rs - t.Rn
@@ -712,10 +709,13 @@ class _DiversityState:
     def set(self, mode=None, phase_deg=None, ratio_db=None, source=None, sid=None,
             nb=None, nb_db=None, pan=None, null_source=None, focus=None, subband=None,
             grid=None, post=None, post_floor_db=None, mrc=None, assume_hz=None,
-            assume_call=None, antenna=None):
+            assume_call=None, antenna=None, squeeze=None, squeeze_width=None,
+            spacing=None, offset=None):
         sid = self.active_slice if sid is None else int(sid)
         if antenna is not None:            # free text, e.g. 'K-480WLA HF, gain HIGH'
             self.sitelog.antenna = str(antenna).strip()[:80]
+        if squeeze is not None or squeeze_width is not None or spacing is not None:
+            _dsq().set_squeeze(self, squeeze, squeeze_width, spacing, offset)
         if post is not None:
             v2 = post == "v2"
             self.post_on = True if v2 else bool(post)

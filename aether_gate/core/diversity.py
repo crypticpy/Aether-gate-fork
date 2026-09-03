@@ -440,8 +440,16 @@ class Tracker:
     def Rn(self):
         return self.Rn_in if self.rn_source == "inband" else self.Rn_guard
 
-    def update(self, R_in, R_guard, n, mode):
-        """One block: in-band and guard-band covariances, n samples of signal."""
+    def update(self, R_in, R_guard, n, mode, squeeze=None):
+        """One block: in-band and guard-band covariances, n samples of signal.
+
+        `squeeze` is a core.squeeze.Squeeze (or any duck of one -- held,
+        scope, null_m) the caller passes only while it should govern the
+        WHOLE passband, i.e. while its own scope is "passband" (the
+        sub-band refinement is off): a held squeeze then wins outright,
+        the same way a focus's interferer null does, and no ordinary
+        refit -- idle null, focus null, or track -- runs underneath it.
+        Pass None (or scope "bins") to leave the weight to the tracker."""
         if n <= 0 or R_in is None:
             return
         R_in = np.asarray(R_in, dtype=np.complex128)
@@ -536,7 +544,10 @@ class Tracker:
         self._since_fit += dt
         if mode in ("null", "track") and self._since_fit >= self.refresh_s:
             self._since_fit = 0.0
-            if mode == "track" and self.interferer:
+            if squeeze is not None and squeeze.held and squeeze.scope == "passband":
+                self.m = squeeze.null_m          # SQUEEZE wins outright: see update()'s docstring
+                self.updates += 1
+            elif mode == "track" and self.interferer:
                 self._null_interferer()     # a focus holds: this over is not wanted
             elif mode == "track" and not self._onset_done \
                     and self._quiet_s >= IDLE_NULL_AFTER_S \

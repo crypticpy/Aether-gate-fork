@@ -4104,6 +4104,30 @@ def start_control_server(radio, port):
                             kwargs["focus"] = int(focus)
                         else:
                             kwargs["focus"] = ""
+                    if "squeeze" in q:
+                        # squeeze=<hz> (signed, offset from the slice centre)
+                        # holds a null or notch there -- coherence decides
+                        # which (see core/squeeze.py); squeeze=comb auto-
+                        # detects a switch-mode/LED-driver comb from the next
+                        # ~2 s (or takes spacing=/offset= below, outright);
+                        # squeeze=off releases (a blank value never reaches
+                        # here: parse_qs drops it)
+                        squeeze = q["squeeze"][0].strip()
+                        if squeeze.lower() in ("", "off", "none"):
+                            kwargs["squeeze"] = ""
+                        elif squeeze.lower() == "comb":
+                            kwargs["squeeze"] = "comb"
+                        else:
+                            kwargs["squeeze"] = int(squeeze)
+                    if "squeeze_width" in q:
+                        # a signal target's width in Hz; ignored for a comb
+                        kwargs["squeeze_width"] = int(q["squeeze_width"][0])
+                    if "spacing" in q:
+                        # an explicit comb, with squeeze=comb -- otherwise
+                        # ignored (auto-detect does not take a spacing)
+                        kwargs["spacing"] = int(q["spacing"][0])
+                    if "offset" in q:
+                        kwargs["offset"] = int(q["offset"][0])
                 except (ValueError, TypeError) as e:
                     return self._json({"error": f"bad value: {e}"})
                 log(f"[ctl] diversity/set -> {kwargs}")

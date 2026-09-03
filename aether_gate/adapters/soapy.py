@@ -1849,14 +1849,17 @@ class SoapyAdapter(RadioAdapter):
     def set_diversity(self, mode=None, phase_deg=None, ratio_db=None, source=None,
                       slice_id=None, nb=None, nb_db=None, pan=None, null_source=None,
                       focus=None, subband=None, grid=None, post=None, post_floor_db=None,
-                      mrc=None, assume_hz=None, assume_call=None, antenna=None):
+                      mrc=None, assume_hz=None, assume_call=None, antenna=None,
+                      squeeze=None, squeeze_width=None, spacing=None, offset=None):
         if self._div is None:
             return {"available": False}
         return self._div.set(mode, phase_deg, ratio_db, source, slice_id,
                              nb=nb, nb_db=nb_db, pan=pan, null_source=null_source,
                              focus=focus, subband=subband, grid=grid, post=post,
                              post_floor_db=post_floor_db, mrc=mrc, assume_hz=assume_hz,
-                             assume_call=assume_call, antenna=antenna)
+                             assume_call=assume_call, antenna=antenna,
+                             squeeze=squeeze, squeeze_width=squeeze_width,
+                             spacing=spacing, offset=offset)
 
     def diversity_realign(self):
         if self._div is None:
