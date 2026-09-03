@@ -348,6 +348,14 @@ def test_a_short_burst_does_not_train_the_signal_covariance():
 
 # --- talker memory ------------------------------------------------------------
 
+def _bearing(theta):
+    """A unit steering vector at a bearing far enough from bearing 0 (and
+    from every other _bearing(k) used below, k an integer or half-integer)
+    that MEMORY_MATCH never merges or recalls across them."""
+    v = np.array([1.0, np.exp(1j * theta)])
+    return v / np.linalg.norm(v)
+
+
 def test_memory_steers_a_known_talker_in_one_block():
     rng = np.random.default_rng(17)
     mem = TalkerMemory()
@@ -415,7 +423,7 @@ def test_memory_matches_on_bearing_not_exact_vector():
     for k in range(20):
         v = np.array([1.0, np.exp(1j * 0.3 * k)]) / np.sqrt(2)
         mem.store(v, complex(k), now=float(k))
-    assert len(mem.entries) <= 8
+    assert len(mem.entries) <= mem.max_n
 
 
 # --- ramps and the blanker -----------------------------------------------------
@@ -615,6 +623,69 @@ def test_memory_never_evicts_the_focused_talker():
     mem.store(np.array([1.0, np.exp(1j * 2.5)]) / np.sqrt(2), 0j, 3.0)
     assert len(mem.entries) == 2
     assert mem.focus_entry() is not None
+
+
+# --- eviction order: a named regular must not be bumped for a stranger --------
+
+def test_eviction_prefers_the_oldest_cold_stranger():
+    """Two one-off callers nobody has recognised again (hits == 0): a third
+    fills the memory, and the LONGER-STANDING stranger is the one to go,
+    not the one that just walked in."""
+    mem = TalkerMemory(max_n=2)
+    mem.store(_bearing(0.0), 0j, now=0.0)      # id 1: the older stranger
+    mem.store(_bearing(1.5), 0j, now=1.0)      # id 2: the younger stranger
+    mem.store(_bearing(3.0), 0j, now=2.0)      # id 3: a third caller, memory full
+    ids = {e["id"] for e in mem.entries}
+    assert ids == {2, 3}, [(e["id"], e["hits"], e["first_seen"]) for e in mem.entries]
+
+
+def test_eviction_takes_a_cold_stranger_before_a_recognised_or_named_voice():
+    """A sole hits-0 unnamed entry is evicted ahead of an unnamed entry that
+    has been recalled before (hits > 0, even with an older last_seen) and
+    ahead of a named entry -- exactly the busy-net case: the regular and the
+    voice heard twice both outrank a stranger heard once."""
+    mem = TalkerMemory(max_n=2)
+    mem.names_path = None                      # never the operator's live file
+    mem.store(_bearing(0.0), 0j, now=0.0)       # id 1
+    mem.recall(_bearing(0.0), now=1.0)          # id 1: hits=1, last_seen=1.0
+    mem.store(_bearing(1.5), 0j, now=2.0)       # id 2: hits=0, memory full
+    # id 3 arrives already named, as if this bearing was named in an earlier
+    # session (see test_memory_names_survive_a_restart_by_signature)
+    mem._named.append({"s": _bearing(3.0), "name": "Cara", "voice": None})
+    mem.store(_bearing(3.0), 0j, now=3.0)       # id 3, named on arrival
+    assert {e["id"]: e["name"] for e in mem.entries} == {1: None, 3: "Cara"}
+
+
+def test_eviction_among_unnamed_recognised_voices_takes_the_oldest_last_seen():
+    """With no hits-0 stranger in the running, eviction picks the unnamed
+    voice heard longest ago -- and a named regular survives even though its
+    own last_seen is far older than either candidate."""
+    mem = TalkerMemory(max_n=3)
+    mem.names_path = None
+    mem.store(_bearing(0.0), 0j, now=0.0)
+    mem.name(1, "Zack")                         # id 1: named, last_seen 0.0 (oldest of all)
+    mem.store(_bearing(1.5), 0j, now=1.0)
+    mem.recall(_bearing(1.5), now=3.0)           # id 2: unnamed, hits=1, last_seen 3.0
+    mem.store(_bearing(3.0), 0j, now=1.2)
+    mem.recall(_bearing(3.0), now=2.5)           # id 3: unnamed, hits=1, last_seen 2.5 (older)
+    mem._named.append({"s": _bearing(4.5), "name": "Wendy", "voice": None})
+    mem.store(_bearing(4.5), 0j, now=4.0)        # id 4: named on arrival, memory full
+    ids = {e["id"] for e in mem.entries}
+    assert ids == {1, 2, 4}, [(e["id"], e["name"], e["hits"], e["last_seen"]) for e in mem.entries]
+
+
+def test_eviction_falls_back_to_the_oldest_named_entry_only_once_all_are_named():
+    """Every slot named: the fallback is the named entry heard longest ago,
+    not a refusal to evict."""
+    mem = TalkerMemory(max_n=2)
+    mem.names_path = None
+    mem.store(_bearing(0.0), 0j, now=0.0)
+    mem.name(1, "Alice")                        # id 1: last_seen 0.0, oldest
+    mem.store(_bearing(1.5), 0j, now=1.0)
+    mem.name(2, "Bob")                          # id 2: last_seen 1.0, memory full
+    mem._named.append({"s": _bearing(3.0), "name": "Charlie", "voice": None})
+    mem.store(_bearing(3.0), 0j, now=2.0)        # id 3: named on arrival too
+    assert {e["id"]: e["name"] for e in mem.entries} == {2: "Bob", 3: "Charlie"}
 
 
 def test_idle_time_between_overs_is_spent_nulling_the_noise():
