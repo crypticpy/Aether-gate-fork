@@ -373,9 +373,28 @@ def _agc_row(filt):
         action=_set("/filter/set", "agc="))
 
 
+def _governor_row(gov):
+    """AUTO CLEAN (B25), at the head of the chain because it is the thing
+    driving the rows below rather than a stage of its own. `gov` is
+    adapters/diversity_governor.py's status(), or None on an adapter with no
+    governor -- in which case there is no row at all, the same way the pair
+    rows are simply absent on a single-tuner device."""
+    if not gov:
+        return None
+    on = bool(gov.get("auto"))
+    held = [h["tool"] for h in (gov.get("holding") or [])]
+    return _row(
+        "auto_clean", "AUTO CLEAN", "toggle",
+        _dot("off" if not on else str(gov.get("state") or "idle"),
+             ("holding " + ", ".join(held)) if held else None,
+             gov.get("why")),
+        enabled=on,
+        action=_toggle("/diversity/set", "auto", on))
+
+
 # ----- the whole chain -------------------------------------------------------
 
-def chain_rows(filt, div=None, device=None, frontend=None):
+def chain_rows(filt, div=None, device=None, frontend=None, governor=None):
     """The chain, in signal order.
 
     filt      the slice filter's status (SliceFilter.status() plus the
@@ -388,9 +407,15 @@ def chain_rows(filt, div=None, device=None, frontend=None):
     frontend  {"gain_db", "gain_range": (lo, hi), "agc": bool} -- the two
               front-end numbers Soapy carries as a gain element rather than
               a setting.
+    governor  adapters/diversity_governor.py's status(), or None: AUTO CLEAN's
+              own row, at the head of the array because it drives the rest.
     """
     roofing = filt.get("roofing") or {}
-    rows = _frontend_rows(device, frontend)
+    rows = []
+    auto_clean = _governor_row(governor)
+    if auto_clean is not None:
+        rows.append(auto_clean)
+    rows.extend(_frontend_rows(device, frontend))
     roof_rf = _roof_rf_row(roofing)
     if roof_rf is not None:
         rows.append(roof_rf)

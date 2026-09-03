@@ -266,6 +266,7 @@ class SoapyAdapter(RadioAdapter):
         self.diversity_available = False    # True once two channels flow (see _open_hw)
         self._div = None                    # _DiversityState, dual-tuner only
         self._dig = None                    # DigRunner, built on the first dig
+        self._gov = None                    # GovernorRunner, built on auto=on
         self._device = (None, 0.0)          # device_block() and when it was made
         # Staged-decimation + SSB/FM state for both channels, one object so a
         # rate change can never hand A and B different generations mid-call;
@@ -972,6 +973,8 @@ class SoapyAdapter(RadioAdapter):
 
     def close(self):
         self._run = False
+        if self._gov is not None:
+            self._gov.stop()
         if self._reader:
             self._reader.join(timeout=2)
         self._stop_stream()
@@ -1746,7 +1749,9 @@ class SoapyAdapter(RadioAdapter):
         # THE CHAIN. One row per stage in signal order, assembled in
         # chainstatus.py from the dicts above and nothing else -- see there for
         # why the gate authors these rows rather than the app.
-        st["chain"] = chain_rows(st, div, self._chain_device(), self._chain_frontend())
+        st["chain"] = chain_rows(st, div, self._chain_device(),
+                                 self._chain_frontend(),
+                                 self._gov.status() if self._gov is not None else None)
         # The VISUAL tab draws the SQUEEZE target (or comb teeth) on the
         # curve, so the block rides along with the rows it explains.
         if div:
@@ -1922,6 +1927,23 @@ class SoapyAdapter(RadioAdapter):
         if seconds is not None:
             return self._dig.start(seconds, hz=hz)
         return self._dig.status()
+
+    def diversity_governor(self, auto=None):
+        """B25 AUTO CLEAN: the governor's status, or its one switch.
+
+        `auto=True/False` turns it on and off; bare is status. One runner,
+        built on first use so an adapter that never governs never makes one --
+        the same shape as diversity_dig above, and the same reach: it drives
+        this adapter's own public setters and nothing else.
+        """
+        if self._div is None:
+            return {"available": False}
+        if self._gov is None:
+            from .diversity_governor import GovernorRunner
+            self._gov = GovernorRunner(self)
+        if auto is not None:
+            return self._gov.set_auto(auto)
+        return self._gov.status()
 
     def diversity_memory_clear(self):
         if self._div is not None:

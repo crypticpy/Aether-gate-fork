@@ -213,6 +213,23 @@ def test_the_squeeze_row_quotes_the_tool_and_releases_while_held():
     assert row["action"]["query"] == "squeeze=off" and row["value"] == "comb"
 
 
+def test_the_auto_clean_row_heads_the_chain_only_when_a_governor_exists():
+    assert _rows()[0]["id"] == "antenna"
+    gov = {"auto": True, "state": "settling",
+           "holding": [{"tool": "squeeze"}, {"tool": "nb"}],
+           "why": "carrier at +1200 Hz: squeezed, waiting 2 s"}
+    rows = chain_rows(_filter(), _diversity(), _device(), _frontend(), gov)
+    row = rows[0]
+    _validate(row)
+    assert row["id"] == "auto_clean" and row["enabled"] is True
+    assert "settling" in row["detail"] and "holding squeeze, nb" in row["detail"]
+    assert gov["why"] in row["detail"]
+    assert row["action"] == {"label": "OFF", "route": "/diversity/set", "query": "auto=off"}
+    off = chain_rows(_filter(), _diversity(), _device(), _frontend(), {"auto": False})[0]
+    assert off["enabled"] is False and off["action"]["query"] == "auto=on"
+    assert off["detail"].startswith("off")
+
+
 def test_measured_appears_only_where_a_level_was_measured():
     rows = _rows()
     have = {r["id"] for r in rows if r.get("measured") is not None}

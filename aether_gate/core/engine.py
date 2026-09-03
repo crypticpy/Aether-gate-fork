@@ -4010,7 +4010,15 @@ def start_control_server(radio, port):
                 a = radio.adapter
                 if not getattr(a, "diversity_available", False):
                     return self._json({"available": False})
-                return self._json(a.diversity_status())
+                st = a.diversity_status()
+                gov = getattr(a, "diversity_governor", None)
+                if gov is not None and isinstance(st, dict):
+                    # B25: what AUTO is holding, next to what it is holding it
+                    # against. The adapter cannot add this key itself --
+                    # diversity_status() is _DiversityState's, and that module
+                    # is at its 800-line budget -- so the route merges it.
+                    st["governor"] = gov()
+                return self._json(st)
             if u.path == "/diversity/set":
                 a = radio.adapter
                 if not getattr(a, "diversity_available", False):
@@ -4128,6 +4136,21 @@ def start_control_server(radio, port):
                         kwargs["spacing"] = int(q["spacing"][0])
                     if "offset" in q:
                         kwargs["offset"] = int(q["offset"][0])
+                    if "auto" in q:
+                        # B25 AUTO CLEAN: the governor picks the tool the noise
+                        # actually wants, scores every move against the dig's
+                        # own objective and puts back the ones that cost dB.
+                        # Its own switch rather than a set_diversity kwarg --
+                        # it is a caller OF set_diversity, not a setting in it.
+                        # Off by default; off, it holds nothing.
+                        want = q["auto"][0].strip().lower()
+                        if want not in ("on", "off"):
+                            raise ValueError(f"auto={want!r} (want on|off)")
+                        gov = getattr(a, "diversity_governor", None)
+                        if gov is None:
+                            raise ValueError("adapter has no governor")
+                        gov(auto=(want == "on"))
+                        log(f"[ctl] diversity auto -> {want}")
                 except (ValueError, TypeError) as e:
                     return self._json({"error": f"bad value: {e}"})
                 log(f"[ctl] diversity/set -> {kwargs}")
@@ -4135,6 +4158,24 @@ def start_control_server(radio, port):
                     return self._json(a.set_diversity(**kwargs))
                 except ValueError as e:          # e.g. null_source past the list's end
                     return self._json({"error": str(e)})
+            # ---- B25: AUTO CLEAN, the governor -----------------------------
+            # What the noise profile FOUND, mapped onto the one tool that can
+            # do something about it: a carrier or a mains comb to SQUEEZE, an
+            # impulse rate to BLANK, a directional floor to NULL, low headroom
+            # to hand the front-end guard, a weak talker to hand the dig. One
+            # move at a time, each scored against core/digout.py's objective
+            # and put back if the audio fell. core/governor.py has the rules
+            # and every threshold's reasoning; adapters/diversity_governor.py
+            # has the tick and the writes.
+            #   GET /diversity/set?auto=on|off   -> the one switch (default off)
+            #   GET /diversity/governor          -> what it holds, and why
+            if u.path == "/diversity/governor":
+                a = radio.adapter
+                fn = (getattr(a, "diversity_governor", None)
+                      if getattr(a, "diversity_available", False) else None)
+                if fn is None:
+                    return self._json({"available": False})
+                return self._json(fn())
             if u.path == "/diversity/align":
                 a = radio.adapter
                 if not getattr(a, "diversity_available", False):
