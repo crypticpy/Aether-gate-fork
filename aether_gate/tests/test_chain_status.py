@@ -230,6 +230,16 @@ def test_the_auto_clean_row_heads_the_chain_only_when_a_governor_exists():
     assert off["detail"].startswith("off")
 
 
+def test_filter_status_carries_the_governor_block_only_with_a_pair():
+    a = SoapyAdapter(driver="sdrplay", samp_rate=250_000.0, center_hz=3_890_000.0)
+    a._np = np
+    a._init_demod()
+    a._mode = "LSB"
+    st = a.filter_status()
+    assert "governor" not in st and "squeeze" not in st     # single tuner: no pair
+    assert a.diversity_governor() == {"available": False}
+
+
 def test_measured_appears_only_where_a_level_was_measured():
     rows = _rows()
     have = {r["id"] for r in rows if r.get("measured") is not None}

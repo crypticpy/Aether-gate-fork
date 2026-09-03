@@ -1756,6 +1756,9 @@ class SoapyAdapter(RadioAdapter):
         # curve, so the block rides along with the rows it explains.
         if div:
             st["squeeze"] = div.get("squeeze")
+            # ...and what AUTO CLEAN holds, so a card can say "held by AUTO"
+            # and the AUTO CLEAN card can list its events, off the one poll.
+            st["governor"] = self._gov.status() if self._gov is not None else None
         st["response"] = self._filt.response_db()
         st["spectrum"] = self._filt.spectrum_db()
         return st
