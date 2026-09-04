@@ -612,6 +612,28 @@ def test_response_db_recomputes_once_the_filter_actually_changes():
     assert second["hz"] != first["hz"] or second["db"] != first["db"]
 
 
+def test_response_db_follows_a_band_change_of_two_redesigns_between_polls():
+    """A retune from 40 m LSB to 20 m USB is a sideband flip AND an edge
+    change, two redesigns before the next /filter poll. The cache used to
+    key on id(self.taps); the array the first redesign frees is what the
+    second allocates, so both polls read as the same taps and the picture
+    kept the LSB curve -- evaluated on the USB frame, a stopband 60 dB down
+    across the whole passband. The key is the redesign counter now."""
+    sf = SliceFilter(RATE)
+    sf.set(low=100, high=2900, shape="soft")
+    sf.apply(np.zeros(64, dtype=np.complex128), lsb=True)
+    before = sf.response_db()
+    seq = sf._design_seq
+    sf.apply(np.zeros(64, dtype=np.complex128), lsb=False)   # redesign 1: sideband
+    sf.set(low=100, high=2800)
+    sf.apply(np.zeros(64, dtype=np.complex128), lsb=False)   # redesign 2: edges
+    assert sf._design_seq == seq + 2
+    after = sf.response_db()
+    assert after is not before
+    in_band = [db for hz, db in zip(after["hz"], after["db"]) if 300 <= hz <= 2600]
+    assert min(in_band) > -3.0                                # the passband, not a stopband
+
+
 # ---- spec_tc: the spectrum EMA's time constant, settable and clamped -------
 
 def test_spec_tc_is_settable_through_filter_set_and_clamped():

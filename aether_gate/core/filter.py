@@ -225,6 +225,7 @@ class SliceFilter:
         self.spec_f = np.fft.fftfreq(SPEC_N, 1.0 / self.rate_hz)
         self._spec_f_order = np.argsort(self.spec_f)   # static: spec_f never changes
         self._resp_cache_key = self._resp_cache = None   # response_db()'s own cache
+        self._design_seq = 0                             # bumped by every _redesign()
         self.auto_low = None
         self.auto_high = None
         self.auto_source = None
@@ -395,6 +396,7 @@ class SliceFilter:
         if self.taps is None or len(taps) != len(self.taps):
             self.state = {}
         self.taps = taps
+        self._design_seq += 1
         self.dirty = False
 
     # ----- per block ------------------------------------------------------
@@ -783,14 +785,13 @@ class SliceFilter:
 
     def response_db(self, points=128):
         """The designed response across the audio band -- see core/
-        filter_response.py's response_snapshot for the shape. Cached
-        against self.taps' own identity (a redesign always replaces it --
-        the exact thing `dirty` guards in apply()) and the SQUEEZE bank's
-        recompute counter: a poll between two redesigns is a dict lookup,
-        not up to 1023 taps' worth of exponentials at 128 points."""
+        filter_response.py's response_snapshot. Cached on the redesign
+        counter and the SQUEEZE bank's, NOT id(self.taps): the address one
+        redesign frees is what the next allocates, so two redesigns between
+        polls (a band change) read as one by id -- the old sideband's curve."""
         if self.taps is None:
             self._redesign()
-        key = (id(self.taps), self._squeeze_bank.recomputes, points, self.spec.bypass)
+        key = (self._design_seq, self._squeeze_bank.recomputes, points, self.spec.bypass)
         if self._resp_cache_key == key:
             return self._resp_cache
         out = response_snapshot(self.taps, self.rate_hz, self._squeeze_bank,
