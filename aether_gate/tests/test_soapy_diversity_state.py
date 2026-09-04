@@ -18,6 +18,12 @@ regression test that fails on the pre-fix code:
       configured phase/ratio so the UI does not appear to reset.
 
 Run:  python -m pytest aether_gate/tests/test_soapy_diversity_state.py
+
+Also covers the held-lock / background-retry behaviour of AlignSearch
+(aether_gate/adapters/diversity_align.py, extracted from this module's
+_align_window 2026-09-03): a held lock survives a non-credible re-measure,
+and a search that never finds a credible window keeps retrying rather than
+parking forever.
 """
 import threading
 
@@ -25,7 +31,21 @@ import numpy as np
 import pytest
 
 from aether_gate.adapters.soapy import _DiversityState
-from aether_gate.core.diversity import weight_from_polar
+from aether_gate.core.diversity import ALIGN_MIN_PEAK, weight_from_polar
+
+
+class _FakeClock:
+    """A controllable time.monotonic() stand-in so AlignSearch's retry timer
+    can be tested without sleeping."""
+
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, dt):
+        self.t += dt
 
 
 class _FakeAdapter:
@@ -153,7 +173,7 @@ def test_a_quiet_window_is_not_a_verdict_the_realign_keeps_measuring():
         assert state._realign == "test" and not state.aligner.aligned, i
     _feed_window(state, rng)
     assert state._realign is None and not state.aligner.aligned
-    assert state.last_align["ok"] is False and state._align_try == state.ALIGN_TRIES
+    assert state.last_align["ok"] is False and state._align.try_count == state.ALIGN_TRIES
     # a talker keys up during the next request: locked on the first window
     state.request_realign("operator request")
     _feed_window(state, rng, lag=63)
@@ -172,7 +192,7 @@ def test_a_credible_lag_is_adopted_at_once_and_only_replaced_by_a_better_window(
     assert not state.aligner.aligned
     _feed_window(state, rng, lag=40)              # strong: adopted, search over
     assert state.aligner.aligned and state.aligner.lag == 40 and state._realign is None
-    assert state._align_try == 2
+    assert state._align.try_count == 2
 
 
 # --- F8: request_realign() and ingest() must not race on the accumulators --
@@ -285,3 +305,132 @@ def test_the_offset_is_found_exactly_at_every_span(rate, lag):
 def test_finder_json_says_why_there_is_nothing_to_find():
     state = _DiversityState(_FakeAdapter(125_000.0))
     assert state.finder_json() == {"available": False, "reason": "not aligned"}
+
+
+# --- a held lock survives a non-credible re-measure, and a non-credible
+# search keeps retrying in the background rather than parking (2026-09-03:
+# an overflow on a quiet band threw away a 113x stream-start lock) --------
+
+def test_held_lock_survives_a_non_credible_realign_and_keeps_combining():
+    """The night's incident: a credible lock at stream start (lag 0, peak
+    113) must not be thrown away by a re-measure whose every window reads as
+    noise -- the aligner stays aligned, on the SAME lag, through all
+    ALIGN_TRIES windows, weight_for() keeps combining in track mode, and
+    status says it is held, naming the reason and the peak. Mutation: the
+    old set_lag(0, peak, False) on a non-credible window, which zeroed the
+    lag and dropped aligned to False on the very first one."""
+    state = _DiversityState(_FakeAdapter(125_000.0))
+    state.aligner.set_lag(0, peak=113.0, aligned=True)      # the stream-start lock
+    state.mode = "track"
+    from aether_gate.core.diversity import Tracker
+    t = state.trackers[0] = Tracker(125_000.0)
+    t.m = 0.5 + 0.2j
+    state.request_realign("overflow on channel A")
+    for _ in range(state.ALIGN_TRIES):
+        state._align.step(state.aligner, lag=3, peak=2.9, min_peak=ALIGN_MIN_PEAK)
+    assert state.aligner.aligned is True
+    assert state.aligner.lag == 0
+    assert state.weight_for(0) != 0j
+    st = state.status(0)
+    assert st["align_held"] is True
+    assert "overflow on channel A" in st["align_note"]
+    assert "peak" in st["align_note"]
+
+
+def test_a_credible_window_is_adopted_even_with_a_lower_peak_than_the_held_lock():
+    """A credible re-measure is adopted whether or not its lag matches the
+    held one, and whether or not its peak beats the held lock's own (113):
+    a credible measurement is a measurement of NOW, not a competition with
+    the past. Mutation: refusing to adopt because the new peak (12) is
+    lower than the held peak (113)."""
+    state = _DiversityState(_FakeAdapter(125_000.0))
+    state.aligner.set_lag(0, peak=113.0, aligned=True)
+    state.request_realign("overflow on channel A")
+    state._align.step(state.aligner, lag=5, peak=2.9, min_peak=ALIGN_MIN_PEAK)     # not credible: held
+    assert state.aligner.aligned is True and state.aligner.lag == 0
+    ok, more, verdict = state._align.step(state.aligner, lag=77, peak=12.0, min_peak=ALIGN_MIN_PEAK)
+    assert ok is True
+    assert state.aligner.aligned is True
+    assert state.aligner.lag == 77
+    st = state.status(0)
+    assert st["align_held"] is False
+    assert st["align_note"] == ""
+
+
+def test_tries_exhausted_with_no_lock_schedules_a_background_retry():
+    """Fresh start on a quiet band: when ALIGN_TRIES windows all come back
+    non-credible, the search ends (realigning False) but is not abandoned --
+    a retry is scheduled ALIGN_RETRY_S out, and ingest() re-requests the
+    measurement once the injected clock reaches the deadline. Mutation: no
+    retry scheduled at all, or a retry only when a lock was already held."""
+    rng = np.random.default_rng(23)
+    clock = _FakeClock()
+    state = _DiversityState(_FakeAdapter(125_000.0), clock=clock)
+    state.request_realign("stream start")
+    for _ in range(state.ALIGN_TRIES):
+        _feed_window(state, rng)
+    assert state._realign is None and not state.aligner.aligned
+    st = state.status(0)
+    assert st["align_held"] is False
+    assert st["align_retry_s"] == pytest.approx(30.0, abs=0.5)
+    clock.advance(31.0)
+    zeros = np.zeros(16, dtype=np.complex64)
+    state.ingest(zeros, zeros)
+    assert state._realign is not None
+    assert state._align.try_count == 0
+
+
+def test_manual_request_realign_cancels_a_pending_retry():
+    """A manual REALIGN while a background retry is scheduled must not wait
+    for the clock: it cancels the pending retry and starts measuring right
+    away. Mutation: request_realign() leaving the old retry deadline in
+    place, so align_retry_s keeps counting down a stale schedule."""
+    rng = np.random.default_rng(24)
+    clock = _FakeClock()
+    state = _DiversityState(_FakeAdapter(125_000.0), clock=clock)
+    state.request_realign("stream start")
+    for _ in range(state.ALIGN_TRIES):
+        _feed_window(state, rng)
+    assert state.status(0)["align_retry_s"] is not None
+    state.request_realign("operator request")
+    st = state.status(0)
+    assert st["align_retry_s"] is None
+    assert st["realigning"] is True
+    assert state._align.try_count == 0
+
+
+def test_status_carries_the_three_align_keys_with_sane_defaults():
+    """status() must always carry align_held/align_note/align_retry_s, with
+    the right types, even when nothing has ever been requested. Mutation:
+    forgetting to add the keys, or defaulting align_held to True."""
+    state = _DiversityState(_FakeAdapter(125_000.0))
+    st = state.status(0)
+    assert st["align_held"] is False
+    assert st["align_note"] == ""
+    assert st["align_retry_s"] is None
+
+
+def test_a_credible_window_that_does_not_beat_the_best_leaves_the_delay_line_alone():
+    """Between ALIGN_MIN_PEAK and ALIGN_STRONG_PEAK the search keeps measuring;
+    only a window that BEATS the best so far may call set_lag, because
+    set_lag restarts the delay line and would glitch the stream every window.
+    Mutation: calling set_lag on every credible window."""
+    from aether_gate.adapters.diversity_align import AlignSearch
+
+    class SpyAligner:
+        def __init__(self):
+            self.lag, self.peak, self.aligned, self.calls = 0, 0.0, False, 0
+
+        def set_lag(self, lag, peak=0.0, aligned=True):
+            self.lag, self.peak, self.aligned = int(lag), float(peak), bool(aligned)
+            self.calls += 1
+
+    al = SpyAligner()
+    search = AlignSearch(tries=8, strong_peak=30.0, clock=lambda: 0.0)
+    search.begin("operator", al)
+    ok, more, _ = search.step(al, 3, 15.0, 10.0)      # credible, not yet strong
+    assert ok and more and al.calls == 1 and al.lag == 3
+    ok, more, _ = search.step(al, 3, 12.0, 10.0)      # credible, but no better
+    assert ok and more and al.calls == 1
+    ok, more, _ = search.step(al, 4, 20.0, 10.0)      # a better window moves it
+    assert ok and al.calls == 2 and al.lag == 4

@@ -19,6 +19,8 @@ import os
 import threading
 import time
 
+from .diversity_align import AlignSearch    # pure logic, no numpy: safe to import at load time
+
 SSB_PASS_HZ = 3000.0        # mirrors soapy.SSB_PASS_HZ / FM_PASS_HZ: the bands
 FM_PASS_HZ = 8000.0         # the demodulator actually passes (see _init_demod)
 
@@ -154,7 +156,7 @@ class _DiversityState:
     SITELOG_PATH = "~/.aether-gate/site-log.jsonl"        # every beacon score and noise verdict, kept
     NULLABLE_COHERENCE = 0.4     # below this the noise has no direction to null
 
-    def __init__(self, adapter):
+    def __init__(self, adapter, clock=time.monotonic):
         self.a = adapter
         self.aligner = _dv().Aligner()
         self.mode = "off"
@@ -177,8 +179,7 @@ class _DiversityState:
         # thread while ingest() is mid-accumulate, and np.concatenate([]) raises.
         self._cal_lock = threading.Lock()
         self._realign = None                # why a measurement is owed, or None
-        self._align_try = 0                 # windows measured for the realign in progress
-        self._align_best = None             # (lag, peak) of the best window so far
+        self._align = AlignSearch(self.ALIGN_TRIES, self.ALIGN_STRONG_PEAK, clock=clock)
         self.last_align = {"lag": 0, "peak": 0.0, "ok": False, "why": None}
         # noise blanker
         self.nb_on = False
@@ -222,7 +223,7 @@ class _DiversityState:
     def request_realign(self, why):
         with self._cal_lock:
             self._cal_a, self._cal_b, self._cal_n = [], [], 0
-        self._align_try, self._align_best = 0, None
+        self._align.begin(why, self.aligner)
         self._realign = str(why)
 
     def _configured_weight(self, sid):
@@ -247,26 +248,17 @@ class _DiversityState:
         return self._configured_weight(sid)
 
     def _align_window(self, A, B, why):
-        """One calibration window measured: adopt the best lag so far when
-        it is credible, and keep measuring while it is not yet strong."""
+        """One calibration window measured: AlignSearch adopts/holds/retries
+        (see diversity_align.py); this measures the window and logs it."""
         dv = _dv()
         from .stream_sync import measured_lag           # numpy: first use only
         lag, peak = measured_lag(A, B, self.a)
-        self._align_try += 1
-        best = self._align_best
-        if best is None or peak > best[1]:
-            best = self._align_best = (int(lag), float(peak))
-        ok = best[1] >= dv.ALIGN_MIN_PEAK
-        if best == (int(lag), float(peak)) or self._align_try == 1:
-            # first window, or a better one: the aligner follows it (an
-            # unchanged best is left alone -- set_lag restarts the delay line)
-            self.aligner.set_lag(best[0] if ok else 0, best[1], ok)
-        more = best[1] < self.ALIGN_STRONG_PEAK and self._align_try < self.ALIGN_TRIES
-        self.last_align = {"lag": best[0] if ok else 0, "peak": best[1], "ok": ok, "why": why}
+        ok, more, verdict = self._align.step(self.aligner, lag, peak, dv.ALIGN_MIN_PEAK)
+        best = self._align.best
+        self.last_align = {"lag": (best[0] if ok else self.aligner.lag),
+                            "peak": best[1], "ok": ok, "why": why}
         if more:
             self._realign = why             # keep collecting
-        verdict = ("locked" if ok else "NOT credible; holding lag 0") + (
-            f"; measuring on ({self._align_try}/{self.ALIGN_TRIES})" if more else "")
         print(f"[diversity] alignment ({why}): lag {lag:+d} samples, correlation "
               f"peak {peak:.1f}x the floor — {verdict}", flush=True)
 
@@ -280,6 +272,10 @@ class _DiversityState:
     def ingest(self, a, b):
         """One raw block pair -> (block for the pan/meters, pair for the demod)."""
         np = self.a._np
+        if self._realign is None:
+            retry_why = self._align.due_retry()    # a parked search's scheduled retry, if due
+            if retry_why is not None:
+                self.request_realign(retry_why)
         if self._realign is not None:
             n_cal = min(int(self.CAL_SECONDS * self.a.samp_rate), self.CAL_SAMPLES_MAX)
             snapshot = None
@@ -542,6 +538,9 @@ class _DiversityState:
             "lag_samples": int(self.aligner.lag), "aligned": bool(self.aligner.aligned),
             "corr_peak": round(float(self.aligner.peak), 1),
             "realigning": self._realign is not None,
+            "align_held": self._align.held,
+            "align_note": self._align.note(_dv().ALIGN_MIN_PEAK),
+            "align_retry_s": self._align.retry_seconds(),
             "snr_db": t.snr_db() if t is not None else {"a": None, "b": None, "out": None},
             "talking": bool(t.talking) if t is not None else False,
             "talk_mod": (round(t.talk_mod, 2) if t is not None and t.talk_mod is not None
