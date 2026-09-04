@@ -105,6 +105,18 @@ def test_a_held_comb_that_goes_away_is_put_back_after_the_grace():
     assert e["wall"] is not None                     # R9: the timeline shows it
 
 
+def test_a_held_row_carries_its_wall_clock_stamp():
+    """Mutation: `since` alone. It is the governor's uptime, and the app was
+    drawing a held null as "20671 d" old from it; `since_wall` is the epoch
+    stamp an age can actually be read from, beside `since` the way every
+    event carries `wall` beside `t` (R9)."""
+    g = _holding_the_comb()
+    h = g.holding["squeeze"]
+    assert h["since_wall"] is not None and h["since_wall"] != h["since"]
+    row = g.status()["holding"][0]
+    assert row["since_wall"] == h["since_wall"]
+
+
 def test_a_comb_that_comes_straight_back_is_left_alone():
     """Mutation: putting it back on the first not-held refresh. `held` is a
     per-refresh judgement and the teeth come and go with the retune."""

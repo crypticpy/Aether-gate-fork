@@ -107,7 +107,11 @@ SPAN_TOOLS = ("mode", "squeeze")
 SPAN_WORDS = {"mode": "the null", "squeeze": "the squeeze"}
 # "released"/"error": not measurement outcomes, but how a move stops being ours.
 RESULTS = ("pending", "kept", "undone", "released", "error")
-_HELD = ("tool", "params", "kind", "why", "since", "delta_db", "scorer")  # a row
+# A held row. `since` is uptime (the governor's own clock); `since_wall` is
+# the same instant as an epoch stamp, the only one of the two an app can
+# turn into "4 min ago" (the NOW strip was reading `since` as epoch and
+# drawing a held null as 20671 days old).
+_HELD = ("tool", "params", "kind", "why", "since", "since_wall", "delta_db", "scorer")
 
 
 def _act(tool, params, undo, kind, why, revert=False, label=None):
@@ -346,7 +350,7 @@ class Governor:
     def _keep(self, p, why=None):
         p["result"] = "kept"
         self.pending = None
-        self.holding[p["tool"]] = dict(p, since=p["t"])
+        self.holding[p["tool"]] = dict(p, since=p["t"], since_wall=self._wall_at(p["t"]))
         self.state, self.label = "idle", "kept"
         d = p["delta_db"]
         self.why = why or (f"kept {_word(p['tool'])}"
@@ -652,7 +656,7 @@ class Governor:
             "state_label": self.label,
             "settle_s": self.settle_s, "margin_db": self.margin_db(),
             "spread_db": self.spread_db(), "objective_source": self._source,
-            "holding": [{k: h[k] for k in _HELD}
+            "holding": [{k: h.get(k) for k in _HELD}
                         for h in sorted(self.holding.values(), key=lambda h: h["since"])],
             "pending": None if self.pending is None else dict(self.pending),
             "events": [dict(e) for e in self.events],
