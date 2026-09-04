@@ -86,9 +86,16 @@ RESULTS = ("pending", "kept", "undone", "released", "error")
 _HELD = ("tool", "params", "kind", "why", "since", "delta_db", "scorer")  # a row
 
 
-def _act(tool, params, undo, kind, why, revert=False):
+def _act(tool, params, undo, kind, why, revert=False, label=None):
+    """`why` is the sentence (events, the AUTO CLEAN card, hover); `label` is
+    the few plain words a switch shows while this move is the pending one."""
     return {"tool": tool, "params": params, "undo": undo, "kind": kind,
-            "why": why, "revert": bool(revert), "scorer": "snr"}
+            "why": why, "revert": bool(revert), "scorer": "snr",
+            "label": label or f"trying {proxy.WORDS.get(tool, tool)}"}
+
+
+def _word(tool):
+    return proxy.WORDS.get(tool, tool)
 
 
 class Governor:
@@ -98,6 +105,7 @@ class Governor:
         self.auto = False
         self.settle_s = float(settle_s)
         self.state = "idle"             # idle|measuring|applying|settling|backoff
+        self.label = "off"              # state_label: the switch's few plain words
         self.pending = None
         self.holding = {}               # tool -> the move being held
         self.backoff = {}               # (kind, tool) -> deadline
@@ -113,16 +121,18 @@ class Governor:
         self._before = {}               # the proxy readings the pending is judged from
         self._dug = set()               # (slice hz, talker) pairs already handed over
         self._note_at = None            # (the dig's last note, when we first saw it)
+        self._pending_label = ""        # the pending move's own label, while it settles
 
     def tick(self, snap):
         """One snapshot in, zero or one actions out."""
         now = _num(snap.get("t"), 0.0)
         if not self.auto:
             self._release_all(now)
-            self.state, self.why = "idle", "auto is off; nothing is held"
+            self.state, self.why, self.label = "idle", "off: nothing is held", "off"
             return []
         if not snap.get("available"):
-            self.state, self.why = "measuring", "no dual-tuner stream to govern"
+            self.state, self.why = "measuring", "waiting for both tuners to stream"
+            self.label = "waiting for the stream"
             return []
         self._observe(snap, now)
         self._source = "snr" if _num(snap.get("objective")) is not None else "none"
@@ -137,14 +147,15 @@ class Governor:
         tool = action["tool"]
         self._mine_until[tool] = now + self.settle_s + 1.0
         if action.get("revert"):
-            self.state = "backoff"
+            self.state, self.label = "backoff", "put back"
             return
         if tool == "dig":
             self.backoff[(action["kind"], tool)] = now + DIG_BACKOFF_S
             self._dug.add(action.get("key"))     # this pair has now had its minute
         # the same dict goes into events: result/delta update it in place
         self.pending = self._event(now, action, "pending", action["why"], before)
-        self.state = "settling"
+        self._pending_label = action.get("label") or f"trying {_word(tool)}"
+        self.state, self.label = "settling", self._pending_label
 
     def failed(self, action, error, now):
         """The write threw: nothing held, nothing pending, and the pair backs
@@ -153,7 +164,8 @@ class Governor:
         self.pending = None
         self.backoff[(action["kind"], action["tool"])] = now + BACKOFF_S
         self._event(now, action, "error", str(error))
-        self.state, self.why = "idle", f"{action['tool']}: {error}"
+        self.state, self.why = "idle", f"{_word(action['tool'])} refused the move: {error}"
+        self.label = "failed"
 
     def _event(self, now, action, result, why, before=None):
         e = {"t": now, "tool": action["tool"], "kind": action["kind"],
@@ -203,9 +215,10 @@ class Governor:
         if waiting:
             settle = SQUEEZE_SETTLE_S            # held: scored; not yet: wait for it
         if now - p["t"] < settle:
-            self.state, self.why = "settling", (f"squeeze: waiting for it to take hold"
+            self.state, self.why = "settling", ("waiting for the squeeze to take hold"
                                                 if waiting else
-                                                f"{p['tool']}: measuring what it did")
+                                                f"measuring what {_word(p['tool'])} did")
+            self.label = self._pending_label
             return []
         if p["scorer"] != "snr":                     # no talker: its own proxy scores it
             keep, why = proxy.verdict(p["tool"], p["kind"], self._before, snap)
@@ -217,15 +230,15 @@ class Governor:
         p["delta_db"] = round(after - before, 2)
         if p["delta_db"] >= -self.margin_db():
             return self._keep(p)
-        return self._undo(p, now, f"{p['tool']} cost {-p['delta_db']:.1f} dB "
-                                  f"on the {p['kind']}: put back")
+        return self._undo(p, now, f"put it back: {_word(p['tool'])} cost the talker "
+                                  f"{-p['delta_db']:.1f} dB")
 
     def _undo(self, p, now, why):
         p["result"] = "undone"
         self.pending = None
         self.holding.pop(p["tool"], None)
         self.backoff[(p["kind"], p["tool"])] = now + BACKOFF_S
-        self.state, self.why = "backoff", why
+        self.state, self.why, self.label = "backoff", why, "put back"
         if p["undo"] is None:
             return []
         return [_act(p["tool"], p["undo"], p["params"], p["kind"], why, revert=True)]
@@ -235,7 +248,8 @@ class Governor:
         and never reverts it -- but it banks only what the dig itself stands
         behind, and a run that concluded nothing backs the pair off again."""
         if snap.get("dig_running"):
-            self.state, self.why = "settling", "dig-out is working on this talker"
+            self.state, self.why = "settling", "DIG OUT is working on the talker"
+            self.label = "DIG OUT running"
             return []
         p = self.pending
         p["delta_db"], note = proxy.dig_delta_db(snap)
@@ -248,10 +262,10 @@ class Governor:
         p["result"] = "kept"
         self.pending = None
         self.holding[p["tool"]] = dict(p, since=p["t"])
-        self.state = "idle"
+        self.state, self.label = "idle", "kept"
         d = p["delta_db"]
-        self.why = why or (f"{p['tool']} on the {p['kind']}: kept"
-                           + (f", {d:+.1f} dB" if d is not None else ""))
+        self.why = why or (f"kept {_word(p['tool'])}"
+                           + (f": {d:+.1f} dB on the talker" if d is not None else ""))
         return []
 
     def _release_all(self, now):
@@ -264,7 +278,7 @@ class Governor:
 
     # ----- the rules, in the chain's order --------------------------------
     def _propose(self, snap, now):
-        self.state = "measuring"
+        self.state, self.label = "measuring", "listening"
         for name in RULES:
             act = getattr(self, "_rule_" + name)(snap, now)
             if act is None:
@@ -278,14 +292,17 @@ class Governor:
                 if now < until:
                     continue
                 del self.backoff[key]
-            self.state, self.why = "applying", act["why"]
+            self.state, self.why, self.label = "applying", act["why"], act["label"]
             if self._source != "snr":
                 act["scorer"] = proxy.scorer(act["tool"])
             self._before = proxy.readings(snap)
             return [act]
-        self.why = (("holding " + ", ".join(sorted(self.holding))
-                     + "; nothing else on the band is asking for a tool") if self.holding
-                    else "nothing the band is doing has a tool that would help it")
+        if self.holding:
+            held = ", ".join(proxy.HELD_WORDS.get(t, t) for t in sorted(self.holding))
+            self.label = f"holding {held}"
+            self.why = f"holding {held}; nothing else on the band needs a tool"
+        else:
+            self.why = "nothing on the band needs a tool right now"
         return []
 
     def _rule_guard(self, snap, now):
@@ -297,7 +314,8 @@ class Governor:
             return None
         return _act("guard", {"guard": True}, {"guard": False}, "neighbour",
                     f"only {hr:.1f} dB of ADC headroom left: the front-end guard "
-                    "takes the LNA down until it is clear")
+                    "takes the LNA down until it is clear",
+                    label="trying the front-end guard")
 
     def _rule_nb(self, snap, now):
         """Impulses, before anything downstream measures a covariance off them.
@@ -315,7 +333,8 @@ class Governor:
             return _act("nb", {"nb": True, "nb_db": db},
                         {"nb": False, "nb_db": _num(nb.get("db"))}, "impulse",
                         f"{rate:g} impulses/s at {_num(snap.get('impulse_db'), 0.0):.0f} dB "
-                        f"over the floor: blanker on at {db:g} dB")
+                        f"over the floor: blanker on at {db:g} dB",
+                        label="trying the blanker")
         if "nb" not in self.holding or not nb.get("on"):
             self._clear_since = None
             return None
@@ -327,7 +346,8 @@ class Governor:
         self._clear_since = None
         return _act("nb", {"nb": False}, {"nb": True, "nb_db": _num(nb.get("db"))},
                     "impulse",
-                    f"the impulses have been gone {IMPULSE_CLEAR_S:.0f} s: blanker off")
+                    f"the impulses have been gone {IMPULSE_CLEAR_S:.0f} s: blanker off",
+                    label="taking the blanker off")
 
     def _rule_mode(self, snap, now):
         """A directional noise floor is a spatial problem, so the combiner's own
@@ -339,8 +359,8 @@ class Governor:
         if coh is None or coh < NULLABLE_COHERENCE:
             return None
         return _act("mode", {"mode": "null"}, {"mode": snap.get("mode")}, "floor",
-                    f"the noise floor has a direction (coherence {coh:.2f}): "
-                    "idle-nulling it")
+                    f"the noise floor comes from one direction (coherence {coh:.2f}): "
+                    "nulling it", label="trying a null on the floor")
 
     def _rule_squeeze(self, snap, now):
         """One target at a time, on whatever the null above left behind: the
@@ -362,7 +382,7 @@ class Governor:
                 return None
             return _act("squeeze", {"squeeze": hz}, {"squeeze": ""}, "carrier",
                         f"a carrier {hz:+d} Hz in the passband at {car['db']:.0f} dB: "
-                        f"squeezing it with {tool}")
+                        f"squeezing it with {tool}", label=f"trying {tool} on a carrier")
         if not snap.get("mains_hz") or int(_num(snap.get("harmonics"), 0)) < 1:
             return None
         if sq.get("held") and sq.get("tool") == "null" \
@@ -374,7 +394,8 @@ class Governor:
             return None
         return _act("squeeze", {"squeeze": "comb"}, {"squeeze": ""}, "mains",
                     f"a {int(_num(snap.get('mains_hz'), 0.0))} Hz mains comb the loops "
-                    f"agree on (coherence {coh:.2f}): squeezing the comb with {tool}")
+                    f"agree on (coherence {coh:.2f}): squeezing the comb with {tool}",
+                    label=f"trying {tool} on the mains hum")
 
     def _rule_dig(self, snap, now):
         """Last: the dig turns the same knobs and already scores every one, so this
@@ -395,11 +416,13 @@ class Governor:
             return None                  # done here already, or nothing to conclude on
         return dict(_act("dig", {"seconds": DIG_SECONDS}, None, "weak",
                          f"a talker at {j:.1f} dB on a band steady to "
-                         f"{self.spread_db():.1f} dB: handing it to dig-out"), key=key)
+                         f"{self.spread_db():.1f} dB: handing it to DIG OUT",
+                         label="handing the talker to DIG OUT"), key=key)
 
     def status(self):
         return {
             "auto": bool(self.auto), "state": self.state, "why": self.why,
+            "state_label": self.label,
             "settle_s": self.settle_s, "margin_db": self.margin_db(),
             "spread_db": self.spread_db(), "objective_source": self._source,
             "holding": [{k: h[k] for k in _HELD}

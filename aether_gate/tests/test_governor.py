@@ -331,7 +331,7 @@ def test_a_write_that_threw_backs_the_pair_off_and_says_so():
 def test_the_status_shape_the_app_reads():
     g = gov()
     st = g.status()
-    assert set(st) == {"auto", "state", "why", "settle_s", "margin_db",
+    assert set(st) == {"auto", "state", "why", "state_label", "settle_s", "margin_db",
                        "spread_db", "objective_source", "holding", "pending",
                        "events", "backoff"}
     assert st["objective_source"] == "snr"

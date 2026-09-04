@@ -216,15 +216,20 @@ def test_the_squeeze_row_quotes_the_tool_and_releases_while_held():
 
 def test_the_auto_clean_row_heads_the_chain_only_when_a_governor_exists():
     assert _rows()[0]["id"] == "antenna"
-    gov = {"auto": True, "state": "settling",
+    gov = {"auto": True, "state": "settling", "state_label": "trying a null on a carrier",
            "holding": [{"tool": "squeeze"}, {"tool": "nb"}],
            "why": "carrier at +1200 Hz: squeezed, waiting 2 s"}
     rows = chain_rows(_filter(), _diversity(), _device(), _frontend(), gov)
     row = rows[0]
     _validate(row)
     assert row["id"] == "auto_clean" and row["enabled"] is True
-    assert "settling" in row["detail"] and "holding squeeze, nb" in row["detail"]
+    # The label leads, never the raw state or the tool keys (U1).
+    assert row["detail"].startswith("trying a null on a carrier · ")
+    assert "settling" not in row["detail"] and "holding squeeze" not in row["detail"]
     assert gov["why"] in row["detail"]
+    old = dict(gov); del old["state_label"]
+    assert chain_rows(_filter(), _diversity(), _device(), _frontend(), old)[0]["detail"] \
+        .startswith("settling · ")
     assert row["action"] == {"label": "OFF", "route": "/diversity/set", "query": "auto=off"}
     off = chain_rows(_filter(), _diversity(), _device(), _frontend(), {"auto": False})[0]
     assert off["enabled"] is False and off["action"]["query"] == "auto=on"

@@ -56,6 +56,11 @@ HEADROOM_GAIN_DB = 1.0          # ...and what the guard has to buy back at the A
 TAIL = "(no talker to score by)"
 TENTATIVE = "tentative"
 NAMES = {"squeeze": "depth", "nb": "blanking", "mode": "floor", "guard": "clips"}
+# The tools by the names the operator sees on the chain, for every sentence
+# and label the app shows a person -- never the key ("nb", "dig") itself.
+WORDS = {"guard": "the front-end guard", "nb": "the blanker", "mode": "a null",
+         "squeeze": "a squeeze", "dig": "DIG OUT"}
+HELD_WORDS = dict(WORDS, dig="what DIG OUT found")   # ...as a thing being held
 
 
 def _num(x, default=None):
@@ -149,7 +154,7 @@ def verdict(tool, kind, before, snap):
         return _mode(rise)
     if tool == "guard":
         return _guard(before, after)
-    return True, f"{tool} kept: nothing to score it by {TAIL}"
+    return True, f"kept {WORDS.get(tool, tool)}: nothing to score it by {TAIL}"
 
 
 def _squeeze(kind, snap, after, rise):
@@ -160,34 +165,34 @@ def _squeeze(kind, snap, after, rise):
         sq = snap.get("squeeze") or {}
         if not sq.get("held"):
             reason = sq.get("reason") or "never took hold"
-            return False, f"squeeze put back: {reason} on the {kind} {TAIL}"
-        return False, f"squeeze put back: no {name} depth measured on the {kind} {TAIL}"
+            return False, f"put the squeeze back: {reason} on the {kind} {TAIL}"
+        return False, f"put the squeeze back: no {name} depth measured on the {kind} {TAIL}"
     if depth < want:
-        return False, (f"squeeze put back: {depth:.1f} dB of {name} depth on the "
-                       f"{kind}, under {want:g} {TAIL}")
+        return False, (f"put the squeeze back: only {depth:.1f} dB of {name} depth on "
+                       f"the {kind}, under the {want:g} it needs {TAIL}")
     if rise is not None and rise > FLOOR_RISE_DB:
-        return False, f"squeeze put back: the passband floor rose {rise:.1f} dB {TAIL}"
-    return True, f"squeeze kept by {depth:.1f} dB of {name} depth on the {kind} {TAIL}"
+        return False, f"put the squeeze back: the passband floor rose {rise:.1f} dB {TAIL}"
+    return True, f"kept the squeeze: {depth:.1f} dB of {name} depth on the {kind} {TAIL}"
 
 
 def _nb(before, after, rise):
     pct = after["blanked_pct"] or 0.0
     if pct > BLANKED_MAX_PCT:
-        return False, (f"nb put back: blanking {pct:.1f} % of the samples, over "
-                       f"{BLANKED_MAX_PCT:g} % {TAIL}")
+        return False, (f"put the blanker back: blanking {pct:.1f} % of the samples, "
+                       f"over {BLANKED_MAX_PCT:g} % {TAIL}")
     if rise is not None and rise > FLOOR_RISE_DB:
-        return False, f"nb put back: the passband floor rose {rise:.1f} dB {TAIL}"
+        return False, f"put the blanker back: the passband floor rose {rise:.1f} dB {TAIL}"
     d = after["impulses_per_s"] - (before.get("impulses_per_s") or 0.0)
-    return True, f"nb kept: blanking {pct:.1f} %, impulses {d:+.1f}/s {TAIL}"
+    return True, f"kept the blanker: blanking {pct:.1f} %, impulses {d:+.1f}/s {TAIL}"
 
 
 def _mode(rise):
     if rise is None:
-        return True, f"mode kept: no passband floor to measure the null by {TAIL}"
+        return True, f"kept the null: no passband floor to measure it by {TAIL}"
     if rise > -FLOOR_DROP_DB:
-        return False, (f"mode put back: the null moved the passband floor "
+        return False, (f"put the null back: it moved the passband floor "
                        f"{rise:+.1f} dB, not the {FLOOR_DROP_DB:g} dB off it {TAIL}")
-    return True, f"mode kept: {-rise:.1f} dB off the passband floor {TAIL}"
+    return True, f"kept the null: {-rise:.1f} dB off the passband floor {TAIL}"
 
 
 def _guard(before, after):
@@ -197,12 +202,12 @@ def _guard(before, after):
     hr0, hr = before.get("headroom_db"), after["headroom_db"]
     gain = None if hr0 is None or hr is None else round(hr - hr0, 1)
     if has is not None and (not has or (was is not None and has < was)):
-        return True, f"guard kept: clips {was or 0:g}/s -> {has:g} {TAIL}"
+        return True, f"kept the guard: clips {was or 0:g}/s -> {has:g} {TAIL}"
     if gain is not None and gain >= HEADROOM_GAIN_DB:
-        return True, f"guard kept: headroom {gain:+.1f} dB {TAIL}"
+        return True, f"kept the guard: headroom {gain:+.1f} dB {TAIL}"
     if has is None and gain is None:
-        return True, f"guard kept: no front-end reading to score it by {TAIL}"
-    return False, (f"guard put back: clips {was or 0:g}/s -> {has or 0:g} and "
+        return True, f"kept the guard: no front-end reading to score it by {TAIL}"
+    return False, (f"put the guard back: clips {was or 0:g}/s -> {has or 0:g} and "
                    f"headroom {gain or 0.0:+.1f} dB {TAIL}")
 
 

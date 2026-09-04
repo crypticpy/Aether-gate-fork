@@ -393,11 +393,12 @@ def _governor_row(gov):
     if not gov:
         return None
     on = bool(gov.get("auto"))
-    held = [h["tool"] for h in (gov.get("holding") or [])]
+    # state_label is the governor's own few plain words ("listening", "trying
+    # a notch on the mains hum", "holding the blanker"); the raw state only on
+    # a governor too old to send one.
     return _row(
         "auto_clean", "AUTO CLEAN", "toggle",
-        _dot("off" if not on else str(gov.get("state") or "idle"),
-             ("holding " + ", ".join(held)) if held else None,
+        _dot("off" if not on else str(gov.get("state_label") or gov.get("state") or "idle"),
              gov.get("why")),
         enabled=on,
         action=_toggle("/diversity/set", "auto", on))
