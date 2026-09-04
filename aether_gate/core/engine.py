@@ -337,6 +337,35 @@ def _filter_kwargs(q):
     return out
 
 
+_FRONTEND_IDLE = {"guard_active": False, "headroom_db": None, "lna_state": None,
+                  "clipped": False}
+
+
+def _diversity_frontend(fe):
+    """/diversity's `frontend` object -- the B23 front-end guard/headroom
+    the GUI's diversity panel wants next to the pair, not the whole
+    /frontend surface: `guard_active` (currently holding the LNA below the
+    operator's floor to protect the ADC), `headroom_db` (None if never
+    measured), `lna_state` (int, None if the driver's state isn't numeric),
+    `clipped` (any sample clipped in the last second). Reads adapters/
+    soapy.py's frontend_status() (adapters/frontend_guard.py's own
+    snapshot merged with the peak/headroom bookkeeping) -- no new
+    measurement, just a narrower view of what /frontend already reports."""
+    if not fe or not fe.get("available"):
+        return dict(_FRONTEND_IDLE)
+    try:
+        lna = int(fe.get("lna_state"))
+    except (TypeError, ValueError):
+        lna = None
+    try:
+        floor = int(fe.get("floor_state"))
+    except (TypeError, ValueError):
+        floor = None
+    guard_active = bool(fe.get("guard")) and lna is not None and floor is not None and lna > floor
+    return {"guard_active": guard_active, "headroom_db": fe.get("headroom_db"),
+            "lna_state": lna, "clipped": bool(fe.get("clips_1s"))}
+
+
 def audio_frames(chunk, reduced_bw=False):
     """An adapter's audio chunk -> the packet's sample list. A chunk is floats
     (one channel, sent to both ears) or (left, right) pairs (the diversity
@@ -3972,7 +4001,9 @@ def start_control_server(radio, port):
             # ---- RSPduo diversity: two coherent tuners combined into one RX ----
             # GET /diversity                            -> current mode/weight/alignment
             # GET /diversity/set?mode=&phase=&ratio=&source=&slice=&nb=&nb_db=&pan=&null_source=&grid=
-            #                    &focus=&subband=        -> apply what's present
+            #                    &focus=&subband=&post=&post_floor_db=&mrc=&assume_hz=&
+            #                    assume_call=&antenna=&squeeze=&squeeze_width=&spacing=&
+            #                    offset=&auto=on|off   -> apply what's present
             # GET /diversity/align                      -> re-measure the inter-tuner lag
             # GET /diversity/map                        -> coherence/level sweep for the panel
             # GET /diversity/spatial                    -> live per-bin phase/coherence/level rows
@@ -3989,6 +4020,9 @@ def start_control_server(radio, port):
             # additions (map/capture/memory) may not exist on every diversity-capable
             # adapter yet, so those are gated on getattr(...) and answer a plain
             # {"error": "not supported"} rather than a traceback when absent.
+            # /diversity's own body carries `frontend` (B23's guard_active/
+            # headroom_db/lna_state/clipped, off /frontend's frontend_status())
+            # next to the pair, and `governor` (B25) when the adapter has one.
             # GET /filter                 -> the receive filter as it is (edges,
             #                                shape, notches, ANF, contour, APF,
             #                                auto, auto_eq, NB, AGC, response)
@@ -4032,6 +4066,12 @@ def start_control_server(radio, port):
                     # diversity_status() is _DiversityState's, and that module
                     # is at its 800-line budget -- so the route merges it.
                     st["governor"] = gov()
+                if isinstance(st, dict):
+                    # B23: the front-end guard/headroom, next to the pair --
+                    # same reason as governor above, a narrower view of
+                    # /frontend rather than a new measurement.
+                    fe = a.frontend_status() if hasattr(a, "frontend_status") else None
+                    st["frontend"] = _diversity_frontend(fe)
                 return self._json(st)
             if u.path == "/diversity/set":
                 a = radio.adapter

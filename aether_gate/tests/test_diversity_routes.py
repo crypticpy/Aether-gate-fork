@@ -276,6 +276,40 @@ def test_diversity_available_adapter_reports_its_status():
     assert a.calls[-1][0] == "status"
 
 
+# ---- /diversity carries the B23 front-end guard/headroom, next to the pair -
+
+def test_diversity_frontend_defaults_idle_when_adapter_has_no_guard():
+    a = FakeDiversityAdapter()               # no frontend_status() at all
+    _, port = _start(a)
+    s = _get(port, "/diversity")
+    assert s["frontend"] == {"guard_active": False, "headroom_db": None,
+                             "lna_state": None, "clipped": False}
+
+
+def test_diversity_frontend_reports_headroom_and_clipping():
+    a = FakeDiversityAdapter()
+    a.frontend_status = lambda: {
+        "available": True, "guard": True, "floor_state": "0", "lna_state": "2",
+        "headroom_db": 4.5, "clips_1s": 3,
+    }
+    _, port = _start(a)
+    s = _get(port, "/diversity")
+    assert s["frontend"] == {"guard_active": True, "headroom_db": 4.5,
+                             "lna_state": 2, "clipped": True}
+
+
+def test_diversity_frontend_not_active_when_lna_at_the_operator_floor():
+    a = FakeDiversityAdapter()
+    a.frontend_status = lambda: {
+        "available": True, "guard": True, "floor_state": "0", "lna_state": "0",
+        "headroom_db": 18.0, "clips_1s": 0,
+    }
+    _, port = _start(a)
+    s = _get(port, "/diversity")
+    assert s["frontend"] == {"guard_active": False, "headroom_db": 18.0,
+                             "lna_state": 0, "clipped": False}
+
+
 # ---- /diversity/set forwards exactly what was given -------------------------
 
 def test_set_forwards_every_given_param():

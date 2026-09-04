@@ -521,3 +521,105 @@ def test_squeeze_notch_bank_costs_under_5pct_of_the_fir_block_time():
     block_duration = SLICE_BLOCK / RATE          # the real-time budget one block actually has
     assert bank_time < 0.10 * block_duration, (bank_time, block_duration, bank_time / block_duration)
     assert bank_time < fir_time, (bank_time, fir_time, bank_time / fir_time)
+
+
+# ---- notch_overlaps: the operator's IF NOTCH vs SQUEEZE's own table --------
+
+def test_notch_overlaps_flags_an_operator_notch_within_combined_width_of_squeeze():
+    sf = SliceFilter(RATE)
+    sf.set(low=300, high=2700, shape="sharp")
+    sf.notch_add(1000.0, width_hz=140.0)
+    sf.notch_add(2200.0, width_hz=140.0)
+    # combined half-width (140 + 120) / 2 = 130 Hz; 60 Hz apart -- overlaps
+    sf.set_squeeze_notches([(1060.0, 120.0)])
+    st = sf.status()
+    assert st["notch_overlaps"] == [{"hz": 1000.0, "width_hz": 140.0, "squeeze_hz": 1060}]
+    sf.set_squeeze_notches([])                        # released: no overlap left
+    assert sf.status()["notch_overlaps"] == []
+
+
+def test_notch_overlaps_is_empty_when_nothing_is_close():
+    sf = SliceFilter(RATE)
+    sf.set(low=300, high=2700, shape="sharp")
+    sf.notch_add(1000.0, width_hz=140.0)
+    sf.set_squeeze_notches([(1800.0, 120.0)])          # 800 Hz away: nowhere near
+    assert sf.status()["notch_overlaps"] == []
+
+
+# ---- ANF found tones carry their own width_hz -------------------------------
+
+def test_anf_found_entries_carry_their_own_width_hz():
+    sf = SliceFilter(RATE)
+    sf.set(low=300, high=2700, shape="sharp", anf=True)
+    sf.anf_found = [(1000.0, ANF_WIDTH_HZ), (-1500.0, ANF_WIDTH_HZ)]
+    anf = sf.status()["anf"]
+    assert anf["found_hz"] == [1000, 1500]
+    assert anf["width_hz"] == [round(ANF_WIDTH_HZ), round(ANF_WIDTH_HZ)]
+
+
+# ---- floor_db: the waterfall's 20th-percentile convention -------------------
+
+def test_floor_db_is_the_20th_percentile_of_the_raw_spectrum_not_the_busy_median():
+    """Three strong carriers filling most of the DISPLAYED passband must not
+    drag floor_db up to their own level: the floor is the 20th percentile of
+    the full 1024-bin raw spectrum (the waterfall's own convention), not the
+    median of the 128 interpolated display points, which a busy passband can
+    push above every weak signal in it."""
+    sf = SliceFilter(RATE)
+    sf.set(low=100, high=2900)
+    f = sf.spec_f
+    spec = np.full(len(f), -100.0)                     # background noise everywhere
+    for lo, hi in ((100, 900), (1000, 1800), (1900, 2700)):    # three strong carriers,
+        spec[(f >= lo) & (f <= hi)] = -20.0                    # filling most of the passband
+    sf.spec_db = spec
+    sp = sf.spectrum_db()
+    assert sp["floor_db"] < -60.0                       # stays near the true background
+
+
+# ---- response_db is cached between redesigns --------------------------------
+
+def test_response_db_caches_between_redesigns_and_does_not_recompute(monkeypatch):
+    """Two /filter polls with nothing changed in between must not re-walk
+    128 points' worth of response_at's per-tap complex exponential sum --
+    GET /filter is polled every UI tick, and 'sharp' is 1023 taps."""
+    import aether_gate.core.filter_response as respmod
+    sf = SliceFilter(RATE)
+    sf.set(low=300, high=2700, shape="sharp")
+    calls = {"n": 0}
+    real = respmod.response_at
+
+    def counting(*a, **kw):
+        calls["n"] += 1
+        return real(*a, **kw)
+
+    monkeypatch.setattr(respmod, "response_at", counting)
+    first = sf.response_db()
+    assert calls["n"] > 0
+    calls["n"] = 0
+    second = sf.response_db()
+    assert calls["n"] == 0
+    assert second is first
+
+
+def test_response_db_recomputes_once_the_filter_actually_changes():
+    sf = SliceFilter(RATE)
+    sf.set(low=300, high=2700, shape="sharp")
+    first = sf.response_db()
+    sf.set(low=300, high=2600)                          # a real change
+    sf.apply(np.zeros(64, dtype=np.complex128))          # apply() is what redesigns
+    second = sf.response_db()
+    assert second is not first
+    assert second["hz"] != first["hz"] or second["db"] != first["db"]
+
+
+# ---- spec_tc: the spectrum EMA's time constant, settable and clamped -------
+
+def test_spec_tc_is_settable_through_filter_set_and_clamped():
+    sf = SliceFilter(RATE)
+    sf.set(spec_tc=0.2)
+    assert sf.spec.spec_tc_s == 0.2
+    assert sf.status()["spec_tc_s"] == 0.2
+    sf.set(spec_tc=100.0)                                # clamped, not rejected
+    assert sf.spec.spec_tc_s == 5.0
+    sf.set(spec_tc=0.001)
+    assert sf.spec.spec_tc_s == 0.05

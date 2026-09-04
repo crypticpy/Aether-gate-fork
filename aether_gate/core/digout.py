@@ -335,8 +335,15 @@ class DigSearch:
             self._judge(op, value, now)
 
     def _judge(self, op, value, now):
-        delta = round(value - self.incumbent, 3)
-        kept = delta >= self.margin_db
+        if self.incumbent is None:
+            # No baseline to compare against (shouldn't happen -- a candidate
+            # is only ever measured after feed()'s baseline branch sets it --
+            # but a defensive guard belongs here too): adopt the measurement
+            # outright, the same as a kept step.
+            delta, kept = 0.0, True
+        else:
+            delta = round(value - self.incumbent, 3)
+            kept = delta >= self.margin_db
         self.trials_done += 1
         self.steps.append({"knob": op["knob"], "from": op["from"], "to": op["to"],
                            "delta_db": delta, "kept": bool(kept),

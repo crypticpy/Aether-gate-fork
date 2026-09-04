@@ -26,6 +26,7 @@ import numpy as np
 
 from .agc import AGC_MODES, AGC_THRESHOLD_DB, Agc
 from .contour import PROFILE_BAND_HZ, fit_contour
+from .filter_response import notch_overlaps, response_at, response_snapshot, spectrum_snapshot
 from .notchbank import NotchBank
 
 SHAPES = {"soft": 255, "sharp": 1023}   # soft: 196 Hz transition at 25 kS/s; 127 taps ate
@@ -33,6 +34,7 @@ SHAPES = {"soft": 255, "sharp": 1023}   # soft: 196 Hz transition at 25 kS/s; 12
 DESIGN_N = 4096                      # frequency-sampling grid for the design
 SPEC_N = 1024                        # analysis FFT (24 Hz/bin at 25 kS/s)
 SPEC_TC_S = 1.0
+SPEC_FLOOR_PCTL = 20.0                # the waterfall's floor: a busy median is a signal, not a floor
 SPEC_WARMUP_BLOCKS = 30              # ~1 s of averaging before the automatics read it
 AUTO_GAP_BINS = 4                    # a formant gap this wide does not end the occupied run
 MAX_NOTCHES = 6
@@ -125,6 +127,7 @@ class FilterSpec:
         self.agc_mode = "med"
         self.agc_attack_ms, self.agc_decay_ms, self.agc_hang_ms = AGC_MODES["med"]
         self.agc_threshold_db = AGC_THRESHOLD_DB
+        self.spec_tc_s = SPEC_TC_S                 # the 1 s spectrum EMA, settable
 
     def copy(self):
         c = FilterSpec()
@@ -168,12 +171,6 @@ def design_taps(rate_hz, low_hz, high_hz, shape="soft", notches=(), contour=None
     ref = np.exp(-2j * np.pi * ref_hz / rate_hz * (np.arange(n) - (n - 1) / 2.0))
     gain = abs(np.sum(hp * ref))
     return (h / gain if gain > 0 else h).astype(np.complex128)
-
-
-def response_at(taps, rate_hz, hz):
-    """|H| in dB of complex taps at one signed frequency."""
-    k = np.arange(len(taps)) - (len(taps) - 1) / 2.0
-    return float(20 * np.log10(abs(np.sum(taps * np.exp(-2j * np.pi * hz / rate_hz * k))) + 1e-12))
 
 
 def blank_impulses(x, db, hold=4):
@@ -226,6 +223,8 @@ class SliceFilter:
         self.dirty = True
         self.spec_db = None                       # EMA power spectrum, dB, SPEC_N bins
         self.spec_f = np.fft.fftfreq(SPEC_N, 1.0 / self.rate_hz)
+        self._spec_f_order = np.argsort(self.spec_f)   # static: spec_f never changes
+        self._resp_cache_key = self._resp_cache = None   # response_db()'s own cache
         self.auto_low = None
         self.auto_high = None
         self.auto_source = None
@@ -319,6 +318,9 @@ class SliceFilter:
                 if v not in TALKER_SNAPS:
                     raise ValueError(f"talker_snap must be one of {TALKER_SNAPS}")
                 self.talker_snap = v
+            elif k == "spec_tc":
+                # the spectrum EMA's time constant: clamped, not rejected.
+                s.spec_tc_s = max(0.05, min(5.0, float(v)))
             else:
                 raise ValueError(f"unknown filter setting {k!r}")
         if s.high_hz - s.low_hz < 50.0 and s.low_hz - s.high_hz < 50.0:
@@ -563,7 +565,7 @@ class SliceFilter:
         if self.spec_db is None:
             self.spec_db = p
         else:
-            al = max(1.0 - math.exp(-m / self.rate_hz / SPEC_TC_S), 1.0 / self._spec_n)
+            al = max(1.0 - math.exp(-m / self.rate_hz / self.spec.spec_tc_s), 1.0 / self._spec_n)
             self.spec_db += al * (p - self.spec_db)
         self._blocks += 1
         if self._blocks % 4:
@@ -717,7 +719,9 @@ class SliceFilter:
             self.eq_lean_db = lean
             self.dirty = True
 
-    # ----- reporting ------------------------------------------------------
+    # ----- reporting --------------------------------------------------
+    # response_at/notch_overlaps/spectrum_snapshot/response_snapshot live in
+    # core/filter_response.py (this class is at its own 800-line budget).
     def status(self):
         s = self.spec
         lo, hi = self.audio_edges()
@@ -734,8 +738,10 @@ class SliceFilter:
             "transition_hz": round(2.0 * self.rate_hz / SHAPES[s.shape]),
             "sideband": "lsb" if self.lsb else "usb",
             "notches": notches, "notches_on": s.notches_on, "bypass": s.bypass,
+            "notch_overlaps": notch_overlaps(s.notches, self.squeeze_notches, sgn),
             "anf": {"enabled": s.anf,
                     "found_hz": [round(abs(hz)) for hz, _w in self.anf_found],
+                    "width_hz": [round(w) for _hz, w in self.anf_found],
                     "depth_db": [round(-response_at(self.taps, self.rate_hz, hz), 1)
                                  for hz, _w in self.anf_found]},
             "contour": self._contour_status(),
@@ -754,25 +760,15 @@ class SliceFilter:
                        "remembered": sorted(int(k[1]) for k in self.talker_filters
                                             if k[0] == self._band)},
             "roofing": {"analogue_hz": None, "digital_hz": round(self.rate_hz)},
+            "spec_tc_s": s.spec_tc_s,
             "_sign": sgn,
         }
 
     def spectrum_db(self, points=128):
-        """What is arriving ahead of the filter, on response_db's grid: the
-        1 s spectrum the auto width and the ANF read, in dB below its peak,
-        with the floor (its median) on the same scale. None until heard."""
-        if self.spec_db is None:
-            return None
-        lo, hi = self.audio_edges()
-        f_audio = np.linspace(0.0, max(hi + 500.0, 3500.0), points)
-        f = self._sign() * f_audio
-        order = np.argsort(self.spec_f)
-        p = np.interp(f, self.spec_f[order], self.spec_db[order])
-        peak = float(np.max(p))
-        floor = float(np.median(p))
-        return {"hz": [round(x) for x in f_audio],
-                "db": [round(max(float(x) - peak, -120.0), 1) for x in p],
-                "floor_db": round(floor - peak, 1)}
+        """What is arriving ahead of the filter -- see filter_response.py's
+        spectrum_snapshot for the shape. None until heard (spec_db is)."""
+        return spectrum_snapshot(self.spec_db, self.spec_f, self._spec_f_order,
+                                 self.audio_edges(), self._sign(), points, SPEC_FLOOR_PCTL)
 
     def combined_response_db(self, hz):
         """|H| in dB at one signed frequency, the FIR and the SQUEEZE notch
@@ -786,15 +782,18 @@ class SliceFilter:
         return response_at(self.taps, self.rate_hz, hz) + self._squeeze_bank.response_db(hz)
 
     def response_db(self, points=128):
-        """The designed response across the audio band, for a picture -- FIR
-        and SQUEEZE notch together (see combined_response_db), except while
-        HEAR RAW holds (bypass=on): flat 0 dB, since nothing is in circuit."""
+        """The designed response across the audio band -- see core/
+        filter_response.py's response_snapshot for the shape. Cached
+        against self.taps' own identity (a redesign always replaces it --
+        the exact thing `dirty` guards in apply()) and the SQUEEZE bank's
+        recompute counter: a poll between two redesigns is a dict lookup,
+        not up to 1023 taps' worth of exponentials at 128 points."""
         if self.taps is None:
             self._redesign()
-        lo, hi = self.audio_edges()
-        f_audio = np.linspace(0.0, max(hi + 500.0, 3500.0), points)
-        if self.spec.bypass:
-            return {"hz": [round(x) for x in f_audio], "db": [0.0] * points}
-        f = self._sign() * f_audio
-        return {"hz": [round(x) for x in f_audio],
-                "db": [round(max(self.combined_response_db(fx), -120.0), 1) for fx in f]}
+        key = (id(self.taps), self._squeeze_bank.recomputes, points, self.spec.bypass)
+        if self._resp_cache_key == key:
+            return self._resp_cache
+        out = response_snapshot(self.taps, self.rate_hz, self._squeeze_bank,
+                                self.audio_edges(), self._sign(), self.spec.bypass, points)
+        self._resp_cache_key, self._resp_cache = key, out
+        return out

@@ -324,6 +324,21 @@ def test_an_empty_run_reports_no_near_miss_rather_than_crashing():
     assert s.gain_db == 0.0 and s.report()["note"] is None
 
 
+def test_judge_with_no_incumbent_adopts_the_measurement_rather_than_crashing():
+    """_judge() is only ever reached after feed()'s baseline branch has set
+    self.incumbent, but `value - self.incumbent` with no guard is one bad
+    call away from a TypeError. A None incumbent adopts the candidate
+    outright (delta 0, kept), the same shape a genuinely kept step gets."""
+    s = digout.DigSearch(60)
+    s.begin(SNAP, 0.0)
+    s.incumbent = None
+    op = {"op": "measure", "target": "slice", "knob": "post", "from": True, "to": "v2"}
+    s._judge(op, 5.0, 1.0)
+    assert s.incumbent == 5.0
+    assert s.steps[-1]["kept"] is True
+    assert s.steps[-1]["delta_db"] == 0.0
+
+
 def test_set_kwargs_speak_the_adapters_own_language():
     assert digout.set_kwargs("post", "v2") == {"post": "v2"}
     assert digout.set_kwargs("nb", "auto") == {"nb": "auto"}
