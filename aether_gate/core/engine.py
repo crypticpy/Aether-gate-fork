@@ -3706,7 +3706,10 @@ def start_control_server(radio, port):
             subscriptable" of 2026-09-03 came back from a route the log
             never named)."""
             log(f"[ctl] {u.path} refused {u.query!r}: {type(e).__name__}: {e}")
-            return self._json({"error": f"bad value: {e}"})
+            # The route travels IN the text too: the app shows a refusal on
+            # whatever tile last wrote, and the CHAIN window's note echoes
+            # refusals of writes the FILTER page made.
+            return self._json({"error": f"bad value: {e} ({u.path}?{u.query})"})
 
         def _json(self, obj):
             body = json.dumps(obj).encode()

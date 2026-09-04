@@ -104,6 +104,16 @@ def test_a_refused_write_is_logged_with_its_route_and_query(capsys):
     assert "/filter/set refused 'low=abc': ValueError" in out
 
 
+def test_a_refusal_names_its_route_and_query_in_the_text_itself():
+    """What the operator sees is the text alone, on whichever tile wrote
+    last -- and the CHAIN window's note echoes refusals the FILTER page
+    earned. Mutation: drop the (path?query) suffix in _refuse."""
+    a = FakeFilterAdapter()
+    _, port = _start(a)
+    err = _get(port, "/filter/set?low=abc")["error"]
+    assert err.startswith("bad value") and err.endswith("(/filter/set?low=abc)")
+
+
 def test_bypass_and_the_notch_flag_arrive_as_flags_not_as_floats():
     """Both are new entries in _FILTER_FLAGS; without them "bypass=on" would
     reach the adapter as float("on") and answer with a bad-value error."""
