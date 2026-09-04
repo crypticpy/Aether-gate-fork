@@ -51,8 +51,11 @@ _ALLOCATIONS = tuple(
 
 # A window may be relabelled from these; a window the finder called "cw" is
 # left alone (a CW operator inside the FT8 window is a real, if rude, thing,
-# and keying is measured evidence rather than a guess).
-REFINABLE = ("voice", "data", "carrier", "noise", "signal", "rtty")
+# and keying is measured evidence rather than a guess). Nor "noise", which
+# since 2026-09-03 means the finder decided there is no station here -- the
+# band plan is a prior on what a signal IS and may not be the whole reason a
+# signal exists, which is what naming a dead window "ft8" amounts to.
+REFINABLE = ("voice", "data", "carrier", "signal", "rtty")
 
 
 def sub_band(lo_hz, hi_hz, overlap=OVERLAP_FRAC):

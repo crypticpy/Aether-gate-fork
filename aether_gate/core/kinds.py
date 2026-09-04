@@ -11,8 +11,9 @@ window, and a static crash is loud, deep and broad. So the same frames that
 make the score also make a verdict, from features that separate the things
 actually on a band:
 
-  voice     a phone-wide patch (1.5-2.7 kHz) whose envelope swings at
-            syllable rate, 2-8 Hz, and swings deeply
+  voice     a patch as wide as an SSB passband and no wider -- 1.5 kHz up,
+            and a contiguous run no broader than anybody talks over -- whose
+            envelope swings at syllable rate, 2-8 Hz, and swings deeply
   cw        a few hundred hertz wide at most, envelope hard on and off at
             a keying rate rather than continuously varying
   data      a fixed width and a constant envelope: PSK, RTTY, FT8 mid-burst
@@ -24,11 +25,16 @@ actually on a band:
   psk31     what the map can see of them is a filled block on all the time,
             and where that block SITS is the rest of the evidence
   signal    something is standing over the local floor and nothing above
-            fitted it well enough to name. An honest row an operator can go
-            and listen to, and the reason a CW column is no longer dropped
-            for failing to look like speech
-  noise     nothing standing above the band's own floor here, or something
-            impulsive, or hash that fills the window without any structure
+            fitted it well enough to name -- or two of them fitted equally
+            well, which is the same admission. An honest row an operator can
+            go and listen to, and the reason a CW column is no longer dropped
+            for failing to look like speech. It ships at SIGNAL_MAX_CONF,
+            because an admission is never a bet
+  noise     something impulsive, or the weather: a window with no line
+            standing over the floor UNDERNEATH it, rising and falling with
+            the whole band's floor instead. Not a name for a window nothing
+            else fitted -- that is `signal` -- and not a name for a window
+            with nothing in it either, which verdict() answers on its own
 
 What this cannot do, said plainly so a confidence of 0.4 reads as the honest
 number it is. The map's points are ~244 Hz apart and the frames arrive ~30 a
@@ -129,6 +135,21 @@ SIGNAL_PRESENT = 0.5           # ...and something is certainly here: "signal".
                                # All three, so that a modest but CLEAR verdict
                                # ("voice 0.30, nothing else near it") keeps its
                                # name and only a genuine tie is renamed.
+
+SSB_RUN_HZ = (6000.0, 12000.0) # the contiguous occupied RUN through a window's
+                               # strongest point, which -- unlike bw_hz -- is not
+                               # capped by the 2.7 kHz window and so is the one
+                               # measure that can say a patch is WIDER than any
+                               # conversation. Measured over three off-air
+                               # captures every talker's run came out
+                               # 977-4639 Hz (the top of that is two adjacent
+                               # talkers merged), so a six-kilohertz run is
+                               # already more than a busy phone band produces
+                               # and twelve is a flat block, not a voice.
+SIGNAL_MAX_CONF = 0.40         # "signal" is an admission that nothing named the
+                               # window, so it is never a bet: whatever the
+                               # presence, the confidence in the KIND is a coin
+                               # toss and the number has to read like one.
 
 RESOLVED_POINTS = (5.0, 8.0)   # map points across one window: fewer than this
                                # and no width verdict has been earned at all.
@@ -283,6 +304,18 @@ def features(W, floor, mean_points, snr_db, depth, syllabic, occupancy,
     right = np.where(lo + win < len(p), occ[right_i], False)
     crosses = ((exc[:, 0] > detect) & left) | ((exc[:, -1] > detect) & right)
     bw_hz = np.where(crosses, win * step_hz, bw_hz)
+    # ...and how far the signal under the window's strongest point reaches in
+    # EITHER direction, which bw_hz cannot say: a window is 2.7 kHz across, so
+    # every occupied width saturates there and a 12 kHz block of hash and a
+    # conversation read the same number. The contiguous run of occupied points
+    # through the peak is not capped by the window, and it is the only thing
+    # here that can tell "as wide as somebody talking" from "wider than anybody
+    # talks" -- see SSB_RUN_HZ.
+    grp = np.cumsum(~occ)                                  # a run id per point
+    lens = np.bincount(grp[occ], minlength=int(grp[-1]) + 1) if occ.any() else None
+    pk_i = np.clip(lo + np.argmax(exc, axis=1), 0, len(p) - 1)
+    run_hz = (np.where(occ[pk_i], lens[grp[pk_i]], 0.0) * step_hz if lens is not None
+              else np.zeros(nwin))
     # ...and the energy width, which is what `filled` means: hash with no
     # structure needs nearly the whole window to account for its energy, a
     # station needs a fraction of it.
@@ -292,6 +325,7 @@ def features(W, floor, mean_points, snr_db, depth, syllabic, occupancy,
 
     return {
         "bw_hz": bw_hz,
+        "run_hz": run_hz,
         # the strongest point over its own floor, in dB: what says a narrow
         # signal is there at all, since the window SNR cannot
         "peak_db": (10.0 * np.log10(1.0 + peak) if peak_db is None
@@ -321,10 +355,29 @@ def present(feat):
                       _ramp(feat.get("peak_db", feat["snr_db"]), PEAK_PRESENT_DB))
 
 
+def station(feat):
+    """How sure a window holds a TRANSMITTER, which is `present` less the one
+    thing that is present and is not one: a window whose envelope rises and
+    falls with the whole band's floor is the weather.
+
+    Measured on three off-air captures, every talker in them reads floor_corr
+    -0.10 to 0.50 and every window of bare band under QRN reads 0.44-0.98 --
+    and it was those, at 0.3-1.9 dB SNR, that the live gate was calling
+    "voice 0.82" and "voice 1.00" on 2026-09-03. Weather used to be checked
+    only by the `noise` verdict, where it competed with the other four instead
+    of disqualifying them, so a lightning-lit window with a syllable-rate
+    flicker in it was a conversation.
+    """
+    return present(feat) * (1.0 - _ramp(feat["floor_corr"], FLOOR_TRACK))
+
+
 def scores(feat):
     """A 0..1 verdict per kind. They do not sum to one; the winner takes it."""
     here = present(feat)                  # not shadowed: scores() calls it
-    absent = 1.0 - here
+    # ...and what every NAMED kind is scored against instead, so that the
+    # weather cannot win one of them by looking like it. `here` is kept for
+    # the two verdicts that are about the band rather than about a station.
+    tx = station(feat)
     syl = _ramp(feat["syllabic"], SYLLABIC_VOICE)
     # Where the map is fine enough, width says which of a tone and a
     # conversation this is. Where it is not -- a 2 MHz span puts three
@@ -362,41 +415,76 @@ def scores(feat):
     impulsive = _ramp(feat["crest"], CREST_IMPULSE) * (1.0 - _ramp(feat["occupancy"],
                                                                   OCCUPANCY_HERE))
     weather = _ramp(feat["floor_corr"], FLOOR_TRACK)
+    # Wider than anybody talks. bw_hz saturates at the window, so this is the
+    # only term that can put an upper bound on an SSB passband at all; it is
+    # set well clear of two merged talkers (see SSB_RUN_HZ) so that what it
+    # actually disqualifies is a flat block of hash or of digital carriers
+    # spread across ten kilohertz, which the envelope terms alone would let
+    # through as speech whenever the band flickered at syllable rate.
+    ssb = 1.0 - _ramp(feat.get("run_hz", 0.0), SSB_RUN_HZ)
+    # is there a LINE here -- something standing over the floor UNDER it --
+    # as opposed to a window the whole band's floor has lifted?
+    line = _ramp(feat.get("peak_db", feat["snr_db"]), PEAK_PRESENT_DB)
     # On all the time. A block of FT8 is; an operator is not, whatever else
     # the two have in common.
     ontime = _ramp(feat["duty"], ONTIME)
     spoken_block = _ramp(feat["syllabic"], SPOKEN_BLOCK)
-    # A whole sub-band of digital signals fills its window edge to edge, stays
-    # on, and is not paced by syllables. Measured on the live gate 2026-09-03,
-    # the FT8 window on 20 m read depth 0.39 and syllabic 0.52: `steady` was
-    # 0.04, so the old data term could not claim it, `swung` was 0.63 and
-    # `syl` 0.68, so voice did -- at 14074.0 and again at 14080.5, the FT8 and
-    # FT4 windows, both called "voice". What separates them from a talker is
-    # not the envelope at all: it is that a talker's energy is in the bottom
-    # kilohertz of his passband (`filled` ~0.4) and a block's is everywhere.
-    block = here * filled * (1.0 - spoken_block) * ontime
+    # A whole sub-band of digital signals is phone-wide or wider, stays on, and
+    # is not paced by syllables. Measured on the live gate 2026-09-03, the FT8
+    # window on 20 m read depth 0.39 and syllabic 0.52: `steady` was 0.04, so
+    # the old data term could not claim it, `swung` was 0.63 and `syl` 0.68, so
+    # voice did -- at 14074.0 and again at 14080.5, the FT8 and FT4 windows,
+    # both called "voice". What separates them from a talker is that a block is
+    # ON: an operator stops to listen, a block never does.
+    #
+    # This used to be gated on `filled` (the share of the window's energy width
+    # it takes to account for BW_ENERGY_FRAC of the excess) against FILLED_FRAC,
+    # which was two mistakes at once. It is the same expression the `noise`
+    # verdict used for hash, so the two tied exactly -- the synthetic FT8 block
+    # scored data 0.455 and noise 0.455, and shipped whichever way one point of
+    # drift pushed it, at a confidence of 0.23 on a thing nobody is unsure
+    # about. And a block only reads `filled` over 0.85 in the one window
+    # centred on it: the same block one window along read 0.73 and lost its
+    # name. Width and on-time are the block's own two facts and both hold
+    # wherever the window sits.
+    block = tx * wide * (1.0 - spoken_block) * ontime
     # Two tones a standard shift apart, held on: RTTY, where the map can
     # resolve the shift at all. Where it cannot, this is zero and the same
     # signal lands on `data`, which is the honest answer at 244 Hz a point.
     shift_fit = np.exp(-((np.asarray(feat.get("shift_hz", 0.0), dtype=np.float64)
                           - RTTY_SHIFT_HZ) / RTTY_SHIFT_TOL_HZ) ** 2)
-    rtty = (float(feat.get("resolves_shift", 0.0)) * here * shift_fit
+    rtty = (float(feat.get("resolves_shift", 0.0)) * tx * shift_fit
             * ontime * steady * narrow)
     return {
-        "voice": here * wide * syl * swung,
-        "cw": here * narrow * keyed,
+        # syllable-rate modulation AND an SSB-shaped passband: a patch at
+        # least a kilohertz and a half wide and no wider than anybody talks
+        "voice": tx * wide * syl * swung * ssb,
+        "cw": tx * narrow * keyed,
         # a fixed width and a flat envelope, and not the single point that
         # would make it a carrier -- or a whole sub-band of them
         "data": np.maximum(
-            here * steady * (1.0 - peaky) * (1.0 - filled) * (0.5 + 0.5 * narrow),
+            tx * steady * (1.0 - peaky) * (1.0 - filled) * (0.5 + 0.5 * narrow),
             block),
         "rtty": rtty,
-        "carrier": here * narrow * steady * peaky,
-        # nothing above the floor, or a crash, or hash filling the window with
-        # no syllables and no keying in it
-        "noise": np.maximum.reduce([absent, here * impulsive, here * weather,
-                                    here * filled * (1.0 - syl) * (1.0 - keyed)]),
-        # not a kind: what classify() needs to know before it may say "signal"
+        "carrier": tx * narrow * steady * peaky,
+        # A crash, or the weather -- and the weather only where there is no
+        # LINE in the window. QRN lifts the whole band and the local floor
+        # rises with it, so a window that is only weather has nothing standing
+        # over its own floor: measured, every floor-tracking window on the
+        # three captures peaks 0.7-5.6 dB over its local floor and every
+        # station in them peaks 10.7-25.4 dB. That is what stops "noise" from
+        # being said about a narrow scored line, which is the one thing it
+        # must never be said about.
+        #
+        # What is NOT here any more is "nothing is standing over the floor",
+        # which is not a verdict about a signal but the absence of one: as a
+        # score it was `1 - present`, it beat every named kind on every window
+        # the finder was least sure about, and it is why 14119.5 kHz -- a 70 Hz
+        # column at 2.6 dB, listed at score 0.91 -- came back "noise".
+        # verdict() answers absence on its own terms.
+        "noise": np.maximum(here * impulsive, here * weather * (1.0 - line)),
+        # not a kind: what verdict() needs to know before it may say "signal",
+        # and before it may say nothing is here at all
         "_present": here,
     }
 
@@ -427,16 +515,30 @@ def verdict(feat):
     and measuring it twice would be measuring it differently.
     """
     s = scores(feat)
-    present = np.asarray(s["_present"], dtype=np.float64)
-    S = np.stack([np.asarray(np.broadcast_to(s.get(k, 0.0), present.shape),
+    here = np.asarray(s["_present"], dtype=np.float64)
+    S = np.stack([np.asarray(np.broadcast_to(s.get(k, 0.0), here.shape),
                              dtype=np.float64) for k in KINDS])
     ranked = np.sort(S, axis=0)
     # a window nothing scored at all is not the first kind in KINDS, it is the
     # last one: argmax has to answer something even when every verdict is zero
     code = np.where(ranked[-1] > 0.0, np.argmax(S, axis=0), NOISE).astype(np.int8)
     conf = np.clip(ranked[-1] - 0.5 * ranked[-2], 0.0, 1.0)
-    unsure = ((ranked[-1] < SIGNAL_TOP) & (conf < SIGNAL_CONF)
-              & (present >= SIGNAL_PRESENT))
+    # Something is certainly here and the evidence is split -- either nothing
+    # scored well, OR the top two are too close to choose between. Both, and
+    # not both-at-once as it used to be: a window where two kinds each score
+    # 0.9 is a coin toss whichever way it lands, and shipping the winner at
+    # 0.45 as though it were a verdict is the confident wrong answer this
+    # whole file exists to avoid.
+    unsure = (here >= SIGNAL_PRESENT) & ((ranked[-1] < SIGNAL_TOP)
+                                         | (conf < SIGNAL_CONF))
     code = np.where(unsure, SIGNAL, code).astype(np.int8)
-    conf = np.where(unsure, present, conf)
+    conf = np.where(unsure, np.minimum(here, SIGNAL_MAX_CONF), conf)
+    # ...and nothing is here at all: the only thing "noise" says on its own,
+    # said where it belongs rather than as a score that outranked the rest.
+    # A window with a real verdict in it keeps it however weakly present it is
+    # -- a keyed column is one point of eleven and its window barely lifts --
+    # so this is the floor under the list, not a kind that competes for rows.
+    quiet = (here < SIGNAL_PRESENT) & (ranked[-1] < SIGNAL_TOP)
+    code = np.where(quiet, NOISE, code).astype(np.int8)
+    conf = np.where(quiet, 1.0 - here, conf)
     return code, conf.astype(np.float32)

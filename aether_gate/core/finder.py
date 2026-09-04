@@ -463,18 +463,26 @@ class Finder:
         excess = np.maximum(peak_db, snr_db)
         detect = (DETECT_MAX * _ramp(excess, DETECT_DB)
                   * _clip01(wpres / DETECT_PRESENT_FRAC))
-        score = np.maximum(voice, detect)
-        # per-loop window power against each loop's own floor, for the gain
-        pa_w = np.mean(self._window_sums(F[:, 0]), axis=0)
-        pb_w = np.mean(self._window_sums(F[:, 1]), axis=0)
-        na_w = np.mean(np.median(F[:, 0], axis=1)) * self.win
-        nb_w = np.mean(np.median(F[:, 1], axis=1)) * self.win
         # what each window is, from the same frames the score came from, held
         # steady across rows so the answer is the band's and not the second's
         feat = kinds.features(W, floor, mean_points, snr_db, depth, syllabic,
                               occupancy, self.win, WINDOW_STEP_POINTS, self.step_hz,
                               floor_points=floor_pts, peak_db=peak_db)
         kind, kconf = self._hold(*kinds.verdict(feat))
+        # A window that rises and falls with the WHOLE band's floor is the
+        # weather, and the weather flickers at syllable rate as readily as a
+        # talker does: on the 2026-09-03 80 m capture, bare band under QRN at
+        # 0.2-1.9 dB scored 0.9-1.0 here on depth and syllabic alone and sat
+        # near the top of the list, which is where the operator kept finding
+        # "voice" on frequencies with nothing on them. kinds.FLOOR_TRACK is
+        # the same correlation the verdict disqualifies a station on.
+        voice = voice * (1.0 - _ramp(feat["floor_corr"], kinds.FLOOR_TRACK))
+        score = np.maximum(voice, detect)
+        # per-loop window power against each loop's own floor, for the gain
+        pa_w = np.mean(self._window_sums(F[:, 0]), axis=0)
+        pb_w = np.mean(self._window_sums(F[:, 1]), axis=0)
+        na_w = np.mean(np.median(F[:, 0], axis=1)) * self.win
+        nb_w = np.mean(np.median(F[:, 1], axis=1)) * self.win
         self.slow[self.slow_i] = score
         self.slow_voice[self.slow_i] = voice
         self.slow_wpres[self.slow_i] = wpres

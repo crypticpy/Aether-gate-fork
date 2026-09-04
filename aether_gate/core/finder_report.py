@@ -147,9 +147,10 @@ def _pair_terms(fd, w, live_dec, c):
 def _row(fd, w, center_hz, score, snapshot, live_dec, active_s, last_s):
     """One candidate, described as it was when it scored best.
 
-    `snapshot` is (snr_db, depth, syllabic, kind code, kind confidence) from
-    that row: twenty seconds after the last over, "now" is the floor, and a
-    row has to describe the conversation it lists.
+    `snapshot` is (snr_db, depth, syllabic) from that row: twenty seconds after
+    the last over, "now" is the floor, and a row has to describe the
+    conversation it lists. The KIND is not taken from that row -- see
+    snapshot() in payload().
     """
     snr_w, depth_w, syl_w, kind_w, kconf_w = snapshot
     kind = kinds.name(kind_w)
@@ -253,13 +254,33 @@ def payload(fd, center_hz=0.0, live=None, tuned_hz=None):
     dec = live.decimated(fd.points) if live is not None else None
 
     def snapshot(w):
+        """The LEVELS from the row this window scored best on, and the KIND
+        from the last row it was actually there on.
+
+        Those are two different questions and were answered from one row. The
+        best row is chosen by a maximum over thirty seconds of a noisy score,
+        which picks each window at its most flattering second -- and taking the
+        kind from it threw away the whole of Finder._hold, whose job is to make
+        the verdict the band's rather than one second's. On the 2026-09-03 80 m
+        capture, three windows of bare band under QRN came back "voice" that
+        way, off the one row in thirty where the floor happened to move at
+        syllable rate, while the held verdict on all three was "noise".
+
+        The last row the window stood over its own floor is the honest one:
+        for anything on the air now that is this second's held verdict, and for
+        a conversation that stopped it is what the conversation was, which is
+        the row this list is supposed to be describing.
+        """
+        seen = np.nonzero(here[:, w])[0]
+        r = int(seen[-1]) if len(seen) else None
+        kind = ((int(kind_rows[r, w]), float(kconf_rows[r, w])) if r is not None
+                else (int(last["kind"][w]), float(last["kind_conf"][w])))
         if best is None:
             return (float(last["snr_db"][w]), float(last["depth"][w]),
-                    float(last["syllabic"][w]), int(last["kind"][w]),
-                    float(last["kind_conf"][w]))
-        r = best[w]
-        return (float(terms[r, 0, w]), float(terms[r, 1, w]), float(terms[r, 2, w]),
-                int(kind_rows[r, w]), float(kconf_rows[r, w]))
+                    float(last["syllabic"][w])) + kind
+        b = best[w]
+        return (float(terms[b, 0, w]), float(terms[b, 1, w]),
+                float(terms[b, 2, w])) + kind
 
     def age(w):
         hit = np.nonzero(here[:, w])[0]

@@ -278,7 +278,11 @@ def test_what_cannot_be_named_is_kept_as_a_signal():
             "resolved": 1.0, "shift_hz": np.array([0.0]), "resolves_shift": 0.0}
     code, conf = kinds.verdict(feat)
     assert kinds.name(code[0]) == "signal", (kinds.name(code[0]), conf[0])
-    assert conf[0] >= 0.9
+    # ...and it is not a bet. "signal" says something is certainly there and
+    # nothing named it, so the confidence in the KIND is a coin toss whatever
+    # the confidence in the presence: it used to ship the presence itself, and
+    # a row reading "signal 1.00" claims certainty about an admission.
+    assert 0.0 < conf[0] <= kinds.SIGNAL_MAX_CONF, conf[0]
 
 
 # --- the list, and the strips ----------------------------------------------

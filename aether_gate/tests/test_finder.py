@@ -202,3 +202,287 @@ def test_a_retune_bigger_than_the_span_resets_the_finder_and_the_live_rows():
     assert fd.candidates(CENTER + huge, live) == {"available": False}
     assert live.rows(CENTER + huge) is None
     assert fd.fast_n == 0 and fd.slow_n == 0
+
+
+# =========================================================================
+# What the thing IS -- and, for each rule, what it would say without it
+# =========================================================================
+# The 2026-09-03 evening report: "it's still not 100% accurate. It's picking
+# things up as voice that are clearly not." Every case below is a rule the
+# classifier has to hold, checked twice: once that it holds, and once with the
+# rule's own threshold pushed out of reach, so a test that would still pass
+# with the rule deleted cannot sit here quietly.
+#
+# The mutation is always to a CONSTANT rather than to an expression, because a
+# constant is the thing the rule is written in: NEVER_HZ/NEVER_FRAC put a ramp
+# somewhere no measurement can reach, which is exactly "as if this term were
+# not there".
+from aether_gate.core import kinds                                      # noqa: E402
+from aether_gate.tests.test_finder_weak import CENTER as WEAK_CENTER    # noqa: E402
+from aether_gate.tests.test_finder_weak import Scene, _at               # noqa: E402
+from aether_gate.tests.test_kinds import FLAP_PATH, _replay             # noqa: E402
+from aether_gate.tests.test_kinds import needs_flap_capture             # noqa: E402
+
+NEVER_HZ = (1e12, 2e12)          # a width ramp no signal can climb
+NEVER_FRAC = (10.0, 11.0)        # ...and a 0..1 one, for the same purpose
+ALWAYS_FRAC = (-2.0, -1.0)       # ...and its opposite, for a ramp read downwards
+
+
+def _kind_at(fd, hz, margin=1500.0):
+    c = _at(fd.candidates(WEAK_CENTER)["candidates"], hz, margin)
+    return (c["kind"], c["kind_conf"]) if c else (None, None)
+
+
+def _win(feat, **over):
+    """One window's features as a dict of length-1 arrays, ready for verdict()."""
+    base = {"snr_db": 8.0, "peak_db": 12.0, "bw_hz": 2000.0, "run_hz": 2400.0,
+            "filled": 0.4, "depth": 0.8, "syllabic": 0.7, "occupancy": 0.5,
+            "mid": 0.05, "duty": 0.5, "crest": 2.0, "floor_corr": 0.0,
+            "peak_frac": 0.3, "shift_hz": 0.0}
+    base.update(feat)
+    base.update(over)
+    out = {k: np.array([float(v)]) for k, v in base.items()}
+    out["resolved"] = 1.0
+    out["resolves_shift"] = 0.0
+    return out
+
+
+def _verdict(feat):
+    code, conf = kinds.verdict(feat)
+    return kinds.name(code[0]), float(conf[0])
+
+
+# --- a block of digital carriers is data, not a conversation ---------------
+
+def test_a_block_of_tones_is_data_and_only_because_it_is_on_all_the_time():
+    """A 50 Hz-stepped block of tones filling a 3 kHz stretch. It swings its
+    envelope and it is phone-wide, which is most of what makes a talker; what
+    it is not is a man who stops to listen."""
+    fd = Scene(seed=41).block(14_120_000.0, 9.0).run()
+    kind, conf = _kind_at(fd, 14_121_500.0, margin=3_000.0)
+    assert kind in kinds.DIGITAL, kind
+    assert conf >= 0.7, conf                    # nobody is unsure about a block
+
+
+# The FT8 window on 20 m as the live gate measured it on 2026-09-03, when it
+# called 14074.0 "voice 0.41": phone-wide, on all the time, envelope swinging
+# 0.39 with 52% of that swing at syllable rate. Synthesised blocks are flatter
+# than this and would pass the rule below without exercising it.
+FT8_WINDOW = {"bw_hz": 2600.0, "run_hz": 3000.0, "filled": 0.55, "depth": 0.39,
+              "syllabic": 0.52, "occupancy": 1.0, "duty": 0.95, "crest": 1.5,
+              "peak_frac": 0.15, "mid": 0.05}
+
+
+def test_the_measured_ft8_window_is_data_and_not_the_voice_it_shipped_as():
+    kind, conf = _verdict(_win(FT8_WINDOW))
+    assert kind == "data" and conf >= 0.7, (kind, conf)
+
+
+def test_without_the_on_all_the_time_rule_the_ft8_window_is_voice_again(monkeypatch):
+    """The reported field value, reproduced: "voice", at 0.41."""
+    monkeypatch.setattr(kinds, "ONTIME", NEVER_FRAC)
+    kind, conf = _verdict(_win(FT8_WINDOW))
+    assert kind == "voice" and conf == pytest.approx(0.41, abs=0.05), (kind, conf)
+
+
+def test_a_block_wider_than_anybody_talks_is_never_a_conversation():
+    """Ten kilohertz of filled band, syllables or no syllables. bw_hz cannot
+    see this -- every occupied width saturates at the 2.7 kHz window -- so it
+    is the contiguous RUN through the window's peak that has to say so."""
+    feat = _win({}, run_hz=15_000.0)            # everything else voice-shaped
+    assert _verdict(feat)[0] != "voice", _verdict(feat)
+    assert _verdict(_win({}))[0] == "voice"     # ...the same window, 2.4 kHz wide
+
+
+def test_without_the_run_width_rule_the_wide_block_is_called_voice(monkeypatch):
+    monkeypatch.setattr(kinds, "SSB_RUN_HZ", NEVER_HZ)
+    assert _verdict(_win({}, run_hz=15_000.0))[0] == "voice"
+
+
+# --- a tone, keyed or held -------------------------------------------------
+
+def test_a_steady_narrow_tone_is_a_carrier():
+    fd = Scene(seed=42).carrier(14_110_000.0, 15.0).run()
+    kind, conf = _kind_at(fd, 14_110_000.0, 600.0)
+    assert kind == "carrier" and conf >= 0.7, (kind, conf)
+
+
+def test_without_the_steady_envelope_rule_the_tone_is_not_a_carrier(monkeypatch):
+    monkeypatch.setattr(kinds, "DEPTH_STEADY", ALWAYS_FRAC)   # nothing reads steady
+    fd = Scene(seed=42).carrier(14_110_000.0, 15.0).run()
+    assert _kind_at(fd, 14_110_000.0, 600.0)[0] != "carrier"
+
+
+def test_a_keyed_narrow_tone_is_cw():
+    fd = Scene(seed=43).cw(14_090_000.0, 15.0, wpm=20.0).run()
+    kind, conf = _kind_at(fd, 14_090_000.0, 600.0)
+    assert kind == "cw" and conf >= 0.7, (kind, conf)
+
+
+def test_without_the_keying_duty_rule_the_keyed_tone_is_not_cw(monkeypatch):
+    """Key-down some of the time and not all of it is what separates an
+    operator from a tone left switched on."""
+    monkeypatch.setattr(kinds, "DUTY_ON", NEVER_FRAC)
+    fd = Scene(seed=43).cw(14_090_000.0, 15.0, wpm=20.0).run()
+    assert _kind_at(fd, 14_090_000.0, 600.0)[0] != "cw"
+
+
+# --- somebody talking ------------------------------------------------------
+
+def test_a_syllabic_phone_wide_signal_is_voice():
+    fd = Scene(seed=44).voice(14_170_000.0, 9.0).run()
+    kind, conf = _kind_at(fd, 14_169_500.0)     # USB: the dial sits below it
+    assert kind == "voice" and conf >= 0.7, (kind, conf)
+
+
+def test_without_the_syllabic_rule_the_talker_is_not_voice(monkeypatch):
+    monkeypatch.setattr(kinds, "SYLLABIC_VOICE", NEVER_FRAC)
+    fd = Scene(seed=44).voice(14_170_000.0, 9.0).run()
+    assert _kind_at(fd, 14_169_500.0)[0] != "voice"
+
+
+def test_without_the_ssb_width_rule_the_talker_is_not_voice(monkeypatch):
+    """Syllables alone are not speech: a keyed tone swings at a few hertz too.
+    Voice needs an SSB-shaped passband as well, and this is the lower half of
+    that -- at least a kilohertz and a half of it."""
+    monkeypatch.setattr(kinds, "WIDE_HZ", NEVER_HZ)
+    fd = Scene(seed=44).voice(14_170_000.0, 9.0).run()
+    assert _kind_at(fd, 14_169_500.0)[0] != "voice"
+
+
+# --- the weather is not a station ------------------------------------------
+
+# 3.9875 MHz on the 2026-09-03 04:34 recording as the finder measured it:
+# bare band, 1.9 dB, nothing standing 6 dB over the floor under it, and an
+# envelope 0.78 correlated with the whole band's -- and it came back "voice".
+# It is deliberately WELL present (peak_db 5.6 puts `present` at 0.87), because
+# the rule under test is that presence alone is not a station.
+QRN_WINDOW = {"snr_db": 1.9, "peak_db": 5.6, "floor_corr": 0.78, "bw_hz": 2000.0,
+              "run_hz": 2400.0, "depth": 0.8, "syllabic": 0.7, "duty": 0.5}
+
+
+def test_a_window_that_moves_with_the_whole_bands_floor_is_not_voice():
+    """QRN lifts every window at once. On the 2026-09-03 80 m capture, bare
+    band at 0.3-1.9 dB whose envelope tracked the band floor at 0.78-0.98 came
+    back "voice 0.82" and "voice 1.00" -- the report, exactly."""
+    kind, _conf = _verdict(_win(QRN_WINDOW))
+    assert kind != "voice", kind
+    # ...and it is not that the window is too weak to name: the same numbers
+    # with the band's floor sitting still are a conversation
+    assert _verdict(_win(QRN_WINDOW, floor_corr=0.0))[0] == "voice"
+
+
+def test_without_the_weather_rule_the_qrn_window_is_called_voice(monkeypatch):
+    monkeypatch.setattr(kinds, "FLOOR_TRACK", NEVER_FRAC)
+    assert _verdict(_win(QRN_WINDOW))[0] == "voice"
+
+
+# --- what "noise" may and may not be said about ----------------------------
+
+def test_a_narrow_scored_present_line_is_never_called_noise():
+    """The other half of the report: 14119.5 kHz, 70 Hz wide, 2.6 dB, listed
+    at score 0.91 -- and called "noise". A line standing over the floor UNDER
+    it is a signal whatever else is going on; only a window with no line in it
+    can be the weather."""
+    for floor_corr in (0.0, 0.5, 0.99):
+        for depth, duty in ((0.02, 1.0), (0.9, 0.5)):      # held down, and keyed
+            feat = _win({}, bw_hz=250.0, run_hz=250.0, peak_frac=0.99,
+                        filled=0.09, syllabic=0.15, snr_db=2.6, peak_db=18.0,
+                        depth=depth, duty=duty, floor_corr=floor_corr)
+            kind, conf = _verdict(feat)
+            assert kind != "noise", (floor_corr, depth, kind, conf)
+    # ...including the row the report was actually about, where the narrow
+    # verdict is only PARTLY earned. 14119.5 kHz was 2.6 dB with a peak 4 dB
+    # over its own floor and a peak share of 0.6 -- narrow, certainly there,
+    # and not confidently any one thing. "Nothing is here" was scored as
+    # 1 - present = 0.47, which beat the 0.23 the carrier verdict earned, and
+    # that is how a scored 70 Hz column came back "noise".
+    half = _win({}, bw_hz=250.0, run_hz=250.0, peak_frac=0.6, filled=0.09,
+                syllabic=0.15, snr_db=2.6, peak_db=4.0, depth=0.05, duty=1.0,
+                floor_corr=0.0)
+    kind, conf = _verdict(half)
+    assert kind != "noise", (kind, conf)
+    assert conf == pytest.approx(kinds.SIGNAL_MAX_CONF), (kind, conf)
+
+
+def test_without_the_line_rule_the_weathered_narrow_line_is_called_noise(monkeypatch):
+    monkeypatch.setattr(kinds, "PEAK_PRESENT_DB", NEVER_HZ)   # no peak reads as a line
+    feat = _win({}, bw_hz=250.0, run_hz=250.0, peak_frac=0.99, filled=0.09,
+                syllabic=0.15, snr_db=2.6, peak_db=18.0, depth=0.02, duty=1.0,
+                floor_corr=0.99)
+    assert _verdict(feat)[0] == "noise"
+
+
+def test_noise_is_what_is_said_when_nothing_is_standing_over_the_floor():
+    """It still has to be said, and said confidently: bare band is bare band."""
+    kind, conf = _verdict(_win({}, snr_db=0.1, peak_db=0.2, depth=0.05,
+                               syllabic=0.4, bw_hz=100.0, run_hz=0.0))
+    assert kind == "noise" and conf >= 0.7, (kind, conf)
+
+
+# --- the confidence means something ----------------------------------------
+
+def test_a_split_verdict_is_signal_at_a_coin_tosss_confidence():
+    """Two kinds that both half-fit is not a verdict. It used to need BOTH a
+    low winner and a close runner-up before it would admit that; either is
+    enough, and the number that ships says so."""
+    tie = _win({}, depth=0.30, syllabic=0.45, bw_hz=1500.0, filled=0.5,
+               duty=0.5, mid=0.5, peak_frac=0.3)
+    kind, conf = _verdict(tie)
+    assert kind == "signal", (kind, conf)
+    assert conf == pytest.approx(kinds.SIGNAL_MAX_CONF), conf
+    assert kinds.SIGNAL_MAX_CONF <= 0.4                  # a coin toss reads like one
+
+
+@pytest.mark.parametrize("scene,hz,margin", [
+    (lambda: Scene(seed=45).voice(14_170_000.0, 12.0), 14_169_500.0, 1500.0),
+    (lambda: Scene(seed=45).cw(14_090_000.0, 15.0), 14_090_000.0, 600.0),
+    (lambda: Scene(seed=45).carrier(14_110_000.0, 15.0), 14_110_000.0, 600.0),
+    (lambda: Scene(seed=45).block(14_120_000.0, 9.0), 14_121_500.0, 3000.0),
+])
+def test_a_kind_worth_betting_on_ships_at_seven_tenths_or_better(scene, hz, margin):
+    """The calibration the report asked for: rows you would bet on at 0.7 and
+    up, coin tosses at 0.4 and down, and nothing in between pretending. The
+    FT8-shaped block is the one that used to fail this -- its data and noise
+    scores were the same expression and tied at 0.455, so it shipped at 0.23."""
+    kind, conf = _kind_at(scene().run(), hz, margin)
+    assert kind is not None and conf >= 0.7, (kind, conf)
+
+
+# --- and the same question put to a recording ------------------------------
+
+@needs_flap_capture
+def test_on_the_recorded_80m_evening_nothing_under_two_decibels_is_a_conversation():
+    """The regression, off-air. Replaying 2026-09-03 04:34 through the finder
+    before this change, three of its candidates at 0.5, 1.1 and 1.9 dB -- bare
+    band tracking its own floor at floor_corr 0.78-0.94, with nothing standing
+    over the local floor at all -- came back "voice". Every real talker on the
+    recording is 4.7 dB or better."""
+    fd, center = _replay(FLAP_PATH)
+    out = fd.candidates(center)
+    cands = out["candidates"]
+    assert len([c for c in cands if c["kind"] == "voice"]) >= 4, cands
+    weak_voice = [c for c in cands if c["kind"] == "voice" and c["snr_db"] < 2.0]
+    assert not weak_voice, weak_voice
+    # ...and the `voice_share` strip the app paints says the same thing. The
+    # score that fills it is the finder's own voice score, which had no
+    # weather term at all: 3.9706 and 3.9686 MHz -- 0.2-0.3 dB of bare band
+    # whose envelope is 0.97 correlated with the band floor -- were painted a
+    # third of the time as somebody talking, and 3.9875 nearly always.
+    # ...and the three windows the report was about, named. 3.9847, 3.9875 and
+    # 3.9901 MHz are bare band on this recording -- 0.5-1.9 dB, nothing more
+    # than 5.6 dB over the local floor under them, envelopes 0.78-0.94
+    # correlated with the whole band's, occupied runs of 0-732 Hz -- against
+    # the real talkers at 3.9230 and 3.9500, which read 10.9-14.7 dB with
+    # floor_corr about zero and three-kilohertz runs. All three came back
+    # "voice" at 0.82-1.00, off the one row in thirty each scored best on.
+    quiet = [c for c in cands if 3_984_000.0 <= c["hz"] <= 3_991_000.0]
+    assert quiet, "the QRN stretch dropped out of the list entirely"
+    assert not [c for c in quiet if c["kind"] == "voice"], quiet
+    vs = np.asarray(out["voice_share"])
+    step = fd.rate_hz / out["points"]
+    col = lambda hz: int((hz - (center - fd.rate_hz / 2)) / step)
+    for hz in (3_970_600.0, 3_968_600.0):
+        assert vs[col(hz)] <= 0.1, (hz, vs[col(hz)])
+    assert vs[col(3_987_500.0)] <= 0.6, vs[col(3_987_500.0)]
+    assert vs[col(3_950_000.0)] >= 0.8, vs[col(3_950_000.0)]   # the real talker
