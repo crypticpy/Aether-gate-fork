@@ -14,6 +14,8 @@ talker, so no site log is written (conftest.py redirects it regardless).
 
 Run:  .venv/bin/python -m pytest aether_gate/tests/test_governor.py -q
 """
+import time
+
 from aether_gate.adapters import diversity_governor as adapt
 from aether_gate.core import governor as G
 from aether_gate.core import governor_proxy as P
@@ -798,3 +800,26 @@ def test_a_status_call_that_throws_leaves_the_governor_measuring():
     r = adapt.GovernorRunner(Broken(), clock=lambda: 0.0)
     r.gov.auto = True
     assert r.tick(0.0)["state"] == "measuring"
+
+
+def test_stop_does_not_block_the_http_thread_on_a_slow_tick():
+    """stop() runs on the HTTP thread for GET /diversity/set?auto=off. The
+    tick thread's join used to wait up to 5 s for it, so
+    that one GET could stall for 5 s if a tick was slow or wedged inside an
+    adapter call. Mutation: reverting the join's timeout in stop() back to
+    something >= ~1 s."""
+    class SlowAdapter(FakeAdapter):
+        def diversity_status(self, slice_id=None):
+            time.sleep(3.0)
+            return self.div
+
+    a = SlowAdapter()
+    r = adapt.GovernorRunner(a)
+    r.set_auto(True)
+    time.sleep(1.3)                  # into the first tick's 3 s status() sleep
+    t0 = time.monotonic()
+    r.stop()
+    assert time.monotonic() - t0 < 1.0
+    assert r.status()["running"] is False       # reported not-running immediately
+    time.sleep(2.5)                  # let the blocked tick actually finish
+    assert r.status()["running"] is False        # still not running once it does

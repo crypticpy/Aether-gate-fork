@@ -758,3 +758,43 @@ def test_the_noise_bearing_rides_on_the_compass_payload_and_into_the_site_log(mo
     line = list(st.sitelog.read(kind="noise"))[-1]
     assert line["noise_bearing_deg"] == nb["bearing_deg"]
     assert line["noise_coherence"] is None or line["noise_coherence"] >= 0.0
+
+
+class _RaisingGetItemDict(dict):
+    """CPython's dict.get() does not go through a subclass's __getitem__, so
+    this distinguishes a single `.get(sid)` read from the two-step
+    `sid in d` + `d[sid]` the audit found in status(): the first is silent
+    here, the second explodes -- no actual race needed."""
+    def __getitem__(self, key):
+        raise AssertionError("status() must use .get(sid), not d[sid]")
+
+
+class _StatusStub:
+    def __init__(self, out):
+        self._out = out
+        self.post = None          # _post_status also reads self.subbands.get(sid).post
+
+    def status(self):
+        return self._out
+
+
+def test_status_reads_passband_and_subband_with_get_not_getitem():
+    """Mutation: reverting `pb = self.passband.get(sid)` / `sb =
+    self.subbands.get(sid)` back to `sid in self.passband` +
+    `self.passband[sid]` (ditto subbands) -- a two-step check-then-index
+    that races the audio thread swapping the entry in between (observe()
+    and combine_passband() both do `self.passband[sid] = PassbandPhase(...)`
+    / `self.subbands[sid] = SubbandCombiner(...)` off that thread)."""
+    st = _aligned_state()
+    # key absent: the same "nothing yet" shape either form would give
+    st.passband, st.subbands = _RaisingGetItemDict(), _RaisingGetItemDict()
+    out = st.status(0)
+    assert out["passband"] is None
+    assert out["subband"] == {"enabled": True, "bins": 0, "extra_db": 0.0}
+    # key present: .get(sid) must return it without ever touching
+    # __getitem__ -- the two-step form would raise via the stand-in above
+    st.passband[0] = _StatusStub({"flatness": 0.9, "phase_slope_deg_per_khz": 1.0})
+    st.subbands[0] = _StatusStub({"bins": 12, "extra_db": 3.5})
+    out = st.status(0)
+    assert out["passband"] == {"flatness": 0.9, "phase_slope_deg_per_khz": 1.0}
+    assert out["subband"] == {"enabled": True, "bins": 12, "extra_db": 3.5}

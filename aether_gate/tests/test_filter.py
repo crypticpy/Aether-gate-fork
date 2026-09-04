@@ -277,6 +277,22 @@ def test_bypass_takes_the_whole_filter_out_and_gives_every_setting_back():
     assert not np.allclose(sf.apply(sig.copy()), sig)
 
 
+def test_bypass_flattens_response_db_to_zero():
+    """While HEAR RAW (bypass=on) holds, the filter is out of circuit, so
+    response_db() -- what the app's VISUAL tab draws -- must not show a
+    passband/notch shape the operator is not actually hearing. Mutation:
+    dropping the `if self.spec.bypass` branch in response_db()."""
+    sf = SliceFilter(RATE)
+    sf.set(low=300, high=2700, shape="sharp", anf=True)
+    sf.notch_add(1000.0)
+    r = sf.response_db()
+    assert any(abs(db) > 1.0 for db in r["db"])        # a real passband/notch shape
+    sf.set(bypass=True)
+    r = sf.response_db()
+    assert all(db == 0.0 for db in r["db"])
+    assert len(r["db"]) == len(r["hz"])
+
+
 def test_the_notch_flag_keeps_the_table_and_only_holds_it_out_of_the_taps():
     """A heterodyne notch can be A/B'd without retyping its frequency."""
     sf = SliceFilter(RATE)

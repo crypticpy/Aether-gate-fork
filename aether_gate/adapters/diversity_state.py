@@ -532,6 +532,8 @@ class _DiversityState:
         # 0j-while-unaligned — the slider must not snap to zero before the lock.
         ph, ra = _dv().weight_to_polar(self._configured_weight(sid))
         t = self.trackers.get(sid)
+        pb = self.passband.get(sid)
+        sb = self.subbands.get(sid)
         return {
             "available": True, "channels": 2,
             "mode": self.mode, "source": self.source, "pan": self.pan,
@@ -547,7 +549,7 @@ class _DiversityState:
             "rn_source": t.rn_source if t is not None else None,
             "steady_qrm": bool(t.steady) if t is not None else False,
             "idle_null": bool(t.idle_null) if t is not None else False,
-            "passband": (self.passband[sid].status() if sid in self.passband else None),
+            "passband": (pb.status() if pb is not None else None),
             # how directional the noise is (0 = isotropic, nothing to null)
             "noise_coherence": (round(_dv()._coherence(t.Rn), 2)
                                 if t is not None and t.Rn is not None else None),
@@ -556,7 +558,7 @@ class _DiversityState:
                    "blanked_pct": round(self.blanked_pct, 2),
                    "auto": self.nbarm.status()},
             "subband": {"enabled": self.subband_on,
-                        **(self.subbands[sid].status() if sid in self.subbands
+                        **(sb.status() if sb is not None
                            else {"bins": 0, "extra_db": 0.0})},
             "post": self._post_status(sid),
             "mrc": self.enh.mrc_status(),

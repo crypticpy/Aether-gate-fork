@@ -301,7 +301,8 @@ def test_grid_is_forwarded_and_a_bad_locator_is_an_error():
     _get(port, "/diversity/set?grid=off")
     assert a.calls[-1][1]["grid"] == ""
     out = _get(port, "/diversity/set?grid=ZZ99")
-    assert out["error"].startswith("not a Maidenhead locator")
+    assert out["error"] == ("bad value: not a Maidenhead locator: 'ZZ99' "
+                             "(/diversity/set?grid=ZZ99)")
 
 
 def test_set_with_only_one_param_leaves_the_rest_unset():
@@ -386,8 +387,8 @@ def test_null_source_forwards_as_int():
 
 def test_adapter_rejecting_a_value_is_an_error_not_a_500():
     """The adapter validates what the route cannot (a null_source index past
-    the source list it alone knows): its ValueError must come back as
-    {"error"}, not as an HTTP 500 with a traceback in the log."""
+    the source list it alone knows): its ValueError must come back through
+    _refuse, not as an HTTP 500 with a traceback in the log."""
     a = FakeDiversityAdapter()
     real = a.set_diversity
 
@@ -397,7 +398,27 @@ def test_adapter_rejecting_a_value_is_an_error_not_a_500():
     a.set_diversity = rejecting
     _, port = _start(a)
     out = _get(port, "/diversity/set?null_source=99")
-    assert out == {"error": "no such source: 99 (have 3)"}
+    assert out == {"error": "bad value: no such source: 99 (have 3) "
+                             "(/diversity/set?null_source=99)"}
+
+
+def test_set_diversity_type_error_is_refused_not_a_dropped_connection(capsys):
+    """A TypeError out of set_diversity (a bad kwarg surfacing from the
+    status() build it ends in) must come back as a refusal over the same
+    connection (HTTP 200, JSON), not escape and drop it. Mutation: dropping
+    TypeError (or KeyError) from the second-stage except in /diversity/set."""
+    a = FakeDiversityAdapter()
+
+    def raising(**kw):
+        raise TypeError("status() missing 1 required positional argument")
+    a.set_diversity = raising
+    _, port = _start(a)
+    out = _get(port, "/diversity/set?mode=manual")   # _get asserts HTTP 200 + JSON
+    assert out["error"].startswith("bad value: ")
+    assert "/diversity/set?mode=manual" in out["error"]
+    time.sleep(0.05)
+    log_out = capsys.readouterr().out
+    assert "/diversity/set refused 'mode=manual': TypeError" in log_out
 
 
 def test_negative_null_source_is_an_error():
@@ -526,6 +547,22 @@ def test_diversity_capture_already_active_surfaces_runtime_error():
     _, port = _start(a)
     out = _get(port, "/diversity/capture?seconds=5")
     assert out == {"error": "capture already active"}
+
+
+def test_diversity_capture_type_error_is_refused_not_a_dropped_connection():
+    """A TypeError/KeyError out of diversity_capture itself (not the query
+    parse) must come back as a refusal, not escape and drop the connection.
+    Mutation: dropping (KeyError, ValueError, TypeError) from the
+    second-stage except in /diversity/capture."""
+    a = FakeDiversityAdapter()
+
+    def raising(seconds):
+        raise TypeError("diversity_capture() bad internal state")
+    a.diversity_capture = raising
+    _, port = _start(a)
+    out = _get(port, "/diversity/capture?seconds=5")   # _get asserts HTTP 200 + JSON
+    assert out["error"].startswith("bad value: ")
+    assert "/diversity/capture?seconds=5" in out["error"]
 
 
 def test_diversity_capture_not_supported_on_v2_less_adapter():
@@ -682,7 +719,7 @@ def test_focus_pins_a_talker_releases_and_rejects_the_unknown():
     _get(port, "/diversity/set?focus=off")
     assert a.calls[-1][1]["focus"] == ""
     out = _get(port, "/diversity/set?focus=9")
-    assert out == {"error": "unknown talker id 9"}
+    assert out == {"error": "bad value: unknown talker id 9 (/diversity/set?focus=9)"}
     out = _get(port, "/diversity/set?focus=0")
     assert out["error"].startswith("bad value")
     out = _get(port, "/diversity/set?focus=bob")
@@ -706,6 +743,25 @@ def test_spatial_and_finder_answer_not_supported_on_a_v1_adapter():
     assert _get(port, "/diversity/spatial") == {"error": "not supported"}
     assert _get(port, "/diversity/finder") == {"error": "not supported"}
     assert _get(port, "/diversity/beacons") == {"error": "not supported"}
+
+
+def test_finder_raising_answers_available_false_not_a_crash(capsys):
+    """A bug in finder_report (or spatial/beacons/compass/timesignals) must
+    not crash the GET -- the app's poller would see a network error instead
+    of the "nothing to show" it already knows how to render. Mutation:
+    removing the try/except around fn() for these five read routes."""
+    a = FakeDiversityAdapter()
+
+    def raising():
+        raise KeyError("bins")
+    a.diversity_finder = raising
+    _, port = _start(a)
+    out = _get(port, "/diversity/finder")   # _get asserts HTTP 200 + JSON
+    assert out["available"] is False
+    assert out["error"] == "KeyError: 'bins'"
+    time.sleep(0.05)
+    log_out = capsys.readouterr().out
+    assert "/diversity/finder failed: KeyError" in log_out
 
 
 def test_beacons_route_passes_the_adapter_answer_through():

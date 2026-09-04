@@ -47,7 +47,8 @@ from ..core import digout, governor
 from ..core import governor_proxy as proxy
 
 TICK_S = 1.0
-JOIN_TIMEOUT_S = 5.0
+# stop() runs on the HTTP thread; see its docstring for why this is short.
+JOIN_TIMEOUT_S = 0.5
 
 
 def _safe(fn, *a, **kw):
@@ -133,7 +134,15 @@ class GovernorRunner:
     def stop(self):
         """Stop ticking and let the policy release what it holds. The SETTINGS
         are left exactly where they stand -- see core/governor.py: releasing is
-        not reverting."""
+        not reverting.
+
+        This runs on the HTTP thread for GET /diversity/set?auto=off, so the
+        join here is capped short (JOIN_TIMEOUT_S, 0.5 s) -- a tick
+        is only a status read and at most one write, so it is normally done
+        well inside that. If the tick is still running past the cap (a slow
+        or wedged adapter call), we do not block the HTTP response on it: the
+        stop event is already set above, so _run's loop will not tick again
+        and the thread exits on its own once the in-flight call returns."""
         self._stop.set()
         t = self._thread
         if t is not None and t.is_alive() and t is not threading.current_thread():

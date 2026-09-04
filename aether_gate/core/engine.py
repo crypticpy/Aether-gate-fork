@@ -4170,8 +4170,11 @@ def start_control_server(radio, port):
                 log(f"[ctl] diversity/set -> {kwargs}")
                 try:
                     return self._json(a.set_diversity(**kwargs))
-                except ValueError as e:          # e.g. null_source past the list's end
-                    return self._json({"error": str(e)})
+                except (KeyError, ValueError, TypeError) as e:
+                    # ValueError: e.g. null_source past the list's end.
+                    # KeyError/TypeError: a bad kwarg surfacing out of the
+                    # status() build set_diversity ends in.
+                    return self._refuse(u, e)
             # ---- B25: AUTO CLEAN, the governor -----------------------------
             # What the noise profile FOUND, mapped onto the one tool that can
             # do something about it: a carrier or a mains comb to SQUEEZE, an
@@ -4214,7 +4217,13 @@ def start_control_server(radio, port):
                       if getattr(a, "diversity_available", False) else None)
                 if fn is None:
                     return self._json({"error": "not supported"})
-                return self._json(fn())
+                try:
+                    return self._json(fn())
+                except Exception as e:
+                    # a bug here must not crash the GET: the app's poller
+                    # would see a network error instead of "nothing to show"
+                    log(f"[ctl] {u.path} failed: {type(e).__name__}: {e}")
+                    return self._json({"available": False, "error": f"{type(e).__name__}: {e}"})
             if u.path == "/diversity/capture":
                 a = radio.adapter
                 fn = (getattr(a, "diversity_capture", None)
@@ -4232,6 +4241,8 @@ def start_control_server(radio, port):
                     path = fn(seconds)
                 except RuntimeError as e:
                     return self._json({"error": str(e)})
+                except (KeyError, ValueError, TypeError) as e:
+                    return self._refuse(u, e)
                 log(f"[ctl] diversity capture ({seconds}s) -> {path}")
                 return self._json({"ok": True, "path": path})
             if u.path == "/diversity/dig":

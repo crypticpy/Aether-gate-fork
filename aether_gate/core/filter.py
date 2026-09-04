@@ -786,15 +786,15 @@ class SliceFilter:
         return response_at(self.taps, self.rate_hz, hz) + self._squeeze_bank.response_db(hz)
 
     def response_db(self, points=128):
-        """The designed response across the audio band, for a picture --
-        the FIR and the SQUEEZE notch bank together (see
-        combined_response_db), so the VISUAL tab's bracket/teeth marks sit
-        on a curve that actually shows the notch whatever `shape` is in
-        force."""
+        """The designed response across the audio band, for a picture -- FIR
+        and SQUEEZE notch together (see combined_response_db), except while
+        HEAR RAW holds (bypass=on): flat 0 dB, since nothing is in circuit."""
         if self.taps is None:
             self._redesign()
         lo, hi = self.audio_edges()
         f_audio = np.linspace(0.0, max(hi + 500.0, 3500.0), points)
+        if self.spec.bypass:
+            return {"hz": [round(x) for x in f_audio], "db": [0.0] * points}
         f = self._sign() * f_audio
         return {"hz": [round(x) for x in f_audio],
                 "db": [round(max(self.combined_response_db(fx), -120.0), 1) for fx in f]}
