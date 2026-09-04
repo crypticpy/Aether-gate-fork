@@ -203,10 +203,12 @@ class SliceFilter:
         self.spec = spec if spec is not None else FilterSpec()
         self.print_source = print_source          # () -> voice print dict or None
         self.talker_source = None                 # () -> talker memory id or None
+        self.band_source = None                   # () -> band centre Hz or None
         self.talker_on = True
         self.talker_snap = "fast"
         self.talker_id = None                     # whose filter is in force
-        self.talker_filters = {}                  # id -> snapshot (see _talker_store)
+        self._band = None                         # ...and on which band it was learned
+        self.talker_filters = {}                  # (band_hz, id) -> snapshot (_talker_store)
         self._glide_until = 0                     # smooth: fits with the quick narrowing rate
         self._auto_hold_until = 0                 # the auto width/EQ wait for the spectrum
         # ONE FIT PER OVER. With a talker live the automatics fit once the
@@ -431,6 +433,7 @@ class SliceFilter:
         if not self.talker_on or self.talker_source is None:
             return
         tid = self.talker_source()
+        band = self.band_source() if self.band_source is not None else None
         if tid is None:
             self._live = False
             return
@@ -441,13 +444,16 @@ class SliceFilter:
         # Between overs the filter stays whoever's it was: an edit made in
         # the silence after an over belongs to the voice just heard, and
         # that talker keying up again changes nothing but this over's fit.
-        if tid == self.talker_id:
+        # A BAND CHANGE counts as a change of voice even at the same id: what
+        # this talker's filter is is a question about a band.
+        if tid == self.talker_id and band == self._band:
             return
         self._over_fit_done = False                          # a new voice: fit once
         if self.talker_id is not None:
-            self._talker_store(self.talker_id)
+            self._talker_store(self.talker_id)               # ...under the OLD band
+        self._band = band
         self.talker_id = tid
-        snap = self.talker_filters.get(tid)
+        snap = self.talker_filters.get((band, tid))
         if snap is not None:
             self._talker_restore(snap)
         else:
@@ -462,7 +468,8 @@ class SliceFilter:
         return (s.contour_hz, s.contour_db, s.contour_width_hz) if s.contour_on else None
 
     def _talker_store(self, tid):
-        self.talker_filters[tid] = {k: getattr(self, k) for k in TALKER_LEARNED}
+        self.talker_filters[(self._band, tid)] = {k: getattr(self, k)
+                                                  for k in TALKER_LEARNED}
 
     def _talker_restore(self, snap):
         """What the automatics learned of this talker, back in force -- under
@@ -509,12 +516,15 @@ class SliceFilter:
         self.dirty = True
 
     def talker_forget(self, keep_ids=None):
-        """Drop the remembered filters (all, or those whose talker is gone)."""
+        """Drop the remembered filters (all, or those whose talker is gone).
+        The key is (band, talker): a talker the memory still knows keeps the
+        filter they earned on every band."""
         if keep_ids is None:
             self.talker_filters = {}
             self.talker_id = None
         else:
-            self.talker_filters = {k: v for k, v in self.talker_filters.items() if k in keep_ids}
+            self.talker_filters = {k: v for k, v in self.talker_filters.items()
+                                   if k[1] in keep_ids}
 
     def talker_filter_summary(self, tid):
         """The filter one talker gets, for the memory table: the operator's
@@ -522,7 +532,7 @@ class SliceFilter:
         that talker's filter is in force now."""
         if tid == self.talker_id:
             self._talker_store(tid)
-        snap = self.talker_filters.get(tid)
+        snap = self.talker_filters.get((self._band, tid))
         if snap is None:
             return None
         sp = self.spec
@@ -739,8 +749,10 @@ class SliceFilter:
                    "blanked_pct": round(self.blanked_pct, 2)},
             "agc": self.agc.status(),
             "talker": {"enabled": self.talker_on, "snap": self.talker_snap,
-                       "id": self.talker_id,
-                       "remembered": sorted(int(k) for k in self.talker_filters)},
+                       "id": self.talker_id, "band_hz": self._band,
+                       # the ids with a filter ON THIS BAND (G2)
+                       "remembered": sorted(int(k[1]) for k in self.talker_filters
+                                            if k[0] == self._band)},
             "roofing": {"analogue_hz": None, "digital_hz": round(self.rate_hz)},
             "_sign": sgn,
         }

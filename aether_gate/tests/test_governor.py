@@ -18,17 +18,19 @@ from aether_gate.adapters import diversity_governor as adapt
 from aether_gate.core import governor as G
 from aether_gate.core import governor_proxy as P
 
+WALL0 = 1_700_000_000.0         # R9: the wall clock the fake `t` starts from
+
 
 def snap(t=0.0, **kw):
     """A quiet, healthy band: no rule fires on this one."""
     s = {
-        "t": t, "available": True, "objective": 10.0,
+        "t": t, "wall": WALL0 + t, "available": True, "objective": 10.0,
         "mode": "track", "focus": None, "talking": False, "coherence": 0.1,
         "squeeze": {"held": False, "tool": None, "depth_db": None,
                     "target": "signal", "hz": None, "configured": False},
         "nb": {"on": False, "db": 9.5, "auto": "off"},
         "impulses_per_s": 0.0, "impulse_db": None,
-        "mains_hz": None, "harmonics": 0, "carriers": [],
+        "mains_hz": None, "harmonics": 0, "hum_db": None, "carriers": [],
         "frontend_available": True, "guard": False, "headroom_db": 30.0,
         "clips_1s": 0, "blanked_pct": 0.0, "floor_db": -100.0,
         "slice_hz": 7185000.0, "talker": None,
@@ -136,11 +138,13 @@ def test_coherence_says_which_tool_the_squeeze_will_reach_for():
     assert "a notch" in gov().tick(snap(carriers=hot, coherence=0.49))[0]["why"]
 
 
-def test_coherent_hum_squeezes_the_comb_and_incoherent_hum_is_left():
-    acts = gov().tick(snap(mains_hz=60.0, harmonics=2, coherence=0.6))
-    assert acts[0]["params"] == {"squeeze": "comb"}
-    assert acts[0]["kind"] == "mains"
-    assert gov().tick(snap(mains_hz=60.0, harmonics=2, coherence=0.2)) == []
+def test_hum_gets_the_comb_whether_or_not_the_loops_agree_on_it():
+    """R6: a comb notch is spectral: no direction needed. Live, a 60 Hz comb
+    11.8 dB over the floor at coherence 0.02 got nothing at all."""
+    for coh in (0.6, 0.02):
+        acts = gov().tick(snap(mains_hz=60.0, harmonics=2, hum_db=11.8,
+                               coherence=coh))
+        assert acts[0]["params"] == {"squeeze": "comb"} and acts[0]["kind"] == "mains"
 
 
 def test_no_second_squeeze_on_a_tone_a_deep_null_already_took_out():
@@ -333,7 +337,7 @@ def test_the_status_shape_the_app_reads():
     st = g.status()
     assert set(st) == {"auto", "state", "why", "state_label", "settle_s", "margin_db",
                        "spread_db", "objective_source", "holding", "pending",
-                       "events", "backoff"}
+                       "events", "backoff", "ruled_out"}
     assert st["objective_source"] == "snr"
     assert st["auto"] is True and st["pending"] is None
     assert isinstance(st["why"], str) and st["why"]

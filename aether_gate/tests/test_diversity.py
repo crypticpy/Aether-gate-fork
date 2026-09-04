@@ -378,7 +378,8 @@ def test_memory_steers_a_known_talker_in_one_block():
     assert abs(tr.m - m1) < 0.35 * max(1.0, abs(m1)), (tr.m, m1)
     st = mem.status(tr.t)
     assert all(set(e) == {"id", "name", "phase_deg", "ratio_db", "age_s",
-                          "first_seen_s", "hits"} for e in st)
+                          "first_seen_s", "hits", "band_hz", "center_hz",
+                          "first_seen_wall", "last_seen_wall"} for e in st)
     # talker 1 is the live talker while its over runs, nobody after the hangover
     live = mem.talker(tr.t)
     assert live is not None and live["id"] == st[0]["id"] and live["since_s"] >= 0.0
@@ -406,7 +407,9 @@ def test_memory_ids_are_stable_and_names_stick_to_them():
     st = mem.status(now=3.0)
     assert st[0] == {"id": 1, "name": "Bob K5XYZ", "phase_deg": st[0]["phase_deg"],
                      "ratio_db": st[0]["ratio_db"], "age_s": 1.0, "first_seen_s": 3.0,
-                     "hits": 0}
+                     "hits": 0, "band_hz": None, "center_hz": None,
+                     "first_seen_wall": st[0]["first_seen_wall"],
+                     "last_seen_wall": st[0]["last_seen_wall"]}
     assert mem.recall(s2, now=4.0) == 0.1 + 0.0j and mem.talker(4.0)["id"] == 2
     assert mem.name(1, "") and mem.entries[0]["name"] is None
     mem.release()

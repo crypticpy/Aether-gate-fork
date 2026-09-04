@@ -95,10 +95,14 @@ def carriers(finder, filt, slice_hz):
 class GovernorRunner:
     """auto on/off, the tick, and the writes. `status()` is what the app reads."""
 
-    def __init__(self, adapter, clock=None):
+    def __init__(self, adapter, clock=None, wall=None):
         self.a = adapter
         self.gov = governor.Governor()
         self._clock = clock or time.monotonic
+        # R9: the tick is monotonic (it must not jump when the host's clock is
+        # set), but nothing monotonic can be shown to a person, so every
+        # snapshot carries the wall clock beside it and the policy stamps both.
+        self._wall = wall or time.time
         self._stop = threading.Event()
         self._thread = None
         self._error = None
@@ -137,7 +141,7 @@ class GovernorRunner:
         self._thread = None
         ours = (self.gov.pending or {}).get("tool") == "dig"
         self.gov.auto = False
-        self.gov.tick({"t": self._clock(), "available": False})
+        self.gov.tick({"t": self._clock(), "wall": self._wall(), "available": False})
         if ours:            # a dig WE started keeps turning knobs otherwise
             _safe(getattr(self.a, "diversity_dig", None), cancel=True)
 
@@ -186,7 +190,7 @@ class GovernorRunner:
         now = self._clock() if now is None else float(now)
         div = _safe(getattr(self.a, "diversity_status", None))
         if not div.get("available"):
-            return {"t": now, "available": False}
+            return {"t": now, "wall": self._wall(), "available": False}
         filt = _safe(getattr(self.a, "filter_status", None))
         fe = _safe(getattr(self.a, "frontend_status", None))
         dig = _safe(getattr(self.a, "diversity_dig", None))
@@ -198,7 +202,7 @@ class GovernorRunner:
         focus, talker = div.get("focus"), div.get("talker")
         slice_hz = getattr(self.a, "_slice_hz", None)
         return {
-            "t": now, "available": True,
+            "t": now, "wall": self._wall(), "available": True,
             "objective": digout.objective(div, self._kind(div, slice_hz)),
             "mode": div.get("mode"), "coherence": div.get("noise_coherence"),
             "focus": (focus or {}).get("id") if isinstance(focus, dict) else None,
@@ -218,12 +222,16 @@ class GovernorRunner:
                    "auto": (nb.get("auto") or {}).get("mode")},
             "impulses_per_s": prof.get("impulses_per_s") or 0.0,
             "impulse_db": prof.get("impulse_db"), "mains_hz": prof.get("mains_hz"),
-            "harmonics": prof.get("harmonics") or 0, "blanked_pct": nb.get("blanked_pct"),
+            "harmonics": prof.get("harmonics") or 0, "hum_db": prof.get("hum_db"),
+            "blanked_pct": nb.get("blanked_pct"),
             "carriers": carriers(_safe(getattr(self.a, "diversity_finder", None)),
                                  filt, slice_hz),
             "frontend_available": bool(fe.get("available")), "guard": bool(fe.get("guard")),
             "headroom_db": fe.get("headroom_db"), "clips_1s": fe.get("clips_1s"),
             "slice_hz": slice_hz, "floor_db": proxy.inband_floor_db(spat),
+            # G1: which amateur band the dial is on. The policy's only span
+            # input, and the whole of how it knows a band change happened.
+            "band_hz": div.get("band_hz"),
             "talker": talker.get("id") if isinstance(talker, dict) else None,
             "dig_running": bool(dig.get("running")), "dig_note": dig.get("note"),
             "dig_gain_db": dig.get("gain_db"), "dig_verdict": dig.get("verdict"),

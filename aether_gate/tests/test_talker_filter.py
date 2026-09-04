@@ -25,9 +25,13 @@ class _Mic:
     def __init__(self):
         self.talker = None
         self.prints = {}
+        self.band = None                     # the amateur band the dial is on
 
     def talker_source(self):
         return self.talker
+
+    def band_source(self):
+        return self.band
 
     def print_source(self):
         return self.prints.get(self.talker)
@@ -36,6 +40,7 @@ class _Mic:
 def _filter(mic, **kw):
     sf = SliceFilter(RATE, print_source=mic.print_source)
     sf.talker_source = mic.talker_source
+    sf.band_source = mic.band_source
     if kw:
         sf.set(**kw)
     return sf
@@ -67,11 +72,13 @@ def test_the_operators_settings_are_everyones_and_the_learned_edges_are_each_tal
     mic.talker = 2
     _blocks(sf)                                   # #1's record is stored as #2 keys up
     st = sf.status()
-    assert st["talker"] == {"enabled": True, "snap": "fast", "id": 2, "remembered": [1]}
+    assert st["talker"] == {"enabled": True, "snap": "fast", "id": 2,
+                            "band_hz": None, "remembered": [1]}
     # a box ticked while #2 talks is ticked for everyone
     sf.set(auto_eq=True, threshold_db=20, contour=False, low=200, high=3100)
-    sf.talker_filters[1].update(auto_low=300.0, auto_high=2700.0, auto_source="spectrum",
-                                eq_tilt_db=-3.0, eq_lean_db=0.5)
+    sf.talker_filters[(None, 1)].update(auto_low=300.0, auto_high=2700.0,
+                                        auto_source="spectrum",
+                                        eq_tilt_db=-3.0, eq_lean_db=0.5)
     mic.talker = 1
     _blocks(sf)                                   # ONE block: #1's learned edges are back
     st = sf.status()
@@ -182,7 +189,8 @@ def test_turned_off_nothing_follows_and_forget_forgets():
     _blocks(sf)
     st = sf.status()
     assert st["set_low_hz"] == 200 and st["talker"] == {"enabled": False, "snap": "fast",
-                                                        "id": None, "remembered": []}
+                                                        "id": None, "band_hz": None,
+                                                        "remembered": []}
     sf.set(talker=True)
     _blocks(sf)                                   # #1 takes the live filter from here
     mic.talker = 2
@@ -233,3 +241,43 @@ def test_auto_fits_once_per_over_and_holds_while_the_voice_is_live():
     mic.talker = 1                                # the next over gets a fresh fit
     _run(sf, _voice(2.0, 350, 3100, seed=6))
     assert sf.status()["auto"]["high_hz"] >= 3100
+
+
+# --- G2: the filter a talker earned is a filter on ONE band -----------------
+
+def test_a_filter_learned_on_one_band_is_not_restored_on_another():
+    """Mutation: keying talker_filters by the talker alone. The same person
+    keys up on 40 m and the gate puts 20 m's passband back on them -- a
+    passband fitted to a signal that is not there any more."""
+    mic = _Mic()
+    sf = _filter(mic, auto=True)
+    mic.band, mic.talker = 14_175_000, 1
+    _blocks(sf)
+    sf.auto_low, sf.auto_high, sf.auto_source = 300.0, 2700.0, "spectrum"
+    mic.band = 7_150_000                          # same talker, new band
+    _blocks(sf)
+    assert (14_175_000, 1) in sf.talker_filters   # filed under the band it was learned on
+    assert sf.status()["talker"]["id"] == 1
+    assert (sf.auto_low, sf.auto_source) == (None, None)  # a restart, not a restore
+    assert sf.status()["talker"]["remembered"] == []      # nothing learned here yet
+    mic.band = 14_175_000                         # ...and back: theirs is still theirs
+    _blocks(sf)
+    assert sf.status()["auto"] == {"enabled": True, "source": "spectrum",
+                                   "low_hz": 300, "high_hz": 2700}
+
+
+def test_forgetting_a_talker_drops_every_band_of_theirs_and_keeps_the_rest():
+    """Mutation: pruning on the whole (band, id) key against a set of ids --
+    talker_forget would then drop every remembered filter it was asked to
+    keep, which is the path /diversity runs on every status read."""
+    mic = _Mic()
+    sf = _filter(mic, auto=True)
+    for band, tid in ((14_175_000, 1), (7_150_000, 1), (14_175_000, 2)):
+        mic.band, mic.talker = band, tid
+        _blocks(sf)
+    mic.talker = None
+    _blocks(sf)
+    assert set(sf.talker_filters) >= {(14_175_000, 1), (7_150_000, 1)}
+    sf.talker_forget(keep_ids={1})
+    assert {k[1] for k in sf.talker_filters} == {1}
+    assert (14_175_000, 1) in sf.talker_filters and (7_150_000, 1) in sf.talker_filters

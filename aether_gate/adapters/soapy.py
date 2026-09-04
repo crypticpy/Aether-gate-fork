@@ -717,9 +717,10 @@ class SoapyAdapter(RadioAdapter):
         self._filt = SliceFilter(self._pd_rate, spec=prev.spec if prev is not None else None,
                                  print_source=self._active_print)
         self._filt.talker_source = self._active_talker
+        self._filt.band_source = self._active_band
         if prev is not None:
             self._filt.agc = prev.agc
-            for k in ("talker_on", "talker_snap", "talker_id", "talker_filters"):
+            for k in ("talker_on", "talker_snap", "talker_id", "talker_filters", "_band"):
                 setattr(self._filt, k, getattr(prev, k))
         # The SSB passband is the operator's filter (self._filt, built above);
         # the fixed one-sided taps that used to live here are gone with it.
@@ -1130,7 +1131,12 @@ class SoapyAdapter(RadioAdapter):
                             got = float(self._sdr.getFrequency(self._SOAPY_SDR_RX, 0))
                         except Exception:
                             got = want
-                        self.center_hz = got
+                        was, self.center_hz = self.center_hz, got
+                        # G1: the dial moved. One hook, on the one thread that
+                        # writes center_hz; it stamps the retune and re-reads
+                        # which band we are on, and never touches a file.
+                        if self._div is not None and got != was:
+                            self._div.on_retune(was, got)
                         if abs(got - want) > 1000.0:
                             print(f"[soapy] RETUNE MISMATCH: asked {want/1e6:.6f} MHz, "
                                   f"tuner reports {got/1e6:.6f} MHz", flush=True)
@@ -1772,6 +1778,13 @@ class SoapyAdapter(RadioAdapter):
         """The talker memory's id for whoever is talking, for the filter per talker."""
         mem = getattr(self._div, "memory", None)
         return mem.active if mem is not None else None
+
+    def _active_band(self):
+        """The amateur band the pair is tuned to (G2): a talker's filter is
+        keyed to it as well as to them, because a passband earned on 20 m is
+        not this talker's filter on 40 m."""
+        band = getattr(self._div, "band", None)
+        return band.band_hz if band is not None else None
 
     def filter_status(self):
         if self._filt is None:

@@ -69,6 +69,16 @@ def _pf():
     return postfilter
 
 
+def _bnd():
+    from ..core import bands
+    return bands
+
+
+def _dvc():
+    from . import diversity_voice
+    return diversity_voice
+
+
 def _voice_key(summary):
     """What of a print summary is persisted with a name: enough for
     VoicePrint.distance, nothing that grows."""
@@ -138,7 +148,8 @@ class _DiversityState:
     GUARD_GAP_HZ = 300.0       # between the passband edge and its guard band
     NB_DEFAULT_DB = 12.0
     CAPTURE_DIR = "~/aether-gate-captures"
-    NAMES_PATH = "~/.aether-gate/diversity-names.json"   # talker labels, by signature
+    NAMES_PATH = "~/.aether-gate/diversity-names.json"   # pre-G2 labels, migrated once
+    TALKERS_PATH = "~/.aether-gate/diversity-talkers.json"   # the whole talker memory, per band
     BEACONS_PATH = "~/.aether-gate/beacons.json"          # beacon samples + station grid
     SITELOG_PATH = "~/.aether-gate/site-log.jsonl"        # every beacon score and noise verdict, kept
     NULLABLE_COHERENCE = 0.4     # below this the noise has no direction to null
@@ -154,7 +165,12 @@ class _DiversityState:
         self.passband = {}                  # sid -> PassbandPhase                  # slice_id -> Tracker (rebuilt on a rate change)
         self.last_m = {}                    # slice_id -> weight the last block ended on
         self.memory = _dv().TalkerMemory(   # shared by every slice's tracker
-            names_path=os.path.expanduser(self.NAMES_PATH))
+            names_path=os.path.expanduser(self.NAMES_PATH),
+            store_path=os.path.expanduser(self.TALKERS_PATH))
+        # which amateur band the dial is on, and when it last moved: the memory
+        # above is keyed by it, and /diversity publishes both stamps (G1)
+        self.band = _bnd().BandWatch(self.memory.set_band)
+        self.band.tune(self._tuned_hz(), time.time())   # keyed from the first block
         self.active_slice = 0
         self._cal_a, self._cal_b, self._cal_n = [], [], 0
         # Guards _cal_a/_cal_b/_cal_n: request_realign() can land from the HTTP
@@ -429,6 +445,22 @@ class _DiversityState:
         return {"rate_hz": float(self.a.samp_rate), "center_hz": float(self.a.center_hz),
                 "lag_samples": int(self.aligner.lag), "aligned": bool(self.aligner.aligned)}
 
+    def _tuned_hz(self):
+        """What the operator is listening to: the SLICE, not the hardware
+        centre -- the centre is parked a quarter-span off it (soapy's
+        _dc_offset_hz), which is routinely outside the band it is tuned to."""
+        hz = getattr(self.a, "_slice_hz", None)
+        return float(hz) if hz else float(self.a.center_hz)
+
+    def on_retune(self, old_hz, new_hz):
+        """The hardware centre moved: soapy's reader thread, the one place
+        center_hz is written. Cheap and file-free -- it stamps the event and
+        re-reads the band; everything that must happen BECAUSE the band
+        changed happens on the tick that sees it (the governor, the dig)."""
+        now = time.time()
+        self.band.retuned(old_hz, new_hz, now)
+        self.band.tune(self._tuned_hz(), now)
+
     def memory_clear(self):
         self.memory.clear()
         for vp in self.prints.values():
@@ -492,6 +524,9 @@ class _DiversityState:
 
     def status(self, sid=None):
         sid = self.active_slice if sid is None else int(sid)
+        # the dial can move without a hardware retune (the slice tunes inside
+        # the window), so the band is re-read here, on the status side
+        self.band.tune(self._tuned_hz(), time.time())
         m = self.weight_for(sid)                     # what is ACTUALLY combined
         # phase/ratio report the operator's CONFIGURED weight, not weight_for's
         # 0j-while-unaligned — the slider must not snap to zero before the lock.
@@ -533,6 +568,7 @@ class _DiversityState:
             "loops": self.balance.status(time.monotonic()),
             "focus": self.memory.focus_status(time.monotonic(),
                                               nulling=bool(t.interferer) if t is not None else False),
+            **self.band.status(),          # retuned_at, band_hz, band_changed_at
             "capture": self._cap.status(),
             "sitelog": self.sitelog.status(),
             "squeeze": _dsq().status(self, sid),
@@ -573,6 +609,7 @@ class _DiversityState:
     def _memory_status(self, sid):
         """The memory's entries with each talker's voice/rig print attached."""
         mem = self.memory.status(time.monotonic())
+        self.memory.persist()      # the audio thread never opens a file: here is where
         vp = self.prints.get(sid)
         if vp is not None:
             vp.forget(keep_ids={e["id"] for e in mem})
@@ -595,45 +632,7 @@ class _DiversityState:
         if not talking:
             self._voice_checked = False
         elif active is not None and not self._voice_checked:
-            self._voice_check(vp, active)
-
-    def _voice_check(self, vp, active):
-        """Once per over, as soon as the running print can be judged: an
-        over recalled by bearing that is not that talker's voice goes to
-        whoever at that bearing it is, or to a new talker."""
-        cur = vp.current()
-        if cur is None:
-            return
-        self._voice_checked = True
-        v = _vp()
-        mine = vp.summary(active)
-        if mine is None:
-            # no print of their own yet: a name inherited from the bearing is
-            # checked against the voice the name was given for
-            e = self.memory.entry(active) or {}
-            known = self.memory.named_voice(e["name"], e["s"]) if e.get("name") else None
-            dn = vp.distance(cur, known)
-            if dn is not None and dn >= v.DIFFERENT_VOICE:
-                name = self.memory.disown(active)
-                print(f"[diversity] #{active} has {name}'s bearing but not their voice "
-                      f"(d={dn:.2f}) -> unnamed", flush=True)
-            return
-        d = vp.distance(cur, mine)
-        if d is None or d < v.DIFFERENT_VOICE:
-            return
-
-        def unlike(e):
-            s = vp.summary(e["id"])
-            dd = vp.distance(cur, s)
-            return dd is not None and dd >= v.DIFFERENT_VOICE
-        new = self.memory.reassign(time.monotonic(), unlike)
-        if new is not None:
-            self.voice_splits += 1
-            was = self.memory.entry(active) or {}
-            print(f"[diversity] voice split: #{active}{' ' + was['name'] if was.get('name') else ''}"
-                  f"'s bearing but not their voice (d={d:.2f}, centroid {cur['centroid_hz']} vs "
-                  f"{mine['centroid_hz']} Hz, top {cur['high_hz']} vs {mine['high_hz']}, tilt "
-                  f"{cur['tilt_db']} vs {mine['tilt_db']} dB) -> #{new}", flush=True)
+            _dvc().voice_check(self, vp, active)
 
     def _monitor(self, pa, pb):
         if self.hear == "a":

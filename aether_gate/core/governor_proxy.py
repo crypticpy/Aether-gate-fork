@@ -45,6 +45,7 @@ NULLABLE_COHERENCE = 0.4        # _DiversityState.NULLABLE_COHERENCE
 CARRIER_MIN_DB = 6.0            # core.squeeze.MIN_LEVEL_DB
 HEADROOM_LOW_DB = 3.0           # adapters.frontend_guard.HEADROOM_LOW_DB
 IMPULSE_RATE_ON = 1.0           # adapters.noise_kinds' own "is this impulsive"
+HUM_MIN_DB = 8.0                # core.noiseprofile.LINE_MIN_DB
 # ...and the proxies', by the same rule: borrowed, never invented.
 NULL_DEPTH_KEEP_DB = 6.0        # core.squeeze.MIN_LEVEL_DB: back down to the floor
 NOTCH_DEPTH_KEEP_DB = 10.0      # ...and a DESIGNED response is asked for more
@@ -263,6 +264,8 @@ def dig_delta_db(snap):
         return 0.0, f"scored 0, not {gain:+.1f} dB: {note or TENTATIVE}"
     if snap.get("dig_verdict") == "worse":
         return 0.0, "the dig was called worse and put back: nothing banked"
+    if snap.get("dig_verdict") == "moved":
+        return 0.0, "the dial moved and the dig put it all back: nothing banked"
     if not gain:
         return 0.0, "the dig tried every knob and found nothing here"
     return round(gain, 2), ""

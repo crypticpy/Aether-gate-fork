@@ -24,16 +24,26 @@ left them and the run waits for a verdict:
     keep    keep them, but the operator is not claiming it is better.
     worse   put every knob back where it was when the button was pressed.
 
+and one the GATE says, never the operator (G5):
+
+    moved   the dial left the band, or moved further than the passband the
+            search is turning knobs on. Every knob goes back exactly as
+            "worse" puts it back, and the record says which of the two it was:
+            the signal being scored is not the signal the run started on, and
+            a search that keeps scoring it is measuring the new station with
+            the old one's answers.
+
 The verdict is the label on the objective — the record `status()["record"]`
 carries is one site-log line waiting for a home.
 """
 import threading
 import time
 
-from ..core import digout
+from ..core import bands, digout
 
 _SECONDS_ALLOWED = (60, 180, 300)
-_VERDICTS = ("better", "worse", "keep")
+_VERDICTS = ("better", "worse", "keep")      # what the OPERATOR may say
+MOVED = "moved"                              # ...and what the dial says for them
 
 
 def _dig(d, *path):
@@ -99,6 +109,7 @@ class DigRunner:
         self._cancelled = False
         self._t0_wall = None
         self._seconds = 0.0
+        self._where0 = None                   # the frequency the run started on
 
     # ----- the operator's four buttons -----------------------------------
 
@@ -119,6 +130,7 @@ class DigRunner:
             self._verdict = self._record = self._error = None
             self._cancelled = False
             self._seconds = float(seconds)
+            self._where0 = self._tuned_hz()
             self._t0_wall = self._wall()
             self._cancel_ev.clear()
             self._search = digout.DigSearch(seconds, kind=self._kind)
@@ -193,6 +205,14 @@ class DigRunner:
                     self._cancelled = True
                     self._restore()
                     return
+                why = self._moved_why()
+                if why is not None:
+                    s.phase = "done"
+                    # the record BEFORE the revert, as verdict() takes it
+                    self._record = self._make_record(MOVED, why)
+                    self._verdict = MOVED
+                    self._restore()
+                    return
                 op = s.next_op(self._clock())
                 if op["op"] == "done":
                     return
@@ -237,6 +257,36 @@ class DigRunner:
             # the operator's own settings; gain_db still says what was found
             self._search.current = dict(self._snapshot)
 
+    def _tuned_hz(self):
+        """Where the operator is listening, or None. An attribute read: this
+        runs on the dig's own thread, every pass round the loop."""
+        hz = getattr(self.a, "_slice_hz", None)
+        return None if hz is None else float(hz)
+
+    def _passband_hz(self):
+        """The width the run opened on, in Hz, or None when it never read one.
+        The OPENING width, not the width a trial is holding right now, so what
+        counts as "the operator tuned away" cannot change under the search."""
+        w = self._snapshot.get("width")
+        if not isinstance(w, (tuple, list)) or len(w) != 2:
+            return None
+        return abs(float(w[1]) - float(w[0]))
+
+    def _moved_why(self):
+        """Why this run has to stop, in the operator's words, or None."""
+        hz = self._tuned_hz()
+        if hz is None or self._where0 is None:
+            return None
+        if bands.band_changed(self._where0, hz):
+            was, now = bands.band_name(self._where0), bands.band_name(hz)
+            return f"the band changed: {was or 'off band'} -> {now or 'off band'}"
+        d = abs(hz - self._where0)
+        width = self._passband_hz()
+        if width is not None and d > width:
+            return (f"the dial moved {d / 1000.0:.1f} kHz, further than the "
+                    f"{width:.0f} Hz passband")
+        return None
+
     def _read_kind(self, hz):
         """What the finder says is on this frequency — its verdict, once, at
         the start. Never its levels: they average over minutes."""
@@ -250,10 +300,12 @@ class DigRunner:
         except Exception:
             return None
 
-    def _make_record(self, word):
+    def _make_record(self, word, why=None):
         r = self._search.report(self._clock())
         return {"kind": "dig", "t": self._wall(), "gain_db": r["gain_db"],
-                "verdict": word, "best": r["best"], "changed": r["changed"],
+                "verdict": word, "why": why, "hz": self._where0,
+                "band_hz": bands.band_of(self._where0),
+                "best": r["best"], "changed": r["changed"],
                 "objective_before": r["objective_before"],
                 "objective_after": r["objective_after"],
                 "measured_best_db": r["measured_best_db"],
