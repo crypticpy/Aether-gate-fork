@@ -72,8 +72,10 @@ def test_the_operators_settings_are_everyones_and_the_learned_edges_are_each_tal
     mic.talker = 2
     _blocks(sf)                                   # #1's record is stored as #2 keys up
     st = sf.status()
-    assert st["talker"] == {"enabled": True, "snap": "fast", "id": 2,
-                            "band_hz": None, "remembered": [1]}
+    assert st["talker"]["enabled"] is True and st["talker"]["snap"] == "fast"
+    assert st["talker"]["id"] == 2 and st["talker"]["band_hz"] is None
+    assert [r["id"] for r in st["talker"]["remembered"]] == [1]
+    assert isinstance(st["talker"]["remembered"][0]["filter"]["learned_at"], float)
     # a box ticked while #2 talks is ticked for everyone
     sf.set(auto_eq=True, threshold_db=20, contour=False, low=200, high=3100)
     sf.talker_filters[(None, 1)].update(auto_low=300.0, auto_high=2700.0,
@@ -87,7 +89,8 @@ def test_the_operators_settings_are_everyones_and_the_learned_edges_are_each_tal
     assert st["agc"]["threshold_db"] == 20.0 and sf.agc.threshold_db == 20.0
     assert st["contour"]["enabled"] is False and st["auto_eq"]["enabled"] is True
     assert st["auto_eq"]["tilt_db"] == -3.0
-    assert st["talker"]["id"] == 1 and st["talker"]["remembered"] == [1, 2]
+    assert st["talker"]["id"] == 1
+    assert [r["id"] for r in st["talker"]["remembered"]] == [1, 2]
     # AUTO off by hand: nobody's learned edges are in force, the operator's are
     sf.set(auto=False)
     mic.talker = 2
@@ -195,7 +198,7 @@ def test_turned_off_nothing_follows_and_forget_forgets():
     _blocks(sf)                                   # #1 takes the live filter from here
     mic.talker = 2
     _blocks(sf)
-    assert sf.status()["talker"]["remembered"] == [1]
+    assert [r["id"] for r in sf.status()["talker"]["remembered"]] == [1]
     sf.talker_forget(keep_ids={2})
     assert sf.status()["talker"]["remembered"] == []
     sf.talker_forget()
@@ -210,6 +213,8 @@ def test_the_summary_for_the_memory_table():
     _blocks(sf)
     sf.set(low=300, high=2700, shape="sharp", threshold_db=8)
     live = sf.talker_filter_summary(1)             # the live one, without a store
+    learned_at = live.pop("learned_at")
+    assert isinstance(learned_at, float) and learned_at > 0.0
     assert live == {"low_hz": 300, "high_hz": 2700, "shape": "sharp", "auto": False,
                     "auto_eq": False, "contour": False, "threshold_db": 8.0, "live": True}
     mic.talker = 2
@@ -217,6 +222,30 @@ def test_the_summary_for_the_memory_table():
     assert sf.talker_filter_summary(1)["live"] is False
     with pytest.raises(ValueError):
         sf.set(talker_snap="jumpy")
+
+
+def test_learned_at_holds_across_polls_and_moves_only_when_something_changed():
+    mic = _Mic()
+    sf = _filter(mic, auto=True)
+    mic.talker = 1
+    _blocks(sf)
+    first = sf.talker_filter_summary(1)["learned_at"]
+    assert isinstance(first, float) and first > 0.0
+    # polling the live talker again with nothing new learned: the same epoch
+    _blocks(sf)
+    assert sf.talker_filter_summary(1)["learned_at"] == first
+    # the automatics learn something new for #1 while #1 is still live
+    sf.auto_low, sf.auto_high, sf.auto_source = 111.0, 2222.0, "spectrum"
+    second = sf.talker_filter_summary(1)["learned_at"]
+    assert second >= first
+    # #1 goes silent, #2 keys up: #1's snapshot (and its learned_at) is stored as-is
+    mic.talker = 2
+    _blocks(sf)
+    assert sf.talker_filters[(None, 1)]["learned_at"] == second
+    # #1 keys back up: the restored filter is unchanged, so learned_at is too
+    mic.talker = 1
+    _blocks(sf)
+    assert sf.talker_filter_summary(1)["learned_at"] == second
 
 
 def test_the_query_keys():

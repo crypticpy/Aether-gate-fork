@@ -24,7 +24,7 @@ GOLDEN_IDS = [
     "antenna", "traps", "lna", "ifgr", "rf_agc",        # the front end
     "roof_rf", "adc",                                   # the hardware roofing
     "align", "nb", "roof_digital",                      # full-rate gate stages
-    "combiner", "subband", "squeeze", "post",           # the pair
+    "combiner", "subband", "squeeze", "post", "mrc",     # the pair
     "slice", "passband", "auto", "shape", "notch",      # the slice FIR
     "anf", "contour", "apf", "auto_eq",
     "detect", "agc", "app",                             # out of the gate
@@ -101,6 +101,7 @@ def _diversity():
                         "since_s": 55.7}},
         "subband": {"enabled": True, "bins": 12, "extra_db": 1.4},
         "post": {"enabled": True, "floor_db": -6.0, "mean_db": -8.5},
+        "mrc": {"enabled": True, "gain_over_broadband_db": 1.2, "bins_used": 41},
         "squeeze": {"hz": -1200, "width_hz": 300, "held": True, "tool": "null",
                     "why": "one wavefront, coherence 0.82: the null takes it",
                     "coherence": 0.82, "depth_db": -18.4, "target": "signal",
@@ -148,7 +149,7 @@ def test_every_row_validates_against_the_contract():
 def test_a_single_tuner_simply_has_no_pair_rows():
     ids = [r["id"] for r in _rows(div=None)]
     assert [i for i in GOLDEN_IDS
-            if i not in ("align", "combiner", "subband", "squeeze", "post")] == ids
+            if i not in ("align", "combiner", "subband", "squeeze", "post", "mrc")] == ids
 
 
 def test_a_gate_with_no_device_surface_still_serves_the_chain():
@@ -192,6 +193,27 @@ def test_the_pair_rows_quote_the_diversity_status_and_never_recompute_it():
     assert rows["post"]["measured"]["out_db"] == div["post"]["mean_db"]
     assert rows["combiner"]["measured"] == {"in_db": div["snr_db"]["b"],
                                             "out_db": div["snr_db"]["out"]}
+
+
+def test_the_mrc_row_follows_post_and_quotes_the_bin_weights_own_status():
+    div, rows = _diversity(), _by_id(_rows())
+    row = rows["mrc"]
+    assert [r["id"] for r in _rows()].index("mrc") == \
+        [r["id"] for r in _rows()].index("post") + 1
+    assert row["name"] == "SUB-BAND MRC" and row["kind"] == "toggle"
+    assert row["enabled"] is div["mrc"]["enabled"]
+    assert row["detail"] == "+1.2 dB over broadband · 41 bins"
+    assert row["measured"] == {"in_db": None, "out_db": div["mrc"]["gain_over_broadband_db"]}
+    assert row["action"] == {"label": "OFF", "route": "/diversity/set", "query": "mrc=off"}
+    div2 = _diversity()
+    div2["mrc"] = {"enabled": False}                   # no covariance yet: nothing to score
+    row = _by_id(_rows(div=div2))["mrc"]
+    assert row["enabled"] is False and row.get("measured") is None
+    assert row["detail"] == "off"
+    assert row["action"] == {"label": "ON", "route": "/diversity/set", "query": "mrc=on"}
+    div2["mrc"]["enabled"] = True
+    row = _by_id(_rows(div=div2))["mrc"]
+    assert row["detail"] == "armed, no bins scored yet"
 
 
 def test_the_squeeze_row_quotes_the_tool_and_releases_while_held():
@@ -249,7 +271,7 @@ def test_filter_status_carries_the_governor_block_only_with_a_pair():
 def test_measured_appears_only_where_a_level_was_measured():
     rows = _rows()
     have = {r["id"] for r in rows if r.get("measured") is not None}
-    assert have == {"combiner", "post", "notch"}
+    assert have == {"combiner", "post", "mrc", "notch"}
     assert _by_id(rows)["notch"]["measured"] == {"in_db": None, "out_db": -34.2}
 
 
@@ -314,7 +336,7 @@ def test_the_adapter_serves_the_chain_from_filter_status():
     ids = [r["id"] for r in st["chain"]]
     assert ids == [i for i in GOLDEN_IDS
                    if i not in ("antenna", "traps", "lna", "align",
-                                "combiner", "subband", "squeeze", "post")]
+                                "combiner", "subband", "squeeze", "post", "mrc")]
     for row in st["chain"]:
         _validate(row)
     assert st["roofing"]["samp_rate_hz"] == 250_000.0

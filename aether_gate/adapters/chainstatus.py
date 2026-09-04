@@ -239,7 +239,24 @@ def _combiner_rows(div):
         action=_toggle("/diversity/set", "post", bool(pf.get("enabled"))),
         measured=None if mean is None else {"in_db": None,
                                             "out_db": round(float(mean), 1)}))
+    rows.append(_mrc_row(div.get("mrc") or {}))
     return rows
+
+
+def _mrc_row(mrc):
+    """SUB-BAND MRC: one weight per frequency bin, on top of the broadband
+    weight the combiner already applies (adapters/diversity_enhance.py's
+    BinWeights). `gain_over_broadband_db`/`bins_used` are None until the
+    map has enough covariance to score it, on or off."""
+    gain, bins = mrc.get("gain_over_broadband_db"), mrc.get("bins_used")
+    detail = (_dot(f"{float(gain):+.1f} dB over broadband", f"{int(bins)} bins")
+              if gain is not None and bins is not None else
+              ("armed, no bins scored yet" if mrc.get("enabled") else "off"))
+    return _row(
+        "mrc", "SUB-BAND MRC", "toggle", detail,
+        enabled=bool(mrc.get("enabled")),
+        action=_toggle("/diversity/set", "mrc", bool(mrc.get("enabled"))),
+        measured=None if gain is None else {"in_db": None, "out_db": float(gain)})
 
 
 def _squeeze_row(sq):
@@ -412,8 +429,8 @@ def chain_rows(filt, div=None, device=None, frontend=None, governor=None):
     filt      the slice filter's status (SliceFilter.status() plus the
               adapter's `mode` and `roofing`) -- i.e. /filter itself.
     div       /diversity's status dict, or None on a single-tuner device:
-              the ALIGN, COMBINER, SUB-BAND and POST-FILTER rows simply do
-              not appear when there is no pair.
+              the ALIGN, COMBINER, SUB-BAND, POST-FILTER and SUB-BAND MRC
+              rows simply do not appear when there is no pair.
     device    device_controls() (antenna + the driver's own settings), or
               None when the adapter has no device surface.
     frontend  {"gain_db", "gain_range": (lo, hi), "agc": bool} -- the two

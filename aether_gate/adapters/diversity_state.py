@@ -587,8 +587,8 @@ class _DiversityState:
                if t is not None and t.Rn is not None else None)
         filt = getattr(self.a, "_filt", None)
         st["kinds"] = _npk().noise_kinds(
-            st, coh, self.mode, self.nb_on, self.blanked_pct,
-            self.NULLABLE_COHERENCE, filt.status() if filt is not None else None)
+            st, coh, self.mode, self.nb_on, self.blanked_pct, self.NULLABLE_COHERENCE,
+            filt.status() if filt is not None else None, self.profile)
         nb = self.enh.noise_bearing(self.map, st, self.sitelog, self.a.samp_rate,
                                     self.a.center_hz, time.time())
         self.sitelog.noise_status(st, self.a.samp_rate, self.a.center_hz, coh,

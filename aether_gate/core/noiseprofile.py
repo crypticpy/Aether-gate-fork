@@ -60,6 +60,7 @@ class NoiseProfile:
         self.hum_db = 0.0
         self.harmonics = 0
         self.periodic = []               # [(hz, db)] the strongest non-mains lines
+        self._kind_since = {}            # noise_kinds.py's row key -> epoch first seen
 
     def update(self, a, b):
         """One aligned raw block pair (before the blanker)."""
@@ -159,6 +160,18 @@ class NoiseProfile:
             out.append((round(float(f[k]), 1), round(float(cand[k]), 1)))
             cand[max(0, k - tol):k + tol + 1] = -np.inf
         self.periodic = out
+
+    def kind_since(self, key, now):
+        """Epoch seconds `key` (adapters/noise_kinds.py's row identity, e.g.
+        "mains" or "periodic:182") was first seen: the same value on every
+        re-detection, whether or not the finding stayed in every kinds list
+        in between -- it moves on again only when this profile itself is
+        replaced (a retune builds a fresh NoiseProfile, so a fresh profile
+        starts every finding's clock over)."""
+        t = self._kind_since.get(key)
+        if t is None:
+            t = self._kind_since[key] = float(now)
+        return t
 
     def status(self):
         return {

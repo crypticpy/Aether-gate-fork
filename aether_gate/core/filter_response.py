@@ -68,6 +68,25 @@ def spectrum_snapshot(spec_db, spec_f, spec_f_order, audio_edges, sign, points=1
             "floor_db": round(floor - peak, 1)}
 
 
+def response_db_cached(f, points=128):
+    """SliceFilter.response_db, moved here (with its cache) to keep
+    core/filter.py under its per-file line budget -- `f` is the SliceFilter
+    instance (self); everything else here stays a pure function of its
+    arguments. Cached on the redesign counter and the SQUEEZE bank's, NOT
+    id(f.taps): the address one redesign frees is what the next allocates,
+    so two redesigns between polls (a band change) read as one by id -- the
+    old sideband's curve."""
+    if f.taps is None:
+        f._redesign()
+    key = (f._design_seq, f._squeeze_bank.recomputes, points, f.spec.bypass)
+    if f._resp_cache_key == key:
+        return f._resp_cache
+    out = response_snapshot(f.taps, f.rate_hz, f._squeeze_bank,
+                            f.audio_edges(), f._sign(), f.spec.bypass, points)
+    f._resp_cache_key, f._resp_cache = key, out
+    return out
+
+
 def response_snapshot(taps, rate_hz, squeeze_bank, audio_edges, sign, bypass, points=128):
     """The designed response across the audio band, for a picture -- FIR
     and SQUEEZE notch bank together (they are in series on the signal, so

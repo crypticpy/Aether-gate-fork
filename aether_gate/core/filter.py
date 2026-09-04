@@ -21,12 +21,13 @@ the spec are audio hertz as the operator sees them (positive); the design
 maps them onto the signed passband of the sideband in use.
 """
 import math
+import time
 
 import numpy as np
 
 from .agc import AGC_MODES, AGC_THRESHOLD_DB, Agc
 from .contour import PROFILE_BAND_HZ, fit_contour
-from .filter_response import notch_overlaps, response_at, response_snapshot, spectrum_snapshot
+from .filter_response import notch_overlaps, response_at, response_db_cached, response_snapshot, spectrum_snapshot
 from .notchbank import NotchBank
 
 SHAPES = {"soft": 255, "sharp": 1023}   # soft: 196 Hz transition at 25 kS/s; 127 taps ate
@@ -472,8 +473,16 @@ class SliceFilter:
         return (s.contour_hz, s.contour_db, s.contour_width_hz) if s.contour_on else None
 
     def _talker_store(self, tid):
-        self.talker_filters[(self._band, tid)] = {k: getattr(self, k)
-                                                  for k in TALKER_LEARNED}
+        """Snapshot what the automatics hold for this talker; learned_at
+        moves only when a value actually changed, not on every poll of the
+        live talker."""
+        key = (self._band, tid)
+        new = {k: getattr(self, k) for k in TALKER_LEARNED}
+        old = self.talker_filters.get(key)
+        new["learned_at"] = (old["learned_at"] if old is not None and
+                             all(old[k] == new[k] for k in TALKER_LEARNED)
+                             else time.time())
+        self.talker_filters[key] = new
 
     def _talker_restore(self, snap):
         """What the automatics learned of this talker, back in force -- under
@@ -546,7 +555,8 @@ class SliceFilter:
             lo, hi = min(abs(sp.low_hz), abs(sp.high_hz)), max(abs(sp.low_hz), abs(sp.high_hz))
         return {"low_hz": round(lo), "high_hz": round(hi), "shape": sp.shape,
                 "auto": sp.auto, "auto_eq": sp.auto_eq, "contour": sp.contour_on,
-                "threshold_db": sp.agc_threshold_db, "live": tid == self.talker_id}
+                "threshold_db": sp.agc_threshold_db, "live": tid == self.talker_id,
+                "learned_at": snap["learned_at"]}
 
     def _contour_status(self):
         s = self.spec
@@ -758,9 +768,10 @@ class SliceFilter:
             "agc": self.agc.status(),
             "talker": {"enabled": self.talker_on, "snap": self.talker_snap,
                        "id": self.talker_id, "band_hz": self._band,
-                       # the ids with a filter ON THIS BAND (G2)
-                       "remembered": sorted(int(k[1]) for k in self.talker_filters
-                                            if k[0] == self._band)},
+                       # the ids with a filter ON THIS BAND (G2), each with its filter
+                       "remembered": [{"id": tid, "filter": self.talker_filter_summary(tid)}
+                                      for tid in sorted(int(k[1]) for k in self.talker_filters
+                                                        if k[0] == self._band)]},
             "roofing": {"analogue_hz": None, "digital_hz": round(self.rate_hz)},
             "spec_tc_s": s.spec_tc_s,
             "_sign": sgn,
@@ -784,17 +795,6 @@ class SliceFilter:
         return response_at(self.taps, self.rate_hz, hz) + self._squeeze_bank.response_db(hz)
 
     def response_db(self, points=128):
-        """The designed response across the audio band -- see core/
-        filter_response.py's response_snapshot. Cached on the redesign
-        counter and the SQUEEZE bank's, NOT id(self.taps): the address one
-        redesign frees is what the next allocates, so two redesigns between
-        polls (a band change) read as one by id -- the old sideband's curve."""
-        if self.taps is None:
-            self._redesign()
-        key = (self._design_seq, self._squeeze_bank.recomputes, points, self.spec.bypass)
-        if self._resp_cache_key == key:
-            return self._resp_cache
-        out = response_snapshot(self.taps, self.rate_hz, self._squeeze_bank,
-                                self.audio_edges(), self._sign(), self.spec.bypass, points)
-        self._resp_cache_key, self._resp_cache = key, out
-        return out
+        """The designed response, cached -- see filter_response.py's
+        response_db_cached (the cache) and response_snapshot (the curve)."""
+        return response_db_cached(self, points)

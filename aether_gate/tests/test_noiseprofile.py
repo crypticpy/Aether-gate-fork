@@ -78,3 +78,22 @@ def test_a_non_mains_line_is_listed_as_periodic():
     s = _feed(NoiseProfile(RATE), rng, 4.0, tone_hz=333.0)
     assert s["mains_hz"] is None, s
     assert s["periodic"] and abs(s["periodic"][0]["hz"] - 333.0) <= 1.5, s
+
+
+def test_kind_since_holds_the_first_epoch_across_re_detections():
+    prof = NoiseProfile(RATE)
+    t0 = prof.kind_since("mains", 1000.0)
+    assert isinstance(t0, float) and t0 == 1000.0
+    # the same key, later "now": the first-seen epoch does not move
+    assert prof.kind_since("mains", 1005.0) == 1000.0
+    # a different key gets its own clock, independent of "mains"
+    assert prof.kind_since("impulse", 1002.0) == 1002.0
+    assert prof.kind_since("mains", 1010.0) == 1000.0
+
+
+def test_kind_since_resets_only_when_the_profile_itself_is_replaced():
+    a = NoiseProfile(RATE)
+    a.kind_since("mains", 500.0)
+    b = NoiseProfile(RATE)                              # a fresh profile: a retune
+    assert b.kind_since("mains", 900.0) == 900.0         # not 500.0 -- a's clock, not shared
+    assert a.kind_since("mains", 999.0) == 500.0         # a's own clock is untouched
