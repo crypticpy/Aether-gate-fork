@@ -3699,6 +3699,15 @@ def start_control_server(radio, port):
         def log_message(self, *a):
             pass
 
+        def _refuse(self, u, e):
+            """A write the control port would not take. Logged: a refusal
+            that only ever reached the app's tile is one nobody can trace
+            afterwards (the operator's "bad value: NoneType is not
+            subscriptable" of 2026-09-03 came back from a route the log
+            never named)."""
+            log(f"[ctl] {u.path} refused {u.query!r}: {type(e).__name__}: {e}")
+            return self._json({"error": f"bad value: {e}"})
+
         def _json(self, obj):
             body = json.dumps(obj).encode()
             self.send_response(200)
@@ -3943,7 +3952,7 @@ def start_control_server(radio, port):
                     try:
                         a.dbm_trim = float(q["trim"][0])
                     except (ValueError, TypeError) as e:
-                        return self._json({"error": f"bad value: {e}"})
+                        return self._refuse(u, e)
                     log(f"[ctl] dBm trim -> {a.dbm_trim:+.1f} dB")
                 from .fft import DBFS_TO_DBM, GAIN_REF_DB, dbm_offset_for
                 gain = float(getattr(a, "gain_db", GAIN_REF_DB))
@@ -4007,7 +4016,7 @@ def start_control_server(radio, port):
                     log(f"[ctl] filter/set -> {kwargs}")
                     return self._json(a.filter_set(**kwargs))
                 except (KeyError, ValueError, TypeError) as e:
-                    return self._json({"error": f"bad value: {e}"})
+                    return self._refuse(u, e)
             if u.path == "/diversity":
                 a = radio.adapter
                 if not getattr(a, "diversity_available", False):
@@ -4154,7 +4163,7 @@ def start_control_server(radio, port):
                         gov(auto=(want == "on"))
                         log(f"[ctl] diversity auto -> {want}")
                 except (ValueError, TypeError) as e:
-                    return self._json({"error": f"bad value: {e}"})
+                    return self._refuse(u, e)
                 log(f"[ctl] diversity/set -> {kwargs}")
                 try:
                     return self._json(a.set_diversity(**kwargs))
@@ -4215,7 +4224,7 @@ def start_control_server(radio, port):
                     if not (1 <= seconds <= 60):
                         raise ValueError(f"seconds={q.get('seconds', ['10'])[0]!r}")
                 except (ValueError, TypeError) as e:
-                    return self._json({"error": f"bad value: {e}"})
+                    return self._refuse(u, e)
                 try:
                     path = fn(seconds)
                 except RuntimeError as e:
@@ -4243,7 +4252,7 @@ def start_control_server(radio, port):
                         kw["cancel"] = True
                     out = fn(**kw)
                 except (ValueError, TypeError) as e:
-                    return self._json({"error": f"bad value: {e}"})
+                    return self._refuse(u, e)
                 except RuntimeError as e:          # already running, no pair yet
                     return self._json({"error": str(e)})
                 if kw:
@@ -4284,7 +4293,7 @@ def start_control_server(radio, port):
                         bins=int(q["bins"][0]) if "bins" in q else None,
                         samp_rate_hz=float(q["rate"][0]) if "rate" in q else None))
                 except (ValueError, TypeError) as e:
-                    return self._json({"error": f"bad value: {e}"})
+                    return self._refuse(u, e)
             if u.path == "/set":
                 q = urllib.parse.parse_qs(u.query)
                 try:

@@ -91,6 +91,19 @@ def test_bad_values_are_errors_not_tracebacks():
     assert _get(port, "/filter/notch?width=100")["error"].startswith("bad value")   # no add
 
 
+def test_a_refused_write_is_logged_with_its_route_and_query(capsys):
+    """The reply reaches one tile in the app and nothing else; without this
+    line a refusal seen on screen an hour later cannot be traced to the
+    write that earned it (2026-09-03: "bad value: NoneType ..." on the AUTO
+    CLEAN card, route unknown). Mutation: drop the log() in _refuse."""
+    a = FakeFilterAdapter()
+    _, port = _start(a)
+    assert _get(port, "/filter/set?low=abc")["error"].startswith("bad value")
+    time.sleep(0.05)
+    out = capsys.readouterr().out
+    assert "/filter/set refused 'low=abc': ValueError" in out
+
+
 def test_bypass_and_the_notch_flag_arrive_as_flags_not_as_floats():
     """Both are new entries in _FILTER_FLAGS; without them "bypass=on" would
     reach the adapter as float("on") and answer with a bad-value error."""
