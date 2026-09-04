@@ -34,6 +34,13 @@ is not touched, and one the governor was HOLDING that changes under it is
 RELEASED -- detected by DRIFT, so a write from any route releases it without that
 route knowing this file exists; and a tool already where a rule wants it is left.
 
+A SQUEEZE THAT IS NOT HOLDING IS NOT A TOOL. core/squeeze.py answers `held`
+False with a `reason` ("no comb found" while its detector is still reading the
+band, "too weak", "outside the passband"), so a squeeze is never banked until
+it says it IS holding, and one that was holding and stops is put back after
+SQUEEZE_GRACE_S. Live, a comb squeeze was kept on +1.1 dB of the objective's
+own noise while the CHAIN row beside the banner read "no comb found".
+
 `auto` starts False and holds nothing. Turning it off releases everything on the
 next tick and leaves the settings where they stand: releasing is not reverting,
 and what the governor kept it kept because it measured better.
@@ -64,13 +71,18 @@ _num = proxy._num                       # the adapter reads it through this name
 SETTLE_S = 2.0                  # after a move, before the objective is read again
 GUARD_SETTLE_S = 10.0           # ...but the guard steps the LNA on its own loop
 SQUEEZE_SETTLE_S = 8.0          # ...and a squeeze takes hold over blocks: the comb
-                                # detector alone wants ~2 s and retries; a proxy-
-                                # scored squeeze is read as soon as it is held,
-                                # and put back if it never is by this
+                                # detector alone wants ~2 s and retries; a squeeze
+                                # is read as soon as it says it is HELD, whatever
+                                # is scoring it, and put back if it never says so
+                                # by this
+SQUEEZE_GRACE_S = 3.0           # ...and one that WAS held and stops gets this long
+                                # (three ticks) to find it again before it goes
+                                # back: `held` is a per-refresh judgement
 OPERATOR_GRACE_S = 60.0         # a knob the operator moved is theirs for this long
 BACKOFF_S = 300.0               # a (kind, tool) that hurt is not retried for this
 DIG_BACKOFF_S = 1800.0          # ...and a dig is a minute of knob-turning: half
                                 # an hour, after eight in eighty minutes on air
+NO_COMB = "no comb found"       # core/squeeze.py's own word while it is still looking
 MAX_EVENTS = 50
 SPREAD_N = 6                    # objective reads the margin's spread is taken over
 
@@ -110,6 +122,33 @@ def _word(tool):
     return proxy.WORDS.get(tool, tool)
 
 
+def _never_held_why(sq):
+    """What the squeeze was still saying when its deadline ran out. Its own
+    `reason` is the whole of the answer, so it is what the operator reads."""
+    reason = sq.get("reason")
+    if reason == NO_COMB:
+        return "put back: the squeeze found no comb to notch"
+    return "put back: the squeeze never took hold" + (f" ({reason})" if reason else "")
+
+
+def _looking_why(sq):
+    """...and what the RULE says about a target that is configured but not
+    holding: never "already squeezing", which is the claim this all exists to
+    stop the banner making."""
+    reason = sq.get("reason")
+    if reason == NO_COMB:
+        return "the squeeze is still looking for a comb"
+    return "the squeeze has not taken hold" + (f" ({reason})" if reason else " yet")
+
+
+def _lost_why(sq):
+    """...and when it WAS holding and stopped: the comb went away, or a retune
+    inside the band moved its teeth out of the passband."""
+    what = "comb" if sq.get("target") == "comb" else "target"
+    return (f"put back: the squeeze lost its {what} "
+            f"({sq.get('reason') or 'it stopped holding'})")
+
+
 class Governor:
     """The whole policy. See the module docstring; `tick` is the only way in."""
 
@@ -138,6 +177,7 @@ class Governor:
         self._wall_off = None           # monotonic -> wall clock, from the snapshot
         self._note_at = None            # (the dig's last note, when we first saw it)
         self._pending_label = ""        # the pending move's own label, while it settles
+        self._sq_lost_at = None         # when a HELD squeeze stopped holding
 
     def tick(self, snap):
         """One snapshot in, zero or one actions out."""
@@ -160,6 +200,9 @@ class Governor:
             return moved
         if self.pending is not None:
             return self._resolve(snap, now)
+        lost = self._squeeze_lost(snap, now)
+        if lost is not None:
+            return lost
         return self._propose(snap, now)
 
     def applied(self, action, now, before=None):
@@ -242,8 +285,14 @@ class Governor:
         if p["tool"] == "dig":
             return self._resolve_dig(snap, now)
         settle = GUARD_SETTLE_S if p["tool"] == "guard" else self.settle_s
-        waiting = (p["tool"] == "squeeze" and p["scorer"] != "snr"
-                   and not (snap.get("squeeze") or {}).get("held"))
+        # A SQUEEZE IS NOT SCORED UNTIL IT SAYS IT IS HOLDING, whatever is
+        # scoring it. Live, with a talker to score by, a comb squeeze was KEPT
+        # at 2 s on +1.1 dB of the objective's own noise while its detector had
+        # not found a comb at all -- the banner claimed a notch over a CHAIN row
+        # reading "no comb found". Held or not, the answer is in by
+        # SQUEEZE_SETTLE_S, and not held by then is not a tool that worked.
+        sq = snap.get("squeeze") or {}
+        waiting = p["tool"] == "squeeze" and not sq.get("held")
         if waiting:
             settle = SQUEEZE_SETTLE_S            # held: scored; not yet: wait for it
         if now - p["t"] < settle:
@@ -256,6 +305,10 @@ class Governor:
             keep, why = proxy.verdict(p["tool"], p["kind"], self._before, snap)
             p["why"] = f"{p['why']}; {why}"
             return self._keep(p, why) if keep else self._undo(p, now, why)
+        if waiting:                          # the talker's delta is not the tool
+            why = _never_held_why(sq)
+            p["why"] = f"{p['why']}; {why}"
+            return self._undo(p, now, why)
         before, after = p["before"], _num(snap.get("objective"))
         if before is None or after is None:
             return self._keep(p)                     # nothing to compare it against
@@ -353,6 +406,41 @@ class Governor:
         return [_act(row["tool"], row["undo"], row["params"], row["kind"], why,
                      revert=True, label="putting it back")]
 
+    def _squeeze_lost(self, snap, now):
+        """A squeeze the governor is HOLDING that has stopped holding -- the
+        comb went away, a retune inside the band moved its teeth out of the
+        passband -- goes back where it was, and the pair backs off like any
+        other move that stopped paying. The banner must never claim a tool the
+        CHAIN row beside it says found nothing.
+
+        SQUEEZE_GRACE_S of rope first: `held` is a per-refresh judgement, and
+        one block's worth of "too weak" on a target that faded is not the
+        target going away. Nothing here fights `_band_moved`: that runs first
+        and takes the whole holding row with it, so on a band change there is
+        nothing left here to lose. Returns None when it did nothing, so the
+        pass carries on to the rules.
+        """
+        held, sq = self.holding.get("squeeze"), snap.get("squeeze") or {}
+        if held is None or sq.get("held"):
+            self._sq_lost_at = None
+            return None
+        if self._sq_lost_at is None:
+            self._sq_lost_at = now
+            return None
+        if now - self._sq_lost_at < SQUEEZE_GRACE_S:
+            return None
+        self._sq_lost_at = None
+        del self.holding["squeeze"]
+        self.backoff[(held["kind"], "squeeze")] = now + BACKOFF_S
+        why = _lost_why(sq)
+        self.state, self.why, self.label = "backoff", why, "put back"
+        self.events.append(dict(held, t=now, wall=self._wall_at(now),
+                                result="undone", why=why, delta_db=None))
+        if held.get("undo") is None:
+            return []
+        return [_act("squeeze", held["undo"], held["params"], held["kind"], why,
+                     revert=True, label="putting it back")]
+
     def _release_all(self, now):
         for held in self.holding.values():
             held.update(result="released",
@@ -360,6 +448,7 @@ class Governor:
             self.events.append(dict(held, t=now, wall=self._wall_at(now)))
         self.holding.clear()
         self.pending, self._seeded, self._clear_since = None, False, None
+        self._sq_lost_at = None
 
     # ----- the rules, in the chain's order --------------------------------
     def _no(self, tool, why):
@@ -503,7 +592,8 @@ class Governor:
         if car is not None:
             hz = int(round(car["hz"]))
             if sq.get("target") == "signal" and abs(_num(sq.get("hz"), 1e9) - hz) < 1.0:
-                return self._no("squeeze", f"already squeezing {hz:+d} Hz")
+                return self._no("squeeze", f"already squeezing {hz:+d} Hz"
+                                if sq.get("held") else _looking_why(sq))
             return _act("squeeze", {"squeeze": hz}, {"squeeze": ""}, "carrier",
                         f"a carrier {hz:+d} Hz in the passband at {car['db']:.0f} dB: "
                         f"squeezing it with {tool}", label=f"trying {tool} on a carrier")
@@ -516,7 +606,8 @@ class Governor:
         if sq.get("held") and sq.get("tool") == "null" and depth >= HUM_COVERED_DB:
             return self._no("squeeze", f"the null already has the hum ({depth:.0f} dB)")
         if sq.get("target") == "comb" and sq.get("configured"):
-            return self._no("squeeze", "already squeezing the mains comb")
+            return self._no("squeeze", "already squeezing the mains comb"
+                            if sq.get("held") else _looking_why(sq))
         level = (f"{hum:.1f} dB over the floor" if hum is not None
                  else f"{int(_num(snap.get('harmonics'), 0))} harmonics")
         return _act("squeeze", {"squeeze": "comb"}, {"squeeze": ""}, "mains",
